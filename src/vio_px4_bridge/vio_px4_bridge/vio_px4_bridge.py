@@ -260,6 +260,7 @@ class VisualOdometryBridge(Node): #python class name
         )
 
 
+
         #reset counter
         out.reset_counter = self.reset_counter
 
