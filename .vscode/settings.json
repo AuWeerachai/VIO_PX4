@@ -1,0 +1,6 @@
+{
+  "python.analysis.extraPaths": [
+    "/home/au/ws_px4_dev/install/px4_msgs/local/lib/python3.10/dist-packages",
+    "/opt/ros/humble/local/lib/python3.10/dist-packages"
+  ]
+}
