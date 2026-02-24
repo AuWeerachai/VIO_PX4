@@ -59,14 +59,24 @@ class VisualOdometryBridge(Node): #python class name
         ])
 
 
-        qos_profile = QoSProfile(
+        sub_qos_profile = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=5,
+        )
+        pub_qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
         )
-        self.subscription = self.create_subscription(Odometry,self.odom_topic,self.odom_callback,qos_profile,) #This node subscribe from this
-        self.publisher = self.create_publisher(VehicleOdometry,self.px4_topic,qos_profile,) #This node publish this
+        self.subscription = self.create_subscription(
+            Odometry, self.odom_topic, self.odom_callback, sub_qos_profile
+        ) #This node subscribe from this
+        self.publisher = self.create_publisher(
+            VehicleOdometry, self.px4_topic, pub_qos_profile
+        ) #This node publish this
         
 
         self.get_logger().info("Subscribed odometry: " + self.odom_topic)
