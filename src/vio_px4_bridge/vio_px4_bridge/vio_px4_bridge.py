@@ -38,7 +38,7 @@ class VisualOdometryBridge(Node):
 
         self.declare_parameter("use_timesync", True)
         self.declare_parameter("timesync_topic", "/fmu/out/timesync_status")
-        self.declare_parameter("timesync_timeout_us", 1_000_000)
+        self.declare_parameter("timesync_timeout_us", 5_000_000)
 
         # Suggestion 3: use more realistic nonzero variance floors.
         self.declare_parameter("position_variance_floor", 1e-2)
