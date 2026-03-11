@@ -41,9 +41,9 @@ class VisualOdometryBridge(Node):
         self.declare_parameter("timesync_timeout_us", 5_000_000)
 
         # Suggestion 3: use more realistic nonzero variance floors.
-        self.declare_parameter("position_variance_floor", 1e-2)
-        self.declare_parameter("orientation_variance_floor", 1e-2)
-        self.declare_parameter("velocity_variance_floor", 1e-2)
+        self.declare_parameter("position_variance_floor", 1e-6)
+        self.declare_parameter("orientation_variance_floor", 1e-6)
+        self.declare_parameter("velocity_variance_floor", 1e-6)
         self.declare_parameter("expected_world_frame", "")
         self.declare_parameter("expected_body_frame", "")
 
@@ -320,15 +320,15 @@ class VisualOdometryBridge(Node):
 
     def covariance_diag_with_floor(self, covariance, index_a, index_b, index_c, floor):
         value_a = covariance[index_a]
-        if value_a < floor:
+        if not isfinite(value_a) or value_a < floor:
             value_a = floor
 
         value_b = covariance[index_b]
-        if value_b < floor:
+        if not isfinite(value_b) or value_b < floor:
             value_b = floor
 
         value_c = covariance[index_c]
-        if value_c < floor:
+        if not isfinite(value_c) or value_c < floor:
             value_c = floor
 
         return [float(value_a), float(value_b), float(value_c)]
