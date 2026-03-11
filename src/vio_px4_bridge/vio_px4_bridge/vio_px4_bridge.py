@@ -2,6 +2,7 @@
 
 import rclpy
 from nav_msgs.msg import Odometry
+from numpy import isfinite
 from px4_msgs.msg import VehicleOdometry
 from px4_msgs.msg import TimesyncStatus
 from rclpy.node import Node
@@ -43,6 +44,8 @@ class VisualOdometryBridge(Node):
         self.declare_parameter("position_variance_floor", 1e-2)
         self.declare_parameter("orientation_variance_floor", 1e-2)
         self.declare_parameter("velocity_variance_floor", 1e-2)
+        self.declare_parameter("expected_world_frame", "")
+        self.declare_parameter("expected_body_frame", "")
 
         # Read parameters.
         self.odom_topic = str(self.get_parameter("odom_topic").value)
@@ -57,6 +60,8 @@ class VisualOdometryBridge(Node):
         self.position_variance_floor = float(self.get_parameter("position_variance_floor").value)
         self.orientation_variance_floor = float(self.get_parameter("orientation_variance_floor").value)
         self.velocity_variance_floor = float(self.get_parameter("velocity_variance_floor").value)
+        self.expected_world_frame = str(self.get_parameter("expected_world_frame").value).strip()
+        self.expected_body_frame = str(self.get_parameter("expected_body_frame").value).strip()
 
         sub_qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -98,6 +103,10 @@ class VisualOdometryBridge(Node):
             f"orientation: {self.orientation_variance_floor}, "
             f"velocity: {self.velocity_variance_floor}"
         )
+        if self.expected_world_frame:
+            self.get_logger().info(f"Expected odometry world frame: {self.expected_world_frame}")
+        if self.expected_body_frame:
+            self.get_logger().info(f"Expected odometry body frame: {self.expected_body_frame}")
         if self.use_timesync:
             self.get_logger().info(f"Subscribed timesync: {self.timesync_topic}")
 
@@ -106,6 +115,9 @@ class VisualOdometryBridge(Node):
         self.timesync_warned = False
 
     def odom_callback(self, msg: Odometry):
+        if not self.validate_frames(msg):
+            return
+
         px4_odom = VehicleOdometry()
 
         now_us = int(self.get_clock().now().nanoseconds / 1000)
@@ -148,6 +160,9 @@ class VisualOdometryBridge(Node):
             msg.pose.pose.orientation.z,
         ]
         px4_quat_wxyz = self.convert_orientation_ros2_to_px4(ros_quat_wxyz)
+        if px4_quat_wxyz is None:
+            self.get_logger().warn("Dropping odometry with invalid quaternion.", throttle_duration_sec=5.0)
+            return
         px4_odom.q = [
             float(px4_quat_wxyz[0]),
             float(px4_quat_wxyz[1]),
@@ -211,8 +226,8 @@ class VisualOdometryBridge(Node):
         px4_odom.reset_counter = int(self.reset_counter)
 
         quality_value = int(self.quality)
-        if quality_value < 1:
-            quality_value = 1
+        if quality_value < 0:
+            quality_value = 0
         if quality_value > 100:
             quality_value = 100
         px4_odom.quality = quality_value
@@ -244,6 +259,9 @@ class VisualOdometryBridge(Node):
         return [x_frd, y_frd, z_frd]
 
     def convert_orientation_ros2_to_px4(self, quat_wxyz):
+        if not self.is_valid_quaternion(quat_wxyz):
+            return None
+
         # ROS world frame: ENU  (X=East, Y=North, Z=Up)
         # PX4 world frame: NED  (X=North, Y=East, Z=Down)
         rotation_ned_from_enu = Rotation.from_matrix([
@@ -274,6 +292,16 @@ class VisualOdometryBridge(Node):
         output_xyzw = rotation_ned_frd.as_quat()
         output_wxyz = self.quat_xyzw_to_wxyz(output_xyzw)
         return output_wxyz
+
+    def is_valid_quaternion(self, quat_wxyz):
+        if len(quat_wxyz) != 4:
+            return False
+
+        if not all(isfinite(value) for value in quat_wxyz):
+            return False
+
+        norm_squared = sum(value * value for value in quat_wxyz)
+        return norm_squared > 1e-12
 
     def quat_wxyz_to_xyzw(self, quat_wxyz):
         w = quat_wxyz[0]
@@ -316,6 +344,25 @@ class VisualOdometryBridge(Node):
         microseconds_from_sec = sec * 1_000_000
         microseconds_from_nanosec = nanosec / 1000
         return int(microseconds_from_sec + microseconds_from_nanosec)
+
+    def validate_frames(self, msg: Odometry):
+        if self.expected_world_frame and msg.header.frame_id != self.expected_world_frame:
+            self.get_logger().warn(
+                f"Unexpected world frame '{msg.header.frame_id}', expected '{self.expected_world_frame}'. "
+                "Dropping odometry.",
+                throttle_duration_sec=5.0,
+            )
+            return False
+
+        if self.expected_body_frame and msg.child_frame_id != self.expected_body_frame:
+            self.get_logger().warn(
+                f"Unexpected body frame '{msg.child_frame_id}', expected '{self.expected_body_frame}'. "
+                "Dropping odometry.",
+                throttle_duration_sec=5.0,
+            )
+            return False
+
+        return True
 
     def timesync_callback(self, msg: TimesyncStatus):
         # Suggestion 1:
