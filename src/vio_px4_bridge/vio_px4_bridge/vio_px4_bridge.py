@@ -98,6 +98,7 @@ class VisualOdometryBridge(Node):
         self.get_logger().info(f"Publishing PX4 vision odometry: {self.px4_topic}")
         self.get_logger().info(f"use_msg_timestamp: {self.use_msg_timestamp}")
         self.get_logger().info(f"use_timesync: {self.use_timesync}")
+        self.get_logger().info(f"timesync_timeout_us: {self.timesync_timeout_us}")
         self.get_logger().info(
             f"variance floors -> position: {self.position_variance_floor}, "
             f"orientation: {self.orientation_variance_floor}, "
@@ -378,7 +379,9 @@ class VisualOdometryBridge(Node):
 
     def to_px4_time_us(self, ros_time_us, now_us):
         # Convert ROS time -> PX4 time using the latest timesync offset.
-        # If timesync is missing or stale, fall back to ROS time.
+        # If timesync is missing, fall back to ROS time.
+        # If timesync is stale but an offset was received before, keep using the
+        # last known offset because it is usually better than switching clocks.
         if not self.use_timesync:
             return int(ros_time_us)
 
@@ -393,10 +396,10 @@ class VisualOdometryBridge(Node):
         if (now_us - self.timesync_last_update_us) > self.timesync_timeout_us:
             if not self.timesync_warned:
                 self.get_logger().warn(
-                    "Timesync stale; using ROS time for PX4 timestamps."
+                    "Timesync stale; using last known PX4 offset."
                 )
                 self.timesync_warned = True
-            return int(ros_time_us)
+            return int(ros_time_us + self.timesync_offset_us)
 
         self.timesync_warned = False
         return int(ros_time_us + self.timesync_offset_us)
