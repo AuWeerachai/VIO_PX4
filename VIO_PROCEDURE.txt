@@ -1,0 +1,68 @@
+###Start VIO docker & attach new terminalsros2 launch mavros px4.launch fcu_url:=serial:///dev/ttyUSB0:921600
+
+cd ${ISAAC_ROS_WS}/src/isaac_ros_common && \
+./scripts/run_dev.sh
+
+############################Current Procedure
+####Terminal 1
+cd ${ISAAC_ROS_WS}/src/isaac_ros_common && \
+   ./scripts/run_dev.sh
+
+cd ${ISAAC_ROS_WS}/src/isaac_ros_common && \
+   ./scripts/start_vio.sh
+
+#####Terminal 2
+cd ${ISAAC_ROS_WS}/src/isaac_ros_common && \
+   ./scripts/run_dev.sh
+
+cd ${ISAAC_ROS_WS}/src/isaac_ros_common && \
+   ./scripts/start_rviz.sh
+
+#####Terminal 3 (for tf)
+ros2 run tf2_ros static_transform_publisher --x 0 --y 0 --z 0 --roll 0 --pitch 0 --yaw 0 --frame-id camera_link --child-frame-id base_link
+
+
+####Terminal 4 (for mavros)
+ros2 run tf2_ros static_transform_publisher --x 0 --y 0 --z 0 --roll 3.14159 --pitch 0 --yaw 0 --frame-id camera_link --child-frame-id camera_link_frd
+
+
+####Terminal 5 
+ros2 run topic_tools relay /visual_slam/tracking/odometry /mavros/odometry/out
+
+
+#####Terminal 6
+ros2 launch mavros px4.launch \
+fcu_url:=serial:///dev/ttyUSB0:921600
+
+
+
+
+############################# OLD PROCEDURE (Before add VIO,RVIZ Start script)
+####Terminal 1
+cd ${ISAAC_ROS_WS}/src/isaac_ros_common && \
+   ./scripts/run_dev.sh
+
+sudo apt-get update
+
+sudo apt-get install -y ros-humble-isaac-ros-visual-slam
+
+sudo apt-get update
+
+sudo apt-get install -y ros-humble-isaac-ros-examples ros-humble-isaac-ros-realsense
+
+### ***OLD HAS BASE_FRAME AS CAMERA LINK, WE NEED TO HAVE AS base_link to be compatible with MAVROS 
+ros2 launch isaac_ros_examples isaac_ros_examples.launch.py launch_fragments:=realsense_stereo_rect,visual_slam \
+interface_specs_file:=${ISAAC_ROS_WS}/isaac_ros_assets/isaac_ros_visual_slam/quickstart_interface_specs.json \
+base_frame:=camera_link camera_optical_frames:="['camera_infra1_optical_frame', 'camera_infra2_optical_frame']"
+
+
+####Terminal 2
+cd ${ISAAC_ROS_WS}/src/isaac_ros_common && \
+   ./scripts/run_dev.sh
+
+rviz2 -d $(ros2 pkg prefix isaac_ros_visual_slam --share)/rviz/default.cfg.rviz
+~                                                                                                    
+~                                                                                                    
+~                                                                                                    
+~                                                                                                    
+~                                  
