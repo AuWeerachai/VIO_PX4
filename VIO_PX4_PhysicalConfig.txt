@@ -1,95 +1,26 @@
 1. Hardware transport path
-
 Physical link:    Jetson (ROS2) - USB - FTDI adapter(/dev/ttyUSB0) - UART - PX4 TELEM2
 Baud Rate:        921600 8N1
 
 
 
 2. PX4 parameter configuration
-
 SER_TEL2_BAUD = 921600
-MAV_2_CONFIG  = 0          # disable MAVLink on TELEM2
-UXRCE_DDS_CFG = 102        # TELEM2
+MAV_1_CONFIG  = TELEM2          
 
 Then reboot PX4.
 
 
 
-3. Start DDS transport On Jetson
-
-Run the DDS agent:    MicroXRCEAgent serial --dev /dev/ttyUSB0 -b 921600 -v 4
-Expected behavior:    agent starts, PX4 client connects automatically
+3. Verify ROS2 discovery (Ros domain must be 0)
 
 
 
 
-4. Verify PX4 DDS client
-
-On PX4 NSH: uxrce_dds_client status
-
-Expected: (once step 2 is done)
-Running, connected
-Using transport: serial
-timesync converged: true
-Payload tx > 0
-Payload rx > 0
+4. Verify message flow into PX4
+CHeck mavlink inspector: see LOCAL_POSITION_NED
 
 
-
-
-
-5. Verify ROS2 discovery (Ros domain must be 0)
-
-On Jetson:
-ros2 topic list 
-should see both:
-/fmu/out/*
-/fmu/in/*
-
-
-
-
-
-6. Verify message flow into PX4
-
-On PX4 NSH: listener vehicle_visual_odometry
-
-Expected: odometry messages printed continuously
-
-
-
-
-
-7. Verify EKF receives VIO
-
-On PX4 NSH: listener estimator_status_flags
-
-Important fields:
-cs_ev_pos : True
-cs_ev_vel : True
-cs_ev_hgt : True
-
-Meaning:EKF2 is fusing external vision
-
-
-
-8.set ekf2 home
-
+5.set ekf2 home
 on PX4 NSH: commander set_ekf_origin 40.4433 -79.9436 300 
-
-
-
-Key debugging commands (quick reference)
-
-PX4 side
-uxrce_dds_client status
-listener vehicle_visual_odometry
-listener estimator_status_flags
-
-ROS2 side
-ros2 topic list | grep /fmu
-ros2 topic echo /fmu/out/timesync_status
-ros2 topic info /fmu/in/vehicle_visual_odometry -v
-Serial device
-ls /dev/ttyUSB*
-dmesg | grep ttyUSB
+or click on the map and select "set estimator home"
