@@ -5,8 +5,9 @@ Baud Rate:        921600 8N1
 
 
 2. PX4 parameter configuration
+MAV_1_CONFIG  = TELEM2
 SER_TEL2_BAUD = 921600
-MAV_1_CONFIG  = TELEM2          
+          
 
 Then reboot PX4.
 
