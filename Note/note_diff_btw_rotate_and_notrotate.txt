@@ -35,10 +35,10 @@ in here the original file won't have anywhere to specify which tf id to listen t
 2.The pipeline to tilt odom will be completely seperate from the running vio for the VIO node, run everything normally  map, odom, camera_link
 
 we need to create child of these things. because we have VIO node as parent (camera_link, odom, map), we need to tilt up from camera to drone. With right hand rule that is negative angle
-For -45 degree tilt (tilt up)
-ground is child of map:               ros2 run tf2_ros static_transform_publisher 0 0 0 0 -0.7854 0 camera_link drone_link
-odom_tilt is child of odom:           ros2 run tf2_ros static_transform_publisher 0 0 0 0 -0.7854 0 map ground
-drone_link is child of camera_link:   ros2 run tf2_ros static_transform_publisher 0 0 0 0 -0.7854 0 odom odom_tilt
+For -30 degree tilt (tilt up)
+ground is child of map:               ros2 run tf2_ros static_transform_publisher 0 0 0 0 -0.5236 0 camera_link drone_link
+odom_tilt is child of odom:           ros2 run tf2_ros static_transform_publisher 0 0 0 0 -0.5236 0 map ground
+drone_link is child of camera_link:   ros2 run tf2_ros static_transform_publisher 0 0 0 0 -0.5236 0 odom odom_tilt
 
 The 6  numbers just make ros2 understand (translation + rotation) The tf tree gives more context about this. Take a look. I attached it
 
@@ -47,7 +47,7 @@ The 6  numbers just make ros2 understand (translation + rotation) The tf tree gi
 
 
 
-3. !!!!!!!!!!!!!!!!!!!!!!change angle in rotated_odometry_relay_vio_px4.py to match angle in step 2 (in this case is -45 degree) !!!!!!!!!!!!!!!!!!!!!
+3. !!!!!!!!!!!!!!!!!!!!!!change angle in rotated_odometry_relay_vio_px4.py to match angle in step 2 (in this case is -30 degree) !!!!!!!!!!!!!!!!!!!!!
 
 The TF tree is now solve, we should see in RVIZ in accordance of what we want to see. Set fix frame to "ground", and we should see the odom_tilt and ground pararell to the grid, drone link pararell the grid at start, and camera_link tilt down at specify angle.
 
