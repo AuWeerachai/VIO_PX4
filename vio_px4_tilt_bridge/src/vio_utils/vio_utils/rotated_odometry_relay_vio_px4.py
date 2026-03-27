@@ -26,7 +26,7 @@ class RotatedOdometryRelay(Node):
 
         # This should match the TF tilt you are publishing.
         # The node will apply the inverse of this to the odometry data.
-        self.declare_parameter('pitch_deg', -45.0)
+        self.declare_parameter('pitch_deg', -30.0)
 
         self.declare_parameter('output_header_frame_id', 'odom_tilt')
         self.declare_parameter('output_child_frame_id', 'drone_link')
@@ -39,7 +39,7 @@ class RotatedOdometryRelay(Node):
         self.output_child_frame_id = self.get_parameter('output_child_frame_id').value
 
         # IMPORTANT:
-        # If TF publishes -45 deg, the data must be rotated +45 deg.
+        # If TF publishes -30 deg, the data must be rotated +30 deg.
         # So the odometry data uses the inverse of the TF tilt.
         self.r_rot = R.from_euler('y', -self.pitch_deg, degrees=True)
         self.R3 = self.r_rot.as_matrix()
