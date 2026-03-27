@@ -1,0 +1,60 @@
+CHANGE MADE TO MAKE TILTING CAMERA POSSIBLE
+
+
+1.mavros frame to be used for odometry can be found in
+~/workspaces/mavros/src/mavros/mavros/launch/px4_config.yaml
+
+in here the original file won't have anywhere to specify which tf id to listen to. At the beginning of the file makes it look like this
+
+1.1 at the beginning ,makes it look like this
+# Common configuration for PX4 autopilot
+#
+/**:
+  ros__parameters:
+    startup_px4_usb_quirk: false
+ # --- CORE MAVROS ROUTER FRAMES ---########################################################### FIXED BY WEERACHAI SANGIUMPAISANKIJ ################################
+    base_link_frame_id: "drone_link"   # Forces MAVROS to build drone_link_frd
+    map_frame_id: "ground"             # Forces MAVROS to build ground_ned
+    odom_frame_id: "odom_tilt"         # Forces MAVROS to build odom_tilt_ned
+ ###################################################################################################################################################################
+# --- system plugins ---
+
+# sys_status
+
+
+
+
+1.2. (currently this work) replace the rest of the file for base_link, map, odom tobe drone_link, ground, odom_tilt respectively. The original file for config is px4_config.yaml and the config file that works for rotating camera is px4_config_rotate_camera.yaml
+
+
+
+
+
+
+
+2.The pipeline to tilt odom will be completely seperate from the running vio for the VIO node, run everything normally  map, odom, camera_link
+
+we need to create child of these things. because we have VIO node as parent (camera_link, odom, map), we need to tilt up from camera to drone. With right hand rule that is negative angle
+For -45 degree tilt (tilt up)
+ground is child of map:               ros2 run tf2_ros static_transform_publisher 0 0 0 0 -0.7854 0 camera_link drone_link
+odom_tilt is child of odom:           ros2 run tf2_ros static_transform_publisher 0 0 0 0 -0.7854 0 map ground
+drone_link is child of camera_link:   ros2 run tf2_ros static_transform_publisher 0 0 0 0 -0.7854 0 odom odom_tilt
+
+The 6  numbers just make ros2 understand (translation + rotation) The tf tree gives more context about this. Take a look. I attached it
+
+
+
+
+
+
+3. !!!!!!!!!!!!!!!!!!!!!!change angle in rotated_odometry_relay_vio_px4.py to match angle in step 2 (in this case is -45 degree) !!!!!!!!!!!!!!!!!!!!!
+
+The TF tree is now solve, we should see in RVIZ in accordance of what we want to see. Set fix frame to "ground", and we should see the odom_tilt and ground pararell to the grid, drone link pararell the grid at start, and camera_link tilt down at specify angle.
+
+However, we need to pass odometry to px4, what I did is subscribing to odometry output from vio that using camera as a reference frame, and I rotate it at specify degree and then publish it to 
+/mavros/odometry/out.
+
+The package is vio_utils in this workspace !!!!! Change the angle here in python file
+/VIO_PX4/vio_px4_tilt_bridge/src/vio_utils/vio_utils/ rotated_odometry_relay_vio_px4.py
+
+and then do ros2 run

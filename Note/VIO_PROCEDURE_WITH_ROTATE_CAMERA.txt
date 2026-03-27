@@ -1,3 +1,4 @@
+ros2 run tf2_ros static_transform_publisher 0 0 0 0 -0.7854 0 camera_link drone_link
 ###Start VIO docker & attach new terminals
 cd ${ISAAC_ROS_WS}/src/isaac_ros_common && \
 ./scripts/run_dev.sh
@@ -25,19 +26,21 @@ ros2 param set /visual_slam_node image_jitter_threshold_ms 60.0
 ros2 param set /visual_slam_node enable_imu_fusion True
 
 
-#####Terminal 4 (for tf)
-ros2 run tf2_ros static_transform_publisher --x 0 --y 0 --z 0 --roll 0 --pitch 0 --yaw 0 --frame-id camera_link --child-frame-id base_link
+#####Terminal 4 (-45 degree camera tilt = tilt from camera to the drone, right hand rule)
+ros2 run tf2_ros static_transform_publisher 0 0 0 0 0.7854 0 camera_link drone_link
 
 
-####Terminal 5 (for mavros)
-ros2 run tf2_ros static_transform_publisher --x 0 --y 0 --z 0 --roll 3.14159 --pitch 0 --yaw 0 --frame-id camera_link --child-frame-id camera_link_frd
+####Terminal 5 (-45 degree tilt follow drone)
+ros2 run tf2_ros static_transform_publisher 0 0 0 0 -0.7854 0 map ground
+
+####Terminal 6 (-45 degree tilt follow ground, drone)
+ros2 run tf2_ros static_transform_publisher 0 0 0 0 -0.7854 0 odom odom_tilt
 
 
-####Terminal 6 
-ros2 run topic_tools relay /visual_slam/tracking/odometry /mavros/odometry/out
+####Terminal 7 (change angle in here to be -45 too!!)(subscribe to /visual_slam/tracking/odometry, do rotation and publish odometry_rotated)
+ros2 run vio_utils rotated_odometry_relay_vio_px4 
 
-
-#####Terminal 7
+#####Terminal 8
 ros2 launch mavros px4.launch \
 fcu_url:=serial:///dev/ttyUSB0:921600
 
