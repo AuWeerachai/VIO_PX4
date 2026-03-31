@@ -44,9 +44,7 @@ ros2 launch mavros px4.launch \
 fcu_url:=serial:///dev/ttyUSB0:921600
 
 
-
-
-####Terminal 8 (set global position for drone)
+####Terminal 9 (set global position for drone)
 ros2 topic pub --once /mavros/global_position/set_gp_origin geographic_msgs/msg/GeoPointStamped "
 header:
   frame_id: ''
