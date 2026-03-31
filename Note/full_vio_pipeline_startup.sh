@@ -34,7 +34,7 @@ PARAM_IMU_FUSION=True
 DELAY_T1=8             # T1: wait for container before launching VIO
 DELAY_T2=8             # T2: wait for container before launching RViz
 DELAY_T3_CONTAINER=8   # T3: wait for container to be up (same as T1/T2)
-DELAY_T3_NODE=30       # T3: additional wait for visual_slam_node to initialize
+DELAY_T3_NODE=25       # T3: additional wait for visual_slam_node to initialize
 DELAY_T7_T8=3          # T8: wait after T7 starts
 DELAY_T8_T9=15         # T9: wait after T8 starts (MAVROS needs time to connect)
 
@@ -129,10 +129,11 @@ sleep $DELAY_T3_CONTAINER
 echo "=== T3: Waiting ${DELAY_T3_NODE}s for visual_slam_node to initialize ==="
 sleep $DELAY_T3_NODE
 echo "=== T3: Setting ROS parameters ==="
-docker exec -u admin --workdir "$CONTAINER_WS" "$CONTAINER_NAME" \
+docker exec -it -u admin --workdir "$CONTAINER_WS" "$CONTAINER_NAME" \
     bash -c "source /opt/ros/humble/setup.bash && \
              ros2 param set /visual_slam_node image_jitter_threshold_ms $PARAM_JITTER && \
-             ros2 param set /visual_slam_node enable_imu_fusion $PARAM_IMU_FUSION"
+             ros2 param set /visual_slam_node enable_imu_fusion $PARAM_IMU_FUSION && \
+             echo '=== T3: Parameters set OK ==='"
 docker exec -it -u admin --workdir "$CONTAINER_WS" "$CONTAINER_NAME" bash
 PANE_EOF
 
