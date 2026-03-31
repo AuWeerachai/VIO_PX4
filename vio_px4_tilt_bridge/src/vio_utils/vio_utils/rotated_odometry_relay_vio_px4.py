@@ -39,8 +39,10 @@ class RotatedOdometryRelay(Node):
         self.output_header_frame_id = self.get_parameter('output_header_frame_id').value
         self.output_child_frame_id  = self.get_parameter('output_child_frame_id').value
  
-        # r_rot : rotation representing the camera tilt (e.g. -30 deg around Y)
-        # r_inv : inverse (+30 deg) — applied everywhere to UNDO the camera tilt
+        # r_rot : rotation representing the tilt from camera_link to drone_link (e.g. -30 deg around Y)(according to ros convention, right hand rule)
+        #(we use camera as a reference since it is the sensor that receives data + in the vio pipeline)
+        
+        # r_inv : inverse (+30 deg) — applied everywhere to UNDO the camera tilt (apply to camera_link, odom, map to get drone_link, odom_tilt, ground (the physical world))
         #
         # Position / linear velocity / angular velocity:
         #   Multiplied by R3 = r_inv.as_matrix()
@@ -50,13 +52,14 @@ class RotatedOdometryRelay(Node):
         #   r_out = r_inv * r_in  (LEFT multiply in world frame)
         #   Verified correct: path flat and parallel to grid in RVIZ ✓
         #   Note: output w may be negative (quaternion double-cover) — normalised below
+        
         self.r_rot = R.from_euler('y', self.pitch_deg, degrees=True)   # -30 deg
         self.r_inv = self.r_rot.inv()                                   # +30 deg
         self.R3    = self.r_inv.as_matrix()                             # 3x3 for pos/vel
         self.R6    = np.block([
             [self.R3, np.zeros((3, 3))],
             [np.zeros((3, 3)), self.R3]
-        ])
+        ])                                                              #R6 for covaraince
  
         debug_qos  = qos_profile_sensor_data
         mavros_qos = QoSProfile(

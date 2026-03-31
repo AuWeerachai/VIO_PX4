@@ -18,8 +18,8 @@
 # ---------------------------------------------------------------------------
 # *** ALL TUNABLE PARAMETERS  ***
 
-# Camera tilt angle in degrees (negative = tilt down)
-CAMERA_TILT_DEG=-30
+# tilt angle starting from camera to drone in degrees (negative = tilt up)
+CAMERA_TILT_DEG=-30.0
 
 # GPS origin
 GPS_LAT="40.41367045298802"
@@ -34,7 +34,7 @@ PARAM_IMU_FUSION=True
 DELAY_T1=8             # T1: wait for container before launching VIO
 DELAY_T2=8             # T2: wait for container before launching RViz
 DELAY_T3_CONTAINER=8   # T3: wait for container to be up (same as T1/T2)
-DELAY_T3_NODE=22       # T3: additional wait for visual_slam_node to initialize
+DELAY_T3_NODE=30       # T3: additional wait for visual_slam_node to initialize
 DELAY_T7_T8=3          # T8: wait after T7 starts
 DELAY_T8_T9=15         # T9: wait after T8 starts (MAVROS needs time to connect)
 
@@ -51,7 +51,7 @@ FCU_URL="serial:///dev/ttyUSB0:921600"
 # ---------------------------------------------------------------------------
 # Derived values (do not edit)
 # ---------------------------------------------------------------------------
-TILT_RAD_NEG=$(python3 -c "import math; print(-1 * math.radians($CAMERA_TILT_DEG))")
+TILT_RAD_NEG=$(python3 -c "import math; print(math.radians($CAMERA_TILT_DEG))")
 SCRIPTS="$WS/src/isaac_ros_common/scripts"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PANE_DIR="$SCRIPT_DIR/vio_panes"
@@ -164,7 +164,8 @@ PANE_EOF
 cat > "$PANE_DIR/t7_odom_relay.sh" << PANE_EOF
 #!/bin/bash
 echo "=== T7: Rotated odometry relay ==="
-ros2 run vio_utils rotated_odometry_relay_vio_px4
+ros2 run vio_utils rotated_odometry_relay_vio_px4 \
+    --ros-args -p pitch_deg:=$CAMERA_TILT_DEG
 exec bash
 PANE_EOF
 
