@@ -9,11 +9,9 @@
 #   T5: TF map -> ground
 #   T6: TF odom -> odom_tilt
 #   T7: Rotated odometry relay
-#   T8: GPS origin (starts early, waits for MAVROS subscriber then publishes)
-#   T9: MAVROS    (starts after T7, subscribes to GPS origin topic)
+#   T8: MAVROS
+#   T9: GPS origin (waits for MAVROS to be ready then publishes)
 # =============================================================================
-
-
 
 # ---------------------------------------------------------------------------
 # *** ALL TUNABLE PARAMETERS  ***
@@ -35,18 +33,16 @@ DELAY_T1=8             # T1: wait for container before launching VIO
 DELAY_T2=8             # T2: wait for container before launching RViz
 DELAY_T3_CONTAINER=8   # T3: wait for container to be up (same as T1/T2)
 DELAY_T3_NODE=30       # T3: additional wait for visual_slam_node to initialize
-DELAY_T7_T8=40          # T8: wait after T7 starts before publishing GPS origin
-DELAY_T7_T9=60         # T9: wait after T7 starts before launching MAVROS
+DELAY_T7_T8=40         # T8: wait after T7 starts before launching MAVROS
+DELAY_T7_T9=60         # T9: wait after T7 starts before publishing GPS origin
 
 # ---------------------------------------------------------------------------
-
 
 # Workspace and container
 WS="${ISAAC_ROS_WS:-$HOME/workspaces/isaac_ros-dev}"
 CONTAINER_NAME="isaac_ros_dev-aarch64-container"
 CONTAINER_WS="/workspaces/isaac_ros-dev"
 FCU_URL="serial:///dev/ttyUSB0:921600"
-
 
 # ---------------------------------------------------------------------------
 # Derived values (do not edit)
@@ -63,8 +59,8 @@ echo " Workspace   : ${WS}"
 echo " Container   : ${CONTAINER_NAME}"
 echo " T1/T2 delay : ${DELAY_T1}s"
 echo " T3 delay    : ${DELAY_T3_CONTAINER}s (container) + ${DELAY_T3_NODE}s (node)"
-echo " T8 delay    : ${DELAY_T7_T8}s after T7 (GPS origin, waits for MAVROS)"
-echo " T9 delay    : ${DELAY_T7_T9}s after T7 (MAVROS)"
+echo " T8 delay    : ${DELAY_T7_T8}s after T7 (MAVROS)"
+echo " T9 delay    : ${DELAY_T7_T9}s after T7 (GPS origin)"
 echo "=================================================="
 
 # ---------------------------------------------------------------------------
@@ -78,7 +74,6 @@ for cmd in gnome-terminal python3 docker; do
 done
 
 mkdir -p "$PANE_DIR"
-
 
 # ---------------------------------------------------------------------------
 # Generate per-pane scripts
@@ -170,37 +165,32 @@ ros2 run vio_utils rotated_odometry_relay_vio_px4 \
 exec bash
 PANE_EOF
 
-# -- T8: MAVROS ----------------------------------------------------------
+# -- T8: MAVROS --------------------------------------------------------------
 cat > "$PANE_DIR/t8_mavros.sh" << PANE_EOF
 #!/bin/bash
-echo "=== T8: Waiting ${DELAY_T7_T8}s for T7 ==="
+echo "=== T8: Waiting ${DELAY_T7_T8}s after T7 before launching MAVROS ==="
 sleep $DELAY_T7_T8
-echo "=== T9: Launching MAVROS ==="
+echo "=== T8: Launching MAVROS ==="
 ros2 launch mavros px4.launch fcu_url:=$FCU_URL
 exec bash
 PANE_EOF
 
-
-# -- T9: GPS ORIGIN --------------------------------------------------------------
-# Starts after T8 is already waiting.
-# T8 will automatically publish and exit.
+# -- T9: GPS origin ----------------------------------------------------------
 cat > "$PANE_DIR/t9_gps_origin.sh" << PANE_EOF
 #!/bin/bash
-echo "=== T9: Waiting ${DELAY_T7_T9}s after T7 ==="
+echo "=== T9: Waiting ${DELAY_T7_T9}s after T7 before publishing GPS origin ==="
 sleep $DELAY_T7_T9
-echo "=== T9: GPS origin ==="
+echo "=== T9: Setting GPS origin ==="
 echo "  latitude : $GPS_LAT"
 echo "  longitude: $GPS_LON"
 echo "  altitude : $GPS_ALT"
 ros2 topic pub --once /mavros/global_position/set_gp_origin \
-  geographic_msgs/msg/GeoPointStamped "
-header:
-  frame_id: ''
-position:
-  latitude: $GPS_LAT
-  longitude: $GPS_LON
-  altitude: $GPS_ALT"
-echo "=== T8: GPS origin published successfully ==="
+  geographic_msgs/msg/GeoPointStamped \
+  "{header: {frame_id: ''}, position: {latitude: $GPS_LAT, longitude: $GPS_LON, altitude: $GPS_ALT}}"
+echo "=== T9: GPS origin set ==="
+echo "  latitude : $GPS_LAT"
+echo "  longitude: $GPS_LON"
+echo "  altitude : $GPS_ALT"
 exec bash
 PANE_EOF
 
@@ -211,16 +201,16 @@ chmod +x "$PANE_DIR"/*.sh
 # ---------------------------------------------------------------------------
 echo "Launching gnome-terminal with 10 tabs..."
 gnome-terminal \
-    --tab --title "T0 - Container"   --command "bash $PANE_DIR/t0_container.sh" \
-    --tab --title "T1 - VIO"         --command "bash $PANE_DIR/t1_vio.sh" \
-    --tab --title "T2 - RViz"        --command "bash $PANE_DIR/t2_rviz.sh" \
-    --tab --title "T3 - Params"      --command "bash $PANE_DIR/t3_params.sh" \
-    --tab --title "T4 - TF Cam"      --command "bash $PANE_DIR/t4_tf_cam.sh" \
-    --tab --title "T5 - TF Map"      --command "bash $PANE_DIR/t5_tf_map.sh" \
-    --tab --title "T6 - TF Odom"     --command "bash $PANE_DIR/t6_tf_odom.sh" \
-    --tab --title "T7 - Odom Relay"  --command "bash $PANE_DIR/t7_odom_relay.sh" \
-    --tab --title "T8 - MAVROS"      --command "bash $PANE_DIR/t8_mavros.sh" \
-    --tab --title "T9 - GPS_ORIGIN"  --command "bash $PANE_DIR/t9_gps_origin.sh" &
+    --tab --title "T0 - Container"   --command "bash -i $PANE_DIR/t0_container.sh" \
+    --tab --title "T1 - VIO"         --command "bash -i $PANE_DIR/t1_vio.sh" \
+    --tab --title "T2 - RViz"        --command "bash -i $PANE_DIR/t2_rviz.sh" \
+    --tab --title "T3 - Params"      --command "bash -i $PANE_DIR/t3_params.sh" \
+    --tab --title "T4 - TF Cam"      --command "bash -i $PANE_DIR/t4_tf_cam.sh" \
+    --tab --title "T5 - TF Map"      --command "bash -i $PANE_DIR/t5_tf_map.sh" \
+    --tab --title "T6 - TF Odom"     --command "bash -i $PANE_DIR/t6_tf_odom.sh" \
+    --tab --title "T7 - Odom Relay"  --command "bash -i $PANE_DIR/t7_odom_relay.sh" \
+    --tab --title "T8 - MAVROS"      --command "bash -i $PANE_DIR/t8_mavros.sh" \
+    --tab --title "T9 - GPS Origin"  --command "bash -i $PANE_DIR/t9_gps_origin.sh" &
 
 echo "=================================================="
 echo " All 10 tabs launched!"
