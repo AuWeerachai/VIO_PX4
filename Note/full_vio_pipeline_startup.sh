@@ -22,8 +22,8 @@
 CAMERA_TILT_DEG=-30.0
 
 # GPS origin
-GPS_LAT="40.443241747280744"
-GPS_LON="-79.94605454862152"
+GPS_LAT="40.41367045298802"
+GPS_LON="-79.94633160928028"
 GPS_ALT="300.0"
 
 # ROS params (T3)
@@ -35,8 +35,8 @@ DELAY_T1=8             # T1: wait for container before launching VIO
 DELAY_T2=8             # T2: wait for container before launching RViz
 DELAY_T3_CONTAINER=8   # T3: wait for container to be up (same as T1/T2)
 DELAY_T3_NODE=30       # T3: additional wait for visual_slam_node to initialize
-DELAY_T7_T8=3          # T8: wait after T7 starts before publishing GPS origin
-DELAY_T7_T9=40         # T9: wait after T7 starts before launching MAVROS
+DELAY_T7_T8=40          # T8: wait after T7 starts before publishing GPS origin
+DELAY_T7_T9=60         # T9: wait after T7 starts before launching MAVROS
 
 # ---------------------------------------------------------------------------
 
@@ -170,15 +170,25 @@ ros2 run vio_utils rotated_odometry_relay_vio_px4 \
 exec bash
 PANE_EOF
 
-# -- T8: GPS origin ----------------------------------------------------------
-# Starts early and waits for MAVROS subscriber.
-# ros2 topic pub --once blocks until a subscriber appears, then publishes and exits.
-# This guarantees GPS origin is set the moment MAVROS (T9) comes up.
-cat > "$PANE_DIR/t8_gps_origin.sh" << PANE_EOF
+# -- T8: MAVROS ----------------------------------------------------------
+cat > "$PANE_DIR/t8_mavros.sh" << PANE_EOF
 #!/bin/bash
-echo "=== T8: Waiting ${DELAY_T7_T8}s after T7 ==="
+echo "=== T8: Waiting ${DELAY_T7_T8}s for T7 ==="
 sleep $DELAY_T7_T8
-echo "=== T8: GPS origin ready — waiting for MAVROS subscriber ==="
+echo "=== T9: Launching MAVROS ==="
+ros2 launch mavros px4.launch fcu_url:=$FCU_URL
+exec bash
+PANE_EOF
+
+
+# -- T9: GPS ORIGIN --------------------------------------------------------------
+# Starts after T8 is already waiting.
+# T8 will automatically publish and exit.
+cat > "$PANE_DIR/t9_gps_origin.sh" << PANE_EOF
+#!/bin/bash
+echo "=== T9: Waiting ${DELAY_T7_T9}s after T7 ==="
+sleep $DELAY_T7_T9
+echo "=== T9: GPS origin ==="
 echo "  latitude : $GPS_LAT"
 echo "  longitude: $GPS_LON"
 echo "  altitude : $GPS_ALT"
@@ -191,19 +201,6 @@ position:
   longitude: $GPS_LON
   altitude: $GPS_ALT"
 echo "=== T8: GPS origin published successfully ==="
-exec bash
-PANE_EOF
-
-# -- T9: MAVROS --------------------------------------------------------------
-# Starts after T8 is already waiting.
-# When MAVROS subscribes to /mavros/global_position/set_gp_origin,
-# T8 will automatically publish and exit.
-cat > "$PANE_DIR/t9_mavros.sh" << PANE_EOF
-#!/bin/bash
-echo "=== T9: Waiting ${DELAY_T7_T9}s for T7 (odometry relay) to be ready ==="
-sleep $DELAY_T7_T9
-echo "=== T9: Launching MAVROS ==="
-ros2 launch mavros px4.launch fcu_url:=$FCU_URL
 exec bash
 PANE_EOF
 
@@ -222,8 +219,8 @@ gnome-terminal \
     --tab --title "T5 - TF Map"      --command "bash $PANE_DIR/t5_tf_map.sh" \
     --tab --title "T6 - TF Odom"     --command "bash $PANE_DIR/t6_tf_odom.sh" \
     --tab --title "T7 - Odom Relay"  --command "bash $PANE_DIR/t7_odom_relay.sh" \
-    --tab --title "T8 - GPS Origin"  --command "bash $PANE_DIR/t8_gps_origin.sh" \
-    --tab --title "T9 - MAVROS"      --command "bash $PANE_DIR/t9_mavros.sh" &
+    --tab --title "T8 - MAVROS"      --command "bash $PANE_DIR/t8_mavros.sh" \
+    --tab --title "T9 - GPS_ORIGIN"  --command "bash $PANE_DIR/t9_gps_origin.sh" &
 
 echo "=================================================="
 echo " All 10 tabs launched!"
