@@ -59,6 +59,7 @@ class Config:
     odom_topic: str = "/visual_slam/tracking/odometry"
     heading_source: str = "compass"
     manual_heading_deg: float = 0.0
+    mag_declination_source: str = "table"
     mag_declination_deg: float = 0.0
     child_to_body_yaw_deg: float = 0.0
     state_dir: Path = field(default_factory=lambda: Path.home() / ".local/state/vio-test")
@@ -112,12 +113,43 @@ def save_config(cfg: Config) -> None:
         "odom_topic": cfg.odom_topic,
         "heading_source": cfg.heading_source,
         "manual_heading_deg": cfg.manual_heading_deg,
+        "mag_declination_source": cfg.mag_declination_source,
         "mag_declination_deg": cfg.mag_declination_deg,
         "child_to_body_yaw_deg": cfg.child_to_body_yaw_deg,
         "vio_px4_dir": str(cfg.vio_px4_dir),
         "ros_setup": str(cfg.ros_setup),
     }
     atomic_write_json(path, payload)
+
+
+def resolved_declination_deg(cfg: Config) -> Optional[float]:
+    """Preview the same bundled grid lookup used by the ROS bridge."""
+    if cfg.mag_declination_source == "manual":
+        return cfg.mag_declination_deg
+    table_path = (cfg.vio_px4_dir / "src/vio_px4_bridge/vio_px4_bridge/data/"
+                  "declination_table.json")
+    try:
+        table = json.loads(table_path.read_text())
+        grid = table["declination_deg"]
+        lon = cfg.home_lon
+        while lon > 180.0: lon -= 360.0
+        while lon < -180.0: lon += 360.0
+        i = min(max((cfg.home_lat-table["lat_min_deg"])/table["lat_step_deg"], 0.0), len(grid)-1.0)
+        j = min(max((lon-table["lon_min_deg"])/table["lon_step_deg"], 0.0), len(grid[0])-1.0)
+        i0, j0 = min(int(i), len(grid)-2), min(int(j), len(grid[0])-2)
+        fi, fj = i-i0, j-j0
+        return (grid[i0][j0]*(1-fi)*(1-fj) + grid[i0+1][j0]*fi*(1-fj)
+                + grid[i0][j0+1]*(1-fi)*fj + grid[i0+1][j0+1]*fi*fj)
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def declination_label(cfg: Config) -> str:
+    value = resolved_declination_deg(cfg)
+    if cfg.mag_declination_source == "table":
+        return (f"table(home)={value:.2f}°" if value is not None
+                else "table unavailable (launch blocked)")
+    return f"manual={cfg.mag_declination_deg:.2f}°"
 
 
 def atomic_write_json(path: Path, payload: dict) -> None:
@@ -145,6 +177,7 @@ def apply_dict(cfg: Config, data: dict) -> Config:
         "odom_topic",
         "heading_source",
         "manual_heading_deg",
+        "mag_declination_source",
         "mag_declination_deg",
         "child_to_body_yaw_deg",
     ):
@@ -566,6 +599,14 @@ def cmd_doctor(cfg: Config) -> int:
             str(cfg.vio_px4_dir),
         ),
     ]
+    if cfg.heading_source == "compass" and cfg.mag_declination_source == "table":
+        resolved_declination = resolved_declination_deg(cfg)
+        checks.append((
+            "Magnetic declination table",
+            resolved_declination is not None,
+            (f"home lookup {resolved_declination:.3f} deg"
+             if resolved_declination is not None else "missing or invalid"),
+        ))
     if cfg.mavlink_url.startswith("/dev/"):
         dev = cfg.mavlink_url.rsplit(":", 1)[0]
         exists = Path(dev).exists()
@@ -582,10 +623,8 @@ def cmd_doctor(cfg: Config) -> int:
             failed += 1
     print(f"\nhome LLA: {cfg.home_lat}, {cfg.home_lon}, {cfg.home_alt}")
     print(f"odom:     {cfg.odom_topic}")
-    print(
-        f"heading:  {cfg.heading_source}, declination={cfg.mag_declination_deg} deg, "
-        f"child-to-body={cfg.child_to_body_yaw_deg} deg"
-    )
+    print(f"heading:  {cfg.heading_source}, declination={declination_label(cfg)}, "
+          f"child-to-body={cfg.child_to_body_yaw_deg} deg")
     print(f"checklist: {cfg.vio_px4_dir / 'PX4_INTERFACE_CHECKLIST.md'}")
     print(f"config:   {user_config_path()}")
     return 0 if failed == 0 else 1
@@ -681,6 +720,7 @@ def cmd_gps(cfg: Config) -> None:
         "odom_topic": cfg.odom_topic,
         "heading_source": cfg.heading_source,
         "manual_heading_deg": cfg.manual_heading_deg,
+        "mag_declination_source": cfg.mag_declination_source,
         "mag_declination_deg": cfg.mag_declination_deg,
         "child_to_body_yaw_deg": cfg.child_to_body_yaw_deg,
     }
@@ -873,7 +913,19 @@ def configure_heading(cfg: Config) -> Config:
         print("Invalid source; use compass or manual.")
         pause()
         return cfg
-    declination = prompt_line("Magnetic declination", str(cfg.mag_declination_deg))
+    declination_source = prompt_line(
+        "Declination source (table/manual)", cfg.mag_declination_source
+    )
+    if declination_source is None:
+        return cfg
+    declination_source = (declination_source or cfg.mag_declination_source).lower()
+    if declination_source not in ("table", "manual"):
+        print("Invalid declination source; use table or manual.")
+        pause()
+        return cfg
+    declination = str(cfg.mag_declination_deg)
+    if declination_source == "manual":
+        declination = prompt_line("Magnetic declination", declination)
     mounting = prompt_line(
         "cuVSLAM child-to-body yaw", str(cfg.child_to_body_yaw_deg)
     )
@@ -887,6 +939,7 @@ def configure_heading(cfg: Config) -> Config:
         cfg = replace(
             cfg,
             heading_source=source,
+            mag_declination_source=declination_source,
             mag_declination_deg=values[0],
             child_to_body_yaw_deg=values[1],
             manual_heading_deg=values[2],
@@ -966,7 +1019,7 @@ def interactive_main(cfg: Config) -> int:
                 MenuItem(
                     "Heading alignment",
                     "heading",
-                    f"{cfg.heading_source}; declination={cfg.mag_declination_deg}°, "
+                    f"{cfg.heading_source}; declination={declination_label(cfg)}, "
                     f"child→body={cfg.child_to_body_yaw_deg}°",
                 ),
                 MenuItem("", "h3", disabled=True),

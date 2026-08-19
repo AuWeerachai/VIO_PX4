@@ -47,6 +47,11 @@ firmware because message handling and estimator requirements can change.
 
 ## Non-circular heading alignment
 
+- [ ] `MAG_DECLINATION_RESOLVED` reports the configured initial/home LLA, the
+  expected east-positive declination, bundled table path, and
+  `frozen_for_flight=true` before compass samples are accepted.
+- [ ] A table load/validation failure blocks launch. Manual fallback requires
+  explicitly selecting `mag_declination_source=manual`; never silently use 0°.
 - [ ] Request and receive PX4 `HIGHRES_IMU` magnetometer and `ATTITUDE` streams.
 - [ ] Use calibrated body-FRD magnetometer plus FC roll/pitch for tilt
   compensation. Do not use FC/EKF yaw in the alignment calculation.

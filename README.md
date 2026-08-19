@@ -141,6 +141,15 @@ infer horizontal motion or acceleration from roll/pitch: valid forward,
 backward, or lateral translation may occur while the body remains approximately
 level.
 
+Compass heading defaults to an offline magnetic-declination lookup. The bundled
+10-degree IGRF-derived grid is the same table used by vns-sdk (extracted from
+ArduPilot `AP_Declination`). At bridge startup, `home_lat_deg/home_lon_deg` are
+bilinearly interpolated once, the result is logged as
+`MAG_DECLINATION_RESOLVED`, and the value is frozen for that flight. The bridge
+does not update it from its own generated GPS output. A missing or invalid table
+blocks compass alignment; select `mag_declination_source:=manual` explicitly to
+use `mag_declination_deg` instead.
+
 ### Optional ROS2 SensorGps transport
 
 ```bash

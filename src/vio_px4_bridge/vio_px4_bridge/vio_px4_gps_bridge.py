@@ -12,6 +12,7 @@ Phases (same idea as vns-sdk GpsSpoof -> BasaltGpsBridge):
 
 from __future__ import annotations
 
+import json
 import math
 import time
 from enum import Enum
@@ -34,6 +35,8 @@ from vio_px4_bridge.geo_utils import tilt_compensated_compass_yaw
 from vio_px4_bridge.geo_utils import wrap_pi
 from vio_px4_bridge.geo_utils import yaw_from_quaternion_xyzw
 from vio_px4_bridge.local_continuity import LocalPoseContinuity
+from vio_px4_bridge.mag_declination import default_table_path
+from vio_px4_bridge.mag_declination import lookup_declination_deg
 
 
 class Phase(Enum):
@@ -96,7 +99,9 @@ class VioPx4GpsBridge(Node):
         # calibrated body-frame magnetometer, never the FC's fused yaw.
         self.declare_parameter("heading_source", "compass")  # compass | manual
         self.declare_parameter("manual_heading_deg", 0.0)
+        self.declare_parameter("mag_declination_source", "table")  # table | manual
         self.declare_parameter("mag_declination_deg", 0.0)
+        self.declare_parameter("mag_declination_table_path", "")
         self.declare_parameter("child_to_body_yaw_deg", 0.0)
         self.declare_parameter("mag_roll_offset_deg", 0.0)
         self.declare_parameter("mag_pitch_offset_deg", 0.0)
@@ -177,9 +182,40 @@ class VioPx4GpsBridge(Node):
         self.manual_heading_rad = math.radians(
             float(self.get_parameter("manual_heading_deg").value)
         )
-        self.mag_declination_rad = math.radians(
-            float(self.get_parameter("mag_declination_deg").value)
-        )
+        manual_declination_deg = float(self.get_parameter("mag_declination_deg").value)
+        self.mag_declination_source = str(
+            self.get_parameter("mag_declination_source").value
+        ).lower()
+        if self.mag_declination_source not in ("table", "manual"):
+            raise ValueError("mag_declination_source must be 'table' or 'manual'")
+        table_path_param = str(
+            self.get_parameter("mag_declination_table_path").value
+        ).strip()
+        resolved_declination_deg = manual_declination_deg
+        if self.heading_source == "compass" and self.mag_declination_source == "table":
+            table_path = table_path_param or str(default_table_path())
+            try:
+                resolved_declination_deg = lookup_declination_deg(
+                    self.home_lat, self.home_lon, table_path
+                )
+                self.get_logger().info(
+                    "MAG_DECLINATION_RESOLVED "
+                    f"source=initial_home lat_deg={self.home_lat:.7f} "
+                    f"lon_deg={self.home_lon:.7f} "
+                    f"declination_deg={resolved_declination_deg:.3f} "
+                    f"table={table_path}; frozen_for_flight=true"
+                )
+            except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+                self.get_logger().error(
+                    "MAG_DECLINATION_TABLE_FAILED "
+                    f"table={table_path} error={exc}; heading alignment blocked"
+                )
+                raise RuntimeError(
+                    "magnetic declination table lookup failed; repair the table "
+                    "or explicitly select mag_declination_source=manual"
+                ) from exc
+        self.mag_declination_deg = resolved_declination_deg
+        self.mag_declination_rad = math.radians(resolved_declination_deg)
         self.child_to_body_yaw_rad = math.radians(
             float(self.get_parameter("child_to_body_yaw_deg").value)
         )
