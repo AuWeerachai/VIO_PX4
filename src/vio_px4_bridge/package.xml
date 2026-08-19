@@ -5,7 +5,7 @@
 <package format="3">
   <name>vio_px4_bridge</name>
   <version>0.1.0</version>
-  <description>Bridge Isaac ROS VSLAM odometry to PX4 external vision via vehicle_visual_odometry.</description>
+  <description>Bridge Isaac ROS VSLAM odometry to PX4 via external vision and/or internship-style GPS (HIL_GPS spoof + live).</description>
 
   <maintainer email="auweerachais@gmail.com">au</maintainer>
   <license>TBD</license>
@@ -15,6 +15,8 @@
   <depend>nav_msgs</depend>
   <depend>px4_msgs</depend>
   <exec_depend>python3-scipy</exec_depend>
+  <exec_depend>python3-pymavlink</exec_depend>
+  <test_depend>python3-pytest</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

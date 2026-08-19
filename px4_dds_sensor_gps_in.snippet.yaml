@@ -1,0 +1,11 @@
+# Optional PX4 uXRCE-DDS patch: accept companion SensorGps on /fmu/in/sensor_gps
+#
+# Stock PX4 only publishes GPS out (/fmu/out/vehicle_gps_position).
+# For transport:=ros2 on vio_px4_gps_bridge, add this under `subscriptions:` in:
+#   PX4-Autopilot/src/modules/uxrce_dds_client/dds_topics.yaml
+# then rebuild PX4 firmware / SITL.
+#
+# Prefer transport:=mavlink (HIL_GPS + MAV_USEHILGPS=1) if you do not want a firmware rebuild.
+
+  - topic: /fmu/in/sensor_gps
+    type: px4_msgs::msg::SensorGps

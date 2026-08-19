@@ -14,8 +14,8 @@ from scipy.spatial.transform import Rotation
 
 class VisualOdometryBridge(Node): #python class name
     """
-    Input convention (ROS2):
-    - World frame: ENU
+    Input convention (cuVSLAM / ROS2):
+    - World frame: local FLU odom frame (relative to startup)
     - Body frame: FLU
 
     Output convention (PX4):
@@ -35,6 +35,7 @@ class VisualOdometryBridge(Node): #python class name
         self.declare_parameter("use_timesync", True)
         self.declare_parameter("timesync_topic", "/fmu/out/timesync_status")
         self.declare_parameter("timesync_timeout_us", 1_000_000)
+        self.declare_parameter("input_world_frame", "local_flu")  # local_flu | earth_enu
 
         # Read parameters.
         self.odom_topic = str(self.get_parameter("odom_topic").value)
@@ -45,6 +46,11 @@ class VisualOdometryBridge(Node): #python class name
         self.use_timesync = bool(self.get_parameter("use_timesync").value)
         self.timesync_topic = str(self.get_parameter("timesync_topic").value)
         self.timesync_timeout_us = int(self.get_parameter("timesync_timeout_us").value)
+        self.input_world_frame = str(
+            self.get_parameter("input_world_frame").value
+        ).lower()
+        if self.input_world_frame not in ("local_flu", "earth_enu"):
+            raise ValueError("input_world_frame must be local_flu or earth_enu")
 
 
 
@@ -73,6 +79,10 @@ class VisualOdometryBridge(Node): #python class name
 
         self.get_logger().info("Subscribed odometry: " + self.odom_topic)
         self.get_logger().info("Publishing PX4 vision odometry: " + self.px4_topic)
+        self.get_logger().info(
+            "Input world frame: " + self.input_world_frame
+            + (" -> PX4 local FRD" if self.input_world_frame == "local_flu" else " -> PX4 NED")
+        )
         if self.use_timesync:
             self.get_logger().info("Subscribed timesync: " + self.timesync_topic)
 
@@ -104,19 +114,25 @@ class VisualOdometryBridge(Node): #python class name
             px4_odom.timestamp_sample = px4_now_us
         
         
-        # Output pose frame (world frame): PX4 expects NED.
-        px4_odom.pose_frame = VehicleOdometry.POSE_FRAME_NED
-
-
-        # Position: ROS ENU -> PX4 NED.
+        # cuVSLAM reports odom_frame -> base_frame relative to startup. That is
+        # a local ROS FLU frame, not geographic ENU. PX4 has an explicit local
+        # FRD pose frame for this case. Earth ENU remains available only for a
+        # genuinely north/east-aligned upstream source.
         ros_position = [msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z,]
-        px4_position = self.enu_to_ned_vector(ros_position) 
+        if self.input_world_frame == "local_flu":
+            px4_odom.pose_frame = VehicleOdometry.POSE_FRAME_FRD
+            px4_position = self.flu_to_frd_vector(ros_position)
+        else:
+            px4_odom.pose_frame = VehicleOdometry.POSE_FRAME_NED
+            px4_position = self.enu_to_ned_vector(ros_position)
         px4_odom.position = [float(px4_position[0]),float(px4_position[1]),float(px4_position[2]),]
 
 
         # Orientation: ROS quaternion (ENU, FLU) -> PX4 quaternion (NED, FRD).
         ros_quat_wxyz = [msg.pose.pose.orientation.w, msg.pose.pose.orientation.x, msg.pose.pose.orientation.y, msg.pose.pose.orientation.z,]
-        px4_quat_wxyz = self.convert_orientation_ROS2_to_PX4(ros_quat_wxyz)
+        px4_quat_wxyz = self.convert_orientation_ROS2_to_PX4(
+            ros_quat_wxyz, self.input_world_frame
+        )
         px4_odom.q = [float(px4_quat_wxyz[0]), float(px4_quat_wxyz[1]), float(px4_quat_wxyz[2]), float(px4_quat_wxyz[3]),]
 
 
@@ -139,10 +155,13 @@ class VisualOdometryBridge(Node): #python class name
         floor = 1e-6
         pose_covariance = msg.pose.covariance
         twist_covariance = msg.twist.covariance
-        position_variance_enu = self.covariance_diag_with_floor(pose_covariance, 0, 7, 14, floor)
-        orientation_variance_enu = self.covariance_diag_with_floor(pose_covariance, 21, 28, 35, floor)
-        px4_odom.position_variance = self.swap_xy_variance(position_variance_enu)
-        px4_odom.orientation_variance = self.swap_xy_variance(orientation_variance_enu)
+        position_variance = self.covariance_diag_with_floor(pose_covariance, 0, 7, 14, floor)
+        orientation_variance = self.covariance_diag_with_floor(pose_covariance, 21, 28, 35, floor)
+        if self.input_world_frame == "earth_enu":
+            position_variance = self.swap_xy_variance(position_variance)
+            orientation_variance = self.swap_xy_variance(orientation_variance)
+        px4_odom.position_variance = position_variance
+        px4_odom.orientation_variance = orientation_variance
         px4_odom.velocity_variance = self.covariance_diag_with_floor(twist_covariance, 0, 7, 14, floor)
 
 
@@ -184,7 +203,7 @@ class VisualOdometryBridge(Node): #python class name
         return [x_frd, y_frd, z_frd]
 
 
-    def convert_orientation_ROS2_to_PX4(self, quat_wxyz): # Transform orientation: ROS ENU/FLU -> PX4 NED/FRD
+    def convert_orientation_ROS2_to_PX4(self, quat_wxyz, input_world_frame="earth_enu"):
         # Frame conversions:
         # World-frame: ENU -> NED
         # ENU axes:  X=East, Y=North, Z=Up (PX4)
@@ -215,11 +234,17 @@ class VisualOdometryBridge(Node): #python class name
 
         ### LEFT MULTIPLY: CHANGE THE REFERENCE FRAME (like changing base frame in arm manipulation)
         ### RIGHT MULTIPLY: CHANGE THE BODY FRAME (like changing the end effector frame in arm maipulation)
-        rotation_ned_frd = (
-            rotation_ned_from_enu
-            * rotation_enu_flu
-            * rotation_flu_from_frd
-        )
+        if input_world_frame == "local_flu":
+            # Change both the local world and body convention FLU -> FRD.
+            rotation_ned_frd = (
+                rotation_flu_from_frd * rotation_enu_flu * rotation_flu_from_frd
+            )
+        else:
+            rotation_ned_frd = (
+                rotation_ned_from_enu
+                * rotation_enu_flu
+                * rotation_flu_from_frd
+            )
 
         output_xyzw = rotation_ned_frd.as_quat()
         output_wxyz = self.quat_xyzw_to_wxyz(output_xyzw)

@@ -11,14 +11,17 @@ setup(
         ('share/' + package_name, ['package.xml']),
     ],
     install_requires=['setuptools'],
+    tests_require=['pytest'],
     zip_safe=True,
     maintainer='au',
     maintainer_email='you@example.com',
-    description='Bridge Isaac ROS VSLAM odometry to PX4 external vision.',
+    description='Bridge Isaac ROS VSLAM odometry to PX4 (EV and internship-style GPS).',
     license='TBD',
     entry_points={
         'console_scripts': [
             'vio_px4_bridge = vio_px4_bridge.vio_px4_bridge:main',
+            'visual_odometry_bridge = vio_px4_bridge.vio_px4_bridge:main',
+            'vio_px4_gps_bridge = vio_px4_bridge.vio_px4_gps_bridge:main',
         ],
     },
 )
