@@ -12,6 +12,7 @@ import errno
 import json
 import math
 import os
+import shutil
 import shlex
 import signal
 import subprocess
@@ -52,6 +53,9 @@ class Config:
     )
     ros_setup: Path = field(default_factory=lambda: Path("/opt/ros/humble/setup.bash"))
     mavros_dir: Path = field(default_factory=lambda: Path.home() / "workspaces/mavros")
+    isaac_ros_dir: Path = field(
+        default_factory=lambda: Path.home() / "workspaces/isaac_ros-dev"
+    )
     px4_msgs_setup: Optional[Path] = None
     home_lat: float = 40.4433
     home_lon: float = -79.9436
@@ -126,6 +130,7 @@ def save_config(cfg: Config) -> None:
         "vio_px4_dir": str(cfg.vio_px4_dir),
         "ros_setup": str(cfg.ros_setup),
         "mavros_dir": str(cfg.mavros_dir),
+        "isaac_ros_dir": str(cfg.isaac_ros_dir),
     }
     atomic_write_json(path, payload)
 
@@ -191,7 +196,7 @@ def apply_dict(cfg: Config, data: dict) -> Config:
     ):
         if key in data and data[key] is not None:
             updates[key] = data[key]
-    for key in ("vio_px4_dir", "ros_setup", "mavros_dir"):
+    for key in ("vio_px4_dir", "ros_setup", "mavros_dir", "isaac_ros_dir"):
         if key in data and data[key]:
             updates[key] = expand(str(data[key]))
     return replace(cfg, **updates) if updates else cfg
@@ -536,6 +541,55 @@ def serial_users(device: Path) -> list[int]:
     return [int(value) for value in result.stdout.split() if value.isdigit()]
 
 
+ISAAC_CONTAINER = "isaac_ros_dev-aarch64-container"
+
+
+def isaac_container_running() -> bool:
+    result = subprocess.run(
+        ["docker", "inspect", "-f", "{{.State.Running}}", ISAAC_CONTAINER],
+        capture_output=True, text=True, check=False,
+    )
+    return result.returncode == 0 and result.stdout.strip() == "true"
+
+
+def ensure_isaac_container(cfg: Config, timeout_s: float = 90.0) -> None:
+    if isaac_container_running():
+        print(f"Isaac container already running: {ISAAC_CONTAINER}")
+        return
+    run_dev = cfg.isaac_ros_dir / "src/isaac_ros_common/scripts/run_dev.sh"
+    if not run_dev.exists():
+        raise RuntimeError(f"Missing NVIDIA container launcher: {run_dev}")
+    if not os.environ.get("DISPLAY"):
+        raise RuntimeError(
+            "DISPLAY is not set. Open vio-test from the Jetson AnyDesk desktop "
+            "terminal so it can create the required interactive container tab."
+        )
+    if not shutil.which("gnome-terminal"):
+        raise RuntimeError("gnome-terminal is required to host NVIDIA's interactive container")
+    command = (
+        f"export ISAAC_ROS_WS={shlex.quote(str(cfg.isaac_ros_dir))}; "
+        f"cd {shlex.quote(str(run_dev.parent))}; "
+        f"{shlex.quote(str(run_dev))} --skip_image_build; "
+        "echo 'Isaac container exited. Press Enter to close.'; read"
+    )
+    subprocess.Popen(
+        ["gnome-terminal", "--title", "Isaac ROS Container", "--",
+         "bash", "-lc", command],
+        start_new_session=True,
+    )
+    print("Opened Isaac ROS container terminal; waiting for Docker readiness...")
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if isaac_container_running():
+            print(f"Isaac container ready: {ISAAC_CONTAINER}")
+            return
+        time.sleep(1.0)
+    raise RuntimeError(
+        f"Isaac container did not become ready within {timeout_s:.0f}s. "
+        "Inspect the 'Isaac ROS Container' terminal tab."
+    )
+
+
 def ros_topic_names(cfg: Config) -> set[str]:
     command = (
         f"{ros_prefix(cfg, [cfg.vio_px4_dir / 'install/setup.bash'])} && "
@@ -633,6 +687,11 @@ def cmd_doctor(cfg: Config) -> int:
             "MAVROS install (Path B)",
             (cfg.mavros_dir / "install/setup.bash").exists(),
             str(cfg.mavros_dir),
+        ),
+        (
+            "Isaac ROS workspace",
+            (cfg.isaac_ros_dir / "src/isaac_ros_common/scripts/run_dev.sh").exists(),
+            str(cfg.isaac_ros_dir),
         ),
     ]
     if cfg.heading_source == "compass" and cfg.mag_declination_source == "table":
@@ -735,6 +794,7 @@ def cmd_ev_bridge(cfg: Config) -> None:
 
 
 def cmd_vio(cfg: Config) -> None:
+    ensure_isaac_container(cfg)
     script = cfg.vio_px4_dir / "scripts/start_cuvslam_body.sh"
     if not script.exists():
         raise RuntimeError(f"Missing cuVSLAM launcher: {script}")
