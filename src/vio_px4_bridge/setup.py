@@ -20,9 +20,8 @@ setup(
     license='TBD',
     entry_points={
         'console_scripts': [
-            'vio_px4_bridge = vio_px4_bridge.vio_px4_bridge:main',
-            'visual_odometry_bridge = vio_px4_bridge.vio_px4_bridge:main',
             'vio_px4_gps_bridge = vio_px4_bridge.vio_px4_gps_bridge:main',
+            'mavros_ev_bridge = vio_px4_bridge.mavros_ev_bridge:main',
         ],
     },
 )

@@ -2,7 +2,7 @@
 
 Two ways to feed the Cube+/PX4 EKF from Jetson VIO:
 
-1. **External vision (original)** — `/fmu/in/vehicle_visual_odometry`
+1. **External vision** — cuVSLAM body odometry through MAVROS `ODOMETRY`
 2. **Internship-style GPS (new)** — boot GPS spoof, then VIO projected as GPS via `HIL_GPS`
 
 The internship ArduPilot stack uses MAVLink `GPS_INPUT`. Stock PX4 does **not** fuse that the same way. PX4’s supported inject path is **`HIL_GPS`** with **`MAV_USEHILGPS=1`** (source sysid must match the vehicle, usually `1`).
@@ -11,10 +11,9 @@ The internship ArduPilot stack uses MAVLink `GPS_INPUT`. Stock PX4 does **not** 
 
 ```bash
 source /opt/ros/humble/setup.bash
-source ~/ws_px4_dev/install/setup.bash   # or wherever px4_msgs is
-sudo apt install -y python3-scipy python3-pymavlink
+sudo apt install -y python3-pymavlink
 
-cd ~/Desktop/VIO_PX4
+cd ~/workspaces/VIO_PX4_NEW_PIPELINE
 colcon build --packages-select vio_px4_bridge
 source install/setup.bash
 ```
@@ -24,7 +23,7 @@ source install/setup.bash
 Commander-style helper (inspired by `theseus-packages`) lives in `tools/vio-test/`:
 
 ```bash
-ln -sf ~/Desktop/VIO_PX4/tools/vio-test/vio-test ~/.local/bin/vio-test
+ln -sf ~/workspaces/VIO_PX4_NEW_PIPELINE/tools/vio-test/vio-test ~/.local/bin/vio-test
 vio-test doctor
 vio-test run a    # GPS spoof → live
 vio-test run b    # EV path
@@ -33,13 +32,10 @@ vio-test stop
 
 See `tools/vio-test/README.md` and `~/test_procedure.txt`.
 
-## 1) External vision bridge (unchanged)
+## 1) External vision through MAVROS
 
 ```bash
-ros2 run vio_px4_bridge vio_px4_bridge --ros-args \
-  -p odom_topic:=/visual_slam/tracking/odometry \
-  -p px4_topic:=/fmu/in/vehicle_visual_odometry \
-  -p input_world_frame:=local_flu
+vio-test run b
 ```
 
 PX4 params (EV):
@@ -47,10 +43,10 @@ PX4 params (EV):
   transform have been verified. Do not blindly use `EKF2_EV_CTRL = 15`.
 - `EKF2_HGT_REF = Vision`
 
-NVIDIA defines this odometry as `odom_frame -> base_frame`, relative to startup.
-The bridge therefore publishes `POSE_FRAME_FRD` for the default `local_flu`
-mode. Use `input_world_frame:=earth_enu` only when an upstream system genuinely
-georeferences the world axes to east/north/up.
+Path B starts MAVROS on `/dev/ttyUSB0:921600`, then relays validated body-frame
+cuVSLAM odometry to `/mavros/odometry/out`. Micro XRCE-DDS and `px4_msgs` are not
+part of the Jetson deployment. The relay rejects raw `camera_link` poses; use
+`scripts/start_cuvslam_body.sh` so cuVSLAM publishes `child_frame_id=drone_link`.
 
 ## 2) Internship-style GPS spoof + live VIO GPS (recommended for GPS path)
 
@@ -74,7 +70,7 @@ Point `mavlink_url` at the Cube+ MAVLink endpoint reachable from the Jetson
 ```bash
 ros2 run vio_px4_bridge vio_px4_gps_bridge --ros-args \
   -p transport:=mavlink \
-  -p mavlink_url:=udpout:127.0.0.1:14540 \
+  -p mavlink_url:=/dev/ttyUSB0:921600 \
   -p mavlink_sysid:=1 \
   -p odom_topic:=/visual_slam/tracking/odometry \
   -p home_lat_deg:=40.4433 \
@@ -83,7 +79,7 @@ ros2 run vio_px4_bridge vio_px4_gps_bridge --ros-args \
   -p spoof_duration_s:=15.0 \
   -p spoof_until_vio:=true \
   -p heading_source:=compass \
-  -p mag_declination_deg:=0.0 \
+  -p mag_declination_source:=table \
   -p child_to_body_yaw_deg:=0.0 \
   -p rate_hz:=10.0
 ```
@@ -150,18 +146,8 @@ does not update it from its own generated GPS output. A missing or invalid table
 blocks compass alignment; select `mag_declination_source:=manual` explicitly to
 use `mag_declination_deg` instead.
 
-### Optional ROS2 SensorGps transport
-
-```bash
-ros2 run vio_px4_bridge vio_px4_gps_bridge --ros-args \
-  -p transport:=ros2 \
-  -p ros2_gps_topic:=/fmu/in/sensor_gps \
-  ...
-```
-
-Stock PX4 DDS yaml only has **out** GPS. To use this, add the subscription in
-`px4_dds_sensor_gps_in.snippet.yaml` to `uxrce_dds_client/dds_topics.yaml` and rebuild PX4.
-Prefer `transport:=mavlink` unless you want that firmware change.
+Path A owns `/dev/ttyUSB0` directly. MAVROS must not run concurrently; the CLI
+checks for an existing serial-port owner and fails rather than competing for it.
 
 ## What was *not* done
 

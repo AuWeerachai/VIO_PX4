@@ -13,8 +13,7 @@
   <buildtool_depend>ament_python</buildtool_depend>
   <depend>rclpy</depend>
   <depend>nav_msgs</depend>
-  <depend>px4_msgs</depend>
-  <exec_depend>python3-scipy</exec_depend>
+  <exec_depend>mavros</exec_depend>
   <exec_depend>python3-pymavlink</exec_depend>
   <test_depend>python3-pytest</test_depend>
 

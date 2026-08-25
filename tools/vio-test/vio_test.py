@@ -47,14 +47,17 @@ def user_config_path() -> Path:
 
 @dataclass
 class Config:
-    vio_px4_dir: Path = field(default_factory=lambda: Path.home() / "Desktop/VIO_PX4")
+    vio_px4_dir: Path = field(
+        default_factory=lambda: Path.home() / "workspaces/VIO_PX4_NEW_PIPELINE"
+    )
     ros_setup: Path = field(default_factory=lambda: Path("/opt/ros/humble/setup.bash"))
+    mavros_dir: Path = field(default_factory=lambda: Path.home() / "workspaces/mavros")
     px4_msgs_setup: Optional[Path] = None
     home_lat: float = 40.4433
     home_lon: float = -79.9436
     home_alt: float = 300.0
     # Jetson↔Cube is typically UART, but a routed UDP MAVLink link also works.
-    mavlink_url: str = "/dev/ttyTHS1:921600"
+    mavlink_url: str = "/dev/ttyUSB0:921600"
     mavlink_sysid: int = 1
     odom_topic: str = "/visual_slam/tracking/odometry"
     heading_source: str = "compass"
@@ -76,7 +79,11 @@ def default_config() -> Config:
     home = Path.home()
     desktop = home / "Desktop"
     return Config(
-        vio_px4_dir=first_existing([str(desktop / "VIO_PX4"), "~/VIO_PX4"])
+        vio_px4_dir=first_existing([
+            "~/workspaces/VIO_PX4_NEW_PIPELINE",
+            str(desktop / "VIO_PX4"),
+            "~/VIO_PX4",
+        ])
         or (desktop / "VIO_PX4"),
         ros_setup=first_existing(["/opt/ros/humble/setup.bash", "/opt/ros/jazzy/setup.bash"])
         or Path("/opt/ros/humble/setup.bash"),
@@ -86,7 +93,7 @@ def default_config() -> Config:
                 str(desktop / "VIO_PX4/install/setup.bash"),
             ]
         ),
-        mavlink_url="/dev/ttyTHS1:921600",
+        mavlink_url="/dev/ttyUSB0:921600",
     )
 
 
@@ -118,6 +125,7 @@ def save_config(cfg: Config) -> None:
         "child_to_body_yaw_deg": cfg.child_to_body_yaw_deg,
         "vio_px4_dir": str(cfg.vio_px4_dir),
         "ros_setup": str(cfg.ros_setup),
+        "mavros_dir": str(cfg.mavros_dir),
     }
     atomic_write_json(path, payload)
 
@@ -183,7 +191,7 @@ def apply_dict(cfg: Config, data: dict) -> Config:
     ):
         if key in data and data[key] is not None:
             updates[key] = data[key]
-    for key in ("vio_px4_dir", "ros_setup"):
+    for key in ("vio_px4_dir", "ros_setup", "mavros_dir"):
         if key in data and data[key]:
             updates[key] = expand(str(data[key]))
     return replace(cfg, **updates) if updates else cfg
@@ -194,7 +202,7 @@ def load_config(ns: argparse.Namespace | None = None) -> Config:
     cfg = apply_dict(cfg, load_saved_overrides())
     saved = load_saved_overrides()
     if "mavlink_url" not in saved:
-        cfg = replace(cfg, mavlink_url="/dev/ttyTHS1:921600")
+        cfg = replace(cfg, mavlink_url="/dev/ttyUSB0:921600")
     if ns is None:
         return cfg
     updates = {}
@@ -505,7 +513,7 @@ def validate_mavlink_url(value: str) -> Optional[str]:
     if value.startswith("/dev/"):
         device, separator, baud = value.rpartition(":")
         if not separator or not device or not baud.isdigit() or int(baud) <= 0:
-            return "Serial link must look like /dev/ttyTHS1:921600"
+            return "Serial link must look like /dev/ttyUSB0:921600"
         return None
     if value.startswith(("udpout:", "udpin:")):
         parts = value.split(":")
@@ -519,6 +527,13 @@ def validate_mavlink_url(value: str) -> Optional[str]:
             return "UDP port must be between 1 and 65535"
         return None
     return "Use a serial link (/dev/...:BAUD) or UDP link (udpout:HOST:PORT)"
+
+
+def serial_users(device: Path) -> list[int]:
+    result = subprocess.run(
+        ["fuser", str(device)], capture_output=True, text=True, check=False
+    )
+    return [int(value) for value in result.stdout.split() if value.isdigit()]
 
 
 def ros_topic_names(cfg: Config) -> set[str]:
@@ -583,6 +598,22 @@ def require_ros_message(
         )
 
 
+def require_mavros_connected(cfg: Config, timeout_s: float = 10.0) -> None:
+    command = (
+        f"{ros_prefix(cfg, [cfg.mavros_dir / 'install/setup.bash'])} && "
+        "ros2 topic echo --no-daemon --once /mavros/state"
+    )
+    try:
+        result = subprocess.run(
+            ["bash", "-lc", command], capture_output=True, text=True,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("MAVROS did not publish state before timeout") from exc
+    if result.returncode != 0 or "connected: true" not in result.stdout.lower():
+        raise RuntimeError("MAVROS is running but is not connected to the Cube")
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -597,6 +628,11 @@ def cmd_doctor(cfg: Config) -> int:
             "VIO_PX4 install",
             (cfg.vio_px4_dir / "install/setup.bash").exists(),
             str(cfg.vio_px4_dir),
+        ),
+        (
+            "MAVROS install (Path B)",
+            (cfg.mavros_dir / "install/setup.bash").exists(),
+            str(cfg.mavros_dir),
         ),
     ]
     if cfg.heading_source == "compass" and cfg.mag_declination_source == "table":
@@ -655,7 +691,7 @@ def cmd_status(cfg: Config) -> None:
             if latest_state[0] >= 0:
                 phase = latest_state[1]
         elif p.get("name") == "ev-bridge":
-            phase = "external-vision bridge running"
+            phase = "MAVROS external-vision relay running"
         print(f"  {p['name']}  {phase}  pid={p['pid']}  since={p['startedAt']}")
         print(f"    log: {p['logFile']}")
 
@@ -664,23 +700,53 @@ def cmd_ev_bridge(cfg: Config) -> None:
     setup = cfg.vio_px4_dir / "install/setup.bash"
     if not setup.exists():
         raise RuntimeError(f"Missing {setup} — build vio_px4_bridge first")
-    print("Checking PX4 middleware...", flush=True)
-    require_px4_ros_link(cfg)
-    print("PX4 middleware ready.")
     print(f"Checking live VIO odometry on {cfg.odom_topic}...", flush=True)
     require_ros_message(cfg, cfg.odom_topic, "VIO odometry", timeout_s=5.0)
     print("VIO odometry ready.")
-    odom_arg = shlex.quote(f"odom_topic:={cfg.odom_topic}")
-    px4_arg = shlex.quote("px4_topic:=/fmu/in/vehicle_visual_odometry")
+    if not find_proc(cfg, "mavros"):
+        mavros_setup = cfg.mavros_dir / "install/setup.bash"
+        if not mavros_setup.exists():
+            raise RuntimeError(f"Missing MAVROS setup: {mavros_setup}")
+        if not cfg.mavlink_url.startswith("/dev/"):
+            raise RuntimeError("Path B currently requires the Jetson serial link")
+        serial_device, _, baud = cfg.mavlink_url.rpartition(":")
+        holders = serial_users(Path(serial_device))
+        if holders:
+            raise RuntimeError(
+                f"{serial_device} is already open by pid(s) {holders}; stop Path A "
+                "or the old MAVROS launcher first"
+            )
+        mavros_cmd = (
+            f"{ros_prefix(cfg, [mavros_setup])} && ros2 launch mavros px4.launch "
+            f"fcu_url:=serial://{serial_device}:{baud}"
+        )
+        mavros_proc = start_managed(cfg, "mavros", mavros_cmd, startup_check_s=3.0)
+        print(f"Started MAVROS pid={mavros_proc['pid']}; waiting for FCU connection...")
+        require_mavros_connected(cfg, timeout_s=10.0)
     cmd = (
-        f"{ros_prefix(cfg, [setup])} && ros2 run vio_px4_bridge vio_px4_bridge --ros-args"
-        f" -p {odom_arg}"
-        f" -p {px4_arg}"
-        " -p input_world_frame:=local_flu"
+        f"{ros_prefix(cfg, [setup])} && ros2 run vio_px4_bridge mavros_ev_bridge --ros-args"
+        f" -p {shlex.quote(f'odom_topic:={cfg.odom_topic}')}"
+        " -p expected_child_frame:=drone_link"
+        " -p output_parent_frame:=odom"
     )
     proc = start_managed(cfg, "ev-bridge", cmd)
     print(f"Started EV bridge pid={proc['pid']}")
     print(f"log: {proc['logFile']}")
+
+
+def cmd_vio(cfg: Config) -> None:
+    script = cfg.vio_px4_dir / "scripts/start_cuvslam_body.sh"
+    if not script.exists():
+        raise RuntimeError(f"Missing cuVSLAM launcher: {script}")
+    cmd = f"{ros_prefix(cfg)} && bash {shlex.quote(str(script))}"
+    proc = start_managed(cfg, "cuvslam", cmd, startup_check_s=3.0)
+    print(f"Started body-frame cuVSLAM pid={proc['pid']}; waiting for odometry...")
+    try:
+        require_ros_message(cfg, cfg.odom_topic, "body-frame cuVSLAM odometry", 30.0)
+    except Exception:
+        stop_managed(cfg, "cuvslam")
+        raise
+    print("cuVSLAM body odometry ready.")
 
 
 def cmd_gps(cfg: Config) -> None:
@@ -702,6 +768,12 @@ def cmd_gps(cfg: Config) -> None:
             )
         if not os.access(serial_device, os.R_OK | os.W_OK):
             raise RuntimeError(f"No read/write permission for {serial_device}")
+        holders = serial_users(serial_device)
+        if holders:
+            raise RuntimeError(
+                f"{serial_device} is already open by pid(s) {holders}. Path A needs "
+                "exclusive serial access; stop MAVROS first."
+            )
     params = {
         "transport": "mavlink",
         "mavlink_url": cfg.mavlink_url,
@@ -723,6 +795,7 @@ def cmd_gps(cfg: Config) -> None:
         "mag_declination_source": cfg.mag_declination_source,
         "mag_declination_deg": cfg.mag_declination_deg,
         "child_to_body_yaw_deg": cfg.child_to_body_yaw_deg,
+        "expected_child_frame": "drone_link",
     }
     param_args = " ".join(
         f"-p {shlex.quote(f'{name}:={value}')}" for name, value in params.items()
@@ -745,6 +818,14 @@ def cmd_run(
     which = normalize_path(path_arg)
     label = "GPS spoof + VIO GPS" if which == "a" else "external vision"
     print(f"Starting Path {which.upper()} ({label})...\n", flush=True)
+
+    try:
+        require_ros_message(cfg, cfg.odom_topic, "body-frame cuVSLAM odometry", 2.0)
+    except RuntimeError:
+        if not find_proc(cfg, "cuvslam"):
+            cmd_vio(cfg)
+        else:
+            raise RuntimeError("cuVSLAM is running but body-frame odometry is not ready")
 
     if which == "b":
         if find_proc(cfg, "gps-bridge"):
@@ -814,7 +895,7 @@ def configure_link(cfg: Config) -> Config:
     choice = select_menu(
         "MAVLink transport",
         [
-            MenuItem("UART / serial (typical Jetson)", "uart", "e.g. /dev/ttyTHS1:921600"),
+            MenuItem("UART / serial (Jetson FTDI → TELEM2)", "uart", "e.g. /dev/ttyUSB0:921600"),
             MenuItem("UDP out", "udp", "e.g. udpout:127.0.0.1:14540"),
             MenuItem("Keep current", "keep", cfg.mavlink_url),
             MenuItem("Back", "back"),
@@ -840,7 +921,7 @@ def configure_link(cfg: Config) -> Config:
         if dev in (None, "back"):
             return cfg
         if dev == "custom":
-            dev = prompt_line("Device path", "/dev/ttyTHS1")
+            dev = prompt_line("Device path", "/dev/ttyUSB0")
             if not dev:
                 return cfg
         baud = prompt_line("Baud", "921600") or "921600"
@@ -1002,7 +1083,7 @@ def interactive_main(cfg: Config) -> int:
                 MenuItem(
                     "Path B — External vision (local)",
                     "run-b",
-                    "VIO → /fmu/in/vehicle_visual_odometry",
+                    "body-frame VIO → MAVROS → PX4 ODOMETRY",
                 ),
                 MenuItem("", "h2", disabled=True),
                 MenuItem("Setup", "hdr2", disabled=True),
@@ -1107,6 +1188,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("doctor")
     sub.add_parser("status")
     sub.add_parser("ev-bridge")
+    sub.add_parser("vio")
     sub.add_parser("gps")
 
     run_p = sub.add_parser("run")
@@ -1141,6 +1223,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             cmd_status(cfg)
         elif args.command == "ev-bridge":
             cmd_ev_bridge(cfg)
+        elif args.command == "vio":
+            cmd_vio(cfg)
         elif args.command == "gps":
             cmd_gps(cfg)
         elif args.command == "run":

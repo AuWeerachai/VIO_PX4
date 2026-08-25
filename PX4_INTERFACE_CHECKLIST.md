@@ -87,16 +87,17 @@ firmware because message handling and estimator requirements can change.
 - [ ] Connect cuVSLAM's explicit tracking/reset event as the primary re-anchor
   trigger; residual thresholds are a conservative fallback, not sole evidence.
 
-## Path B: vehicle_visual_odometry contract
+## Path B: MAVROS ODOMETRY contract
 
-- [ ] `/fmu/in/vehicle_visual_odometry` exists in the firmware DDS topic table
-  and the configured ROS 2 middleware is alive before launch.
+- [ ] MAVROS exclusively owns `/dev/ttyUSB0:921600` and `/mavros/state` reports
+  `connected: true` before the EV relay starts.
+- [ ] Micro XRCE-DDS and `px4_msgs` are not required or started for Path B.
 - [ ] Publish at 30-50 Hz when practical; PX4 documentation warns that low-rate
   external vision may not be fused.
 - [ ] `EKF2_EV_CTRL` enables only intended position, height, velocity and yaw
   fields. Do not fuse EV yaw until the VIO frame has been aligned deliberately.
-- [ ] `VehicleOdometry.pose_frame` matches the actual data frame. Do not label an
-  arbitrary cuVSLAM world as NED merely after a fixed ENU/NED axis swap.
+- [ ] cuVSLAM publishes `child_frame_id=drone_link`; the relay rejects
+  `camera_link` so camera pose cannot be mistaken for vehicle-body pose.
 - [ ] Position, orientation, velocity, covariance and timestamps use consistent
   PX4 frames and time domain.
 - [ ] Configure `EKF2_EV_DELAY` and `EKF2_EV_POS_X/Y/Z` for measured latency and
@@ -104,7 +105,7 @@ firmware because message handling and estimator requirements can change.
 
 ## Acceptance checks before propellers
 
-- [ ] PX4 `listener sensor_gps` (Path A) or `listener vehicle_visual_odometry`
+- [ ] PX4 `listener sensor_gps` (Path A) or MAVLink `ODOMETRY` inspection
   (Path B) shows the intended rate, frame, values and no dropouts.
 - [ ] Move the vehicle north/east/up by a known direction and verify signs and
   scale independently of PX4's fused output.

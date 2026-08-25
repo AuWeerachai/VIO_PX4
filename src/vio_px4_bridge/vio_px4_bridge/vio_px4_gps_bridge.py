@@ -19,7 +19,10 @@ from enum import Enum
 
 import rclpy
 from nav_msgs.msg import Odometry
-from px4_msgs.msg import SensorGps
+try:
+    from px4_msgs.msg import SensorGps
+except ImportError:
+    SensorGps = None
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy
 from rclpy.qos import HistoryPolicy
@@ -55,6 +58,7 @@ class VioPx4GpsBridge(Node):
         super().__init__("vio_px4_gps_bridge")
 
         self.declare_parameter("odom_topic", "/visual_slam/tracking/odometry")
+        self.declare_parameter("expected_child_frame", "drone_link")
         self.declare_parameter("transport", "mavlink")  # mavlink | ros2
         self.declare_parameter("mavlink_url", "udpout:127.0.0.1:14540")
         self.declare_parameter("mavlink_sysid", 1)
@@ -120,6 +124,7 @@ class VioPx4GpsBridge(Node):
         self.declare_parameter("continuity_max_yaw_rate_deg_s", 200.0)
 
         self.odom_topic = str(self.get_parameter("odom_topic").value)
+        self.expected_child_frame = str(self.get_parameter("expected_child_frame").value)
         self.transport = str(self.get_parameter("transport").value).lower()
         self.mavlink_url = str(self.get_parameter("mavlink_url").value)
         self.mavlink_sysid = int(self.get_parameter("mavlink_sysid").value)
@@ -279,6 +284,7 @@ class VioPx4GpsBridge(Node):
             "ignore_velocity": False,
         }
         self.have_vio = False
+        self.rejected_odom_frame = None
         self.last_vio_time = None
         self.vio_stale_warned = False
         self.last_rc_position = None
@@ -412,6 +418,10 @@ class VioPx4GpsBridge(Node):
                 )
                 self.get_logger().info("Requested ATTITUDE and HIGHRES_IMU at 20 Hz")
         elif self.transport == "ros2":
+            if SensorGps is None:
+                raise RuntimeError(
+                    "transport=ros2 requires px4_msgs; use transport=mavlink on the Jetson"
+                )
             qos = QoSProfile(
                 reliability=ReliabilityPolicy.BEST_EFFORT,
                 durability=DurabilityPolicy.VOLATILE,
@@ -454,6 +464,16 @@ class VioPx4GpsBridge(Node):
         return None
 
     def _odom_callback(self, msg: Odometry):
+        if msg.child_frame_id != self.expected_child_frame:
+            if msg.child_frame_id != self.rejected_odom_frame:
+                self.rejected_odom_frame = msg.child_frame_id
+                self.get_logger().error(
+                    "VIO_FRAME_REJECTED "
+                    f"received={msg.child_frame_id!r} required={self.expected_child_frame!r}; "
+                    "GPS output remains gated"
+                )
+            return
+        self.rejected_odom_frame = None
         if not self.logged_odom_frames:
             self.get_logger().info(
                 "cuVSLAM odometry frames: "
