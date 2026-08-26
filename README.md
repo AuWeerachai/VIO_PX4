@@ -9,16 +9,27 @@ The internship ArduPilot stack uses MAVLink `GPS_INPUT`. Stock PX4 does **not** 
 
 ## Fresh Jetson setup
 
-The repository contains the VIO bridges, operator launcher, and the
-project-owned Isaac ROS launch overrides. On a Jetson that already has the
-Isaac ROS cuVSLAM workspace:
+The repository contains the VIO bridges, operator launcher, and project-owned
+Isaac ROS launch overrides. For a Jetson that does not yet have Isaac ROS,
+provision the compatible NVIDIA base and this project together:
+
+```bash
+cd ~/workspaces
+git clone -b vio-as-gps git@github.com:AuWeerachai/VIO_PX4.git
+cd VIO_PX4
+./scripts/bootstrap_isaac_ros.sh --install-deps
+./vio-launch
+```
+
+If the compatible Isaac ROS/cuVSLAM workspace already exists, only install the
+project layer:
 
 ```bash
 cd ~/workspaces
 git clone -b vio-as-gps git@github.com:AuWeerachai/VIO_PX4.git
 cd VIO_PX4
 ./scripts/bootstrap_jetson.sh --install-deps
-~/vio-launch
+./vio-launch
 ```
 
 If the Isaac workspace is elsewhere, pass `--isaac-ws PATH`. The bootstrap
@@ -31,13 +42,14 @@ logs, bags, credentials, and Docker images are intentionally not stored in Git.
 
 ## Operator launcher
 
-Commander-style helper (inspired by `theseus-packages`) lives in `tools/vio-launch/`:
+Run the repository-root entry point; its implementation is versioned under
+`scripts/vio-launch/`:
 
 ```bash
-~/vio-launch
+./vio-launch
 ```
 
-See `tools/vio-launch/README.md`.
+See `scripts/vio-launch/README.md`.
 
 ## 1) External vision through MAVROS
 

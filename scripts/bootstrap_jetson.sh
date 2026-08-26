@@ -88,9 +88,9 @@ set -u
 cd "$REPO_DIR"
 colcon build --packages-select vio_px4_bridge
 
-ln -sfn "$REPO_DIR/tools/vio-launch/vio-launch" "$HOME/vio-launch"
+ln -sfn "$REPO_DIR/scripts/vio-launch/vio-launch" "$HOME/vio-launch"
 mkdir -p "$HOME/.local/bin"
-ln -sfn "$REPO_DIR/tools/vio-launch/vio-launch" "$HOME/.local/bin/vio-launch"
+ln -sfn "$REPO_DIR/scripts/vio-launch/vio-launch" "$HOME/.local/bin/vio-launch"
 
 echo
 echo "Jetson bootstrap complete."

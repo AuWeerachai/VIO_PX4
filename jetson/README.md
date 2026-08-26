@@ -12,6 +12,13 @@ cd ~/workspaces/VIO_PX4
 ~/vio-launch
 ```
 
+For a Jetson without the NVIDIA workspace, run
+`./scripts/bootstrap_isaac_ros.sh --install-deps` instead. It selects only the
+supported ROS 2 Humble Isaac ROS release for the detected JetPack/L4T version,
+clones NVIDIA's `isaac_ros_common`, downloads the matching visual-SLAM assets,
+and then invokes `bootstrap_jetson.sh`. It deliberately rejects unknown JetPack
+versions rather than installing an incompatible current release.
+
 The bootstrap script copies the reviewed overrides to:
 
 ```text

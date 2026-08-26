@@ -5,7 +5,7 @@ Interactive companion CLI (inspired by `theseus-packages`) for VIO ↔ PX4.
 **On Jetson (AnyDesk):** run `vio-launch` with no args → a numbered menu pops up.
 
 ```bash
-cd ~/workspaces/VIO_PX4_NEW_PIPELINE/tools/vio-launch
+cd ~/workspaces/VIO_PX4/scripts/vio-launch
 ./vio-launch
 ```
 

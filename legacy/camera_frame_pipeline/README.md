@@ -13,6 +13,6 @@ Production files live under:
 
 ```text
 jetson/isaac_ros_overrides/
-tools/vio-launch/
+scripts/vio-launch/
 src/vio_px4_bridge/
 ```
