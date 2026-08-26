@@ -7,35 +7,42 @@ Two ways to feed the Cube+/PX4 EKF from Jetson VIO:
 
 The internship ArduPilot stack uses MAVLink `GPS_INPUT`. Stock PX4 does **not** fuse that the same way. PX4’s supported inject path is **`HIL_GPS`** with **`MAV_USEHILGPS=1`** (source sysid must match the vehicle, usually `1`).
 
-## Build
+## Fresh Jetson setup
+
+The repository contains the VIO bridges, operator launcher, and the
+project-owned Isaac ROS launch overrides. On a Jetson that already has the
+Isaac ROS cuVSLAM workspace:
 
 ```bash
-source /opt/ros/humble/setup.bash
-sudo apt install -y python3-pymavlink
-
-cd ~/workspaces/VIO_PX4_NEW_PIPELINE
-colcon build --packages-select vio_px4_bridge
-source install/setup.bash
+cd ~/workspaces
+git clone -b vio-as-gps git@github.com:AuWeerachai/VIO_PX4.git
+cd VIO_PX4
+./scripts/bootstrap_jetson.sh --install-deps
+~/vio-launch
 ```
 
-## Automate test_procedure (`vio-test` CLI)
+If the Isaac workspace is elsewhere, pass `--isaac-ws PATH`. The bootstrap
+creates backups of existing Isaac launch scripts, installs the versioned
+overrides, builds `vio_px4_bridge`, and creates both `~/vio-launch` and
+`~/.local/bin/vio-launch`.
 
-Commander-style helper (inspired by `theseus-packages`) lives in `tools/vio-test/`:
+See `jetson/README.md` for the installed paths. Generated ROS build trees,
+logs, bags, credentials, and Docker images are intentionally not stored in Git.
+
+## Operator launcher
+
+Commander-style helper (inspired by `theseus-packages`) lives in `tools/vio-launch/`:
 
 ```bash
-ln -sf ~/workspaces/VIO_PX4_NEW_PIPELINE/tools/vio-test/vio-test ~/.local/bin/vio-test
-vio-test doctor
-vio-test run a    # GPS spoof → live
-vio-test run b    # EV path
-vio-test stop
+~/vio-launch
 ```
 
-See `tools/vio-test/README.md` and `~/test_procedure.txt`.
+See `tools/vio-launch/README.md`.
 
 ## 1) External vision through MAVROS
 
 ```bash
-vio-test run b
+vio-launch run b
 ```
 
 PX4 params (EV):
@@ -46,7 +53,8 @@ PX4 params (EV):
 Path B starts MAVROS on `/dev/ttyUSB0:921600`, then relays validated body-frame
 cuVSLAM odometry to `/mavros/odometry/out`. Micro XRCE-DDS and `px4_msgs` are not
 part of the Jetson deployment. The relay rejects raw `camera_link` poses; use
-`scripts/start_cuvslam_body.sh` so cuVSLAM publishes `child_frame_id=drone_link`.
+the installed `jetson/isaac_ros_overrides/scripts/start_vio.sh` so cuVSLAM
+publishes `child_frame_id=drone_link` directly.
 
 ## 2) Internship-style GPS spoof + live VIO GPS (recommended for GPS path)
 
@@ -64,8 +72,7 @@ Same *pattern* as vns-sdk `GpsSpoof` → `BasaltGpsBridge`:
 
 ### Run (MAVLink / HIL_GPS — works on stock PX4)
 
-Point `mavlink_url` at the Cube+ MAVLink endpoint reachable from the Jetson
-(example UDP; change to your serial/UDP route):
+Point `mavlink_url` at the Cube+ MAVLink endpoint reachable from the Jetson:
 
 ```bash
 ros2 run vio_px4_bridge vio_px4_gps_bridge --ros-args \
@@ -77,7 +84,10 @@ ros2 run vio_px4_bridge vio_px4_gps_bridge --ros-args \
   -p home_lon_deg:=-79.9436 \
   -p home_alt_m:=300.0 \
   -p spoof_duration_s:=15.0 \
-  -p spoof_until_vio:=true \
+  -p spoof_until_vio:=false \
+  -p boot_accuracy_m:=0.5 \
+  -p cruise_eph_m:=0.5 \
+  -p horizontal_only_output:=true \
   -p heading_source:=compass \
   -p mag_declination_source:=table \
   -p child_to_body_yaw_deg:=0.0 \
@@ -89,16 +99,21 @@ ros2 run vio_px4_bridge vio_px4_gps_bridge --ros-args \
 | Param | Value | Why |
 |-------|-------|-----|
 | `MAV_USEHILGPS` | `1` | Accept companion `HIL_GPS` |
-| `EKF2_GPS_CTRL` | normally `7` | Position, altitude, velocity; heading bit off |
+| `EKF2_GPS_CTRL` | `1` | Fuse GPS longitude/latitude only, matching vns-sdk |
 | `EKF2_EV_CTRL` | `0` (while testing GPS path) | Avoid fighting EV |
-| `EKF2_HGT_REF` | GPS or Baro | Match your height source |
-| Onboard GNSS | disable or carefully blend | Real Cube+ GPS will fight the inject |
+| `EKF2_HGT_REF` | Baro | PX4 owns height; VIO GPS contributes horizontal position only |
+| `GPS_1_CONFIG` | `201` | Keep physical Here GNSS on GPS1 |
+| `GPS_2_CONFIG` | `0` | VIO arrives over MAVLink, not a second GPS serial driver |
+| `SENS_GPS_MASK` | `0` | Do not blend physical GNSS and VIO |
+| `SENS_GPS_PRIME` | verify on hardware | Instance numbering changes when physical GNSS is absent |
 
 Reboot FC after param changes.
 
-The bridge refuses to start if `MAV_USEHILGPS` is not `1`, position/velocity
-fusion is missing, GPS heading fusion is enabled, or the sender system ID does
-not match PX4. Set the real magnetic declination and measured cuVSLAM
+The bridge refuses to start if `MAV_USEHILGPS` is not `1`, horizontal-position
+fusion is missing, unsupported GPS fusion bits are enabled, the sender system ID does
+not match PX4, or exposed dual-GPS selector values contradict the VIO-first
+policy. Firmware without `SENS_GPS_MASK`/`SENS_GPS_PRIME` produces an explicit
+unverified-selection warning and requires inspection before flight. Set the real magnetic declination and measured cuVSLAM
 child-to-body yaw in the CLI's **Heading alignment** menu. Review
 `PX4_INTERFACE_CHECKLIST.md` before hardware testing.
 
@@ -148,6 +163,12 @@ use `mag_declination_deg` instead.
 
 Path A owns `/dev/ttyUSB0` directly. MAVROS must not run concurrently; the CLI
 checks for an existing serial-port owner and fails rather than competing for it.
+
+`HIL_GPS` requires altitude and velocity fields on the wire. In the deployed
+horizontal-only mode, altitude is held at the configured origin and velocity is
+zero; `EKF2_GPS_CTRL=1` leaves height and velocity estimation to PX4. Only
+latitude and longitude carry live VIO motion. Horizontal accuracy remains
+0.5 m instead of loosening after the boot phase.
 
 ## What was *not* done
 

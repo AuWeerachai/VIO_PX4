@@ -3,10 +3,8 @@ set -euo pipefail
 
 ISAAC_WS="${ISAAC_ROS_WS:-$HOME/workspaces/isaac_ros-dev}"
 CONTAINER_NAME="${ISAAC_CONTAINER_NAME:-isaac_ros_dev-aarch64-container}"
-CAMERA_PITCH_DEG="${CAMERA_PITCH_DEG:--30.0}"
-CAMERA_TO_BODY_X_M="${CAMERA_TO_BODY_X_M:-0.0}"
-CAMERA_TO_BODY_Y_M="${CAMERA_TO_BODY_Y_M:-0.0}"
-CAMERA_TO_BODY_Z_M="${CAMERA_TO_BODY_Z_M:-0.0}"
+PID_FILE="/tmp/vio_px4_new_pipeline_cuvslam.pid"
+OWNER_TAG="vio_px4_new_pipeline"
 
 if ! docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null | grep -qx true; then
   echo "Container $CONTAINER_NAME is not running." >&2
@@ -14,19 +12,26 @@ if ! docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null | grep
   exit 1
 fi
 
-pitch_rad=$(python3 -c "import math; print(math.radians(float('$CAMERA_PITCH_DEG')))" )
-ros2 run tf2_ros static_transform_publisher \
-  "$CAMERA_TO_BODY_X_M" "$CAMERA_TO_BODY_Y_M" "$CAMERA_TO_BODY_Z_M" \
-  0 "$pitch_rad" 0 camera_link drone_link &
-tf_pid=$!
-trap 'kill "$tf_pid" 2>/dev/null || true' EXIT INT TERM
+if docker exec "$CONTAINER_NAME" bash -lc '
+  for env_file in /proc/[0-9]*/environ; do
+    { tr "\0" "\n" < "$env_file" | grep -qx "VIO_PIPELINE_OWNER=vio_px4_new_pipeline"; } 2>/dev/null && exit 0
+  done
+  exit 1
+'; then
+  echo "The VIO_PX4_NEW_PIPELINE cuVSLAM instance is already running in $CONTAINER_NAME." >&2
+  exit 2
+fi
 
 docker exec -u admin --workdir /workspaces/isaac_ros-dev "$CONTAINER_NAME" \
-  bash -lc 'source /opt/ros/humble/setup.bash && \
+  env VIO_CUVSLAM_PID_FILE="$PID_FILE" \
+      VIO_PIPELINE_OWNER="$OWNER_TAG" \
+  bash -lc 'set -e; source /opt/ros/humble/setup.bash; \
+    echo $$ > "$VIO_CUVSLAM_PID_FILE"; \
+    cleanup() { rm -f "$VIO_CUVSLAM_PID_FILE"; }; \
+    trap cleanup EXIT INT TERM; \
     ros2 launch isaac_ros_examples isaac_ros_examples.launch.py \
       launch_fragments:=realsense_stereo_rect,visual_slam \
       interface_specs_file:=/workspaces/isaac_ros-dev/isaac_ros_assets/isaac_ros_visual_slam/quickstart_interface_specs.json \
-      base_frame:=drone_link \
-      enable_imu_fusion:=True \
+      base_frame:=camera_link \
       image_jitter_threshold_ms:=60.0 \
       camera_optical_frames:="['"'"'camera_infra1_optical_frame'"'"', '"'"'camera_infra2_optical_frame'"'"']"'

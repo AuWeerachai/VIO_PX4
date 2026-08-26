@@ -3,3 +3,9 @@ install/
 log/
 __pycache__/
 *.pyc
+.pytest_cache/
+*.log
+*.bag
+*.db3
+.config/
+.local-state/
