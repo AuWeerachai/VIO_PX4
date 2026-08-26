@@ -1,0 +1,15 @@
+diff --git a/docker/Dockerfile.realsense b/docker/Dockerfile.realsense
+index 2c91710..998ded4 100644
+--- a/docker/Dockerfile.realsense
++++ b/docker/Dockerfile.realsense
+@@ -42,3 +42,10 @@ RUN --mount=type=cache,target=/var/cache/apt \
+     && fakeroot debian/rules binary \
+     && cd ../ && apt-get install -y ./*.deb && rm ./*.deb \
+     && cd ../ && rm -Rf realsense-ros
++
++# new install
++RUN apt-get update && apt-get install -y --no-install-recommends \
++    ros-humble-isaac-ros-visual-slam \
++    ros-humble-isaac-ros-examples \
++    ros-humble-isaac-ros-realsense \
++ && rm -rf /var/lib/apt/lists/*

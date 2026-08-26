@@ -26,6 +26,8 @@ done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 ISAAC_SCRIPTS="$ISAAC_WS/src/isaac_ros_common/scripts"
+ISAAC_COMMON="$ISAAC_WS/src/isaac_ros_common"
+ISAAC_VSLAM="$ISAAC_COMMON/isaac_ros_visual_slam"
 
 [[ -f /opt/ros/humble/setup.bash ]] || {
   echo "ROS 2 Humble is required at /opt/ros/humble." >&2
@@ -81,6 +83,28 @@ install_override \
 install -m 0644 \
   "$REPO_DIR/jetson/isaac_ros_overrides/.isaac_ros_common-config" \
   "$ISAAC_SCRIPTS/.isaac_ros_common-config"
+
+realsense_patch="$REPO_DIR/jetson/isaac_ros_overrides/docker/Dockerfile.realsense.patch"
+if grep -q 'ros-humble-isaac-ros-visual-slam' "$ISAAC_COMMON/docker/Dockerfile.realsense"; then
+  echo "Isaac ROS RealSense image already contains the VIO runtime packages."
+elif git -C "$ISAAC_COMMON" apply --check "$realsense_patch"; then
+  git -C "$ISAAC_COMMON" apply "$realsense_patch"
+  echo "Installed the versioned VIO runtime layer in Dockerfile.realsense."
+else
+  echo "Dockerfile.realsense does not match the pinned Isaac ROS base; refusing to patch it." >&2
+  exit 1
+fi
+
+vslam_patch="$REPO_DIR/jetson/isaac_ros_overrides/visual_slam/proven_jetson.patch"
+if git -C "$ISAAC_VSLAM" apply --reverse --check "$vslam_patch" 2>/dev/null; then
+  echo "Isaac ROS visual-slam source already matches the proven Jetson patch."
+elif git -C "$ISAAC_VSLAM" apply --check "$vslam_patch"; then
+  git -C "$ISAAC_VSLAM" apply "$vslam_patch"
+  echo "Installed the proven Jetson visual-slam source patch."
+else
+  echo "isaac_ros_visual_slam does not match the pinned source; refusing to patch it." >&2
+  exit 1
+fi
 
 set +u
 source /opt/ros/humble/setup.bash

@@ -1,0 +1,35 @@
+diff --git a/isaac_ros_visual_slam/launch/isaac_ros_visual_slam_realsense.launch.py b/isaac_ros_visual_slam/launch/isaac_ros_visual_slam_realsense.launch.py
+index 35934a1..e855679 100644
+--- a/isaac_ros_visual_slam/launch/isaac_ros_visual_slam_realsense.launch.py
++++ b/isaac_ros_visual_slam/launch/isaac_ros_visual_slam_realsense.launch.py
+@@ -33,7 +33,7 @@ def generate_launch_description():
+             'enable_color': False,
+             'enable_depth': False,
+             'depth_module.emitter_enabled': 0,
+-            'depth_module.profile': '640x360x90',
++            'depth_module.profile': '640x360x30',
+             'enable_gyro': True,
+             'enable_accel': True,
+             'gyro_fps': 200,
+diff --git a/isaac_ros_visual_slam/src/visual_slam_node.cpp b/isaac_ros_visual_slam/src/visual_slam_node.cpp
+index 5a6b6e2..83a8575 100644
+--- a/isaac_ros_visual_slam/src/visual_slam_node.cpp
++++ b/isaac_ros_visual_slam/src/visual_slam_node.cpp
+@@ -59,7 +59,7 @@ VisualSlamNode::VisualSlamNode(rclcpp::NodeOptions options)
+   enable_ground_constraint_in_slam_(
+     declare_parameter<bool>("enable_ground_constraint_in_slam", false)),
+   enable_localization_n_mapping_(declare_parameter<bool>("enable_localization_n_mapping", true)),
+-  enable_imu_fusion_(declare_parameter<bool>("enable_imu_fusion", false)),
++  enable_imu_fusion_(declare_parameter<bool>("enable_imu_fusion", true)),//false
+   enable_debug_imu_mode_(declare_parameter<bool>("debug_imu_mode", false)),
+   imu_params_{
+     declare_parameter<double>("gyro_noise_density", 0.000244),
+@@ -67,7 +67,7 @@ VisualSlamNode::VisualSlamNode(rclcpp::NodeOptions options)
+     declare_parameter<double>("accel_noise_density", 0.001862),
+     declare_parameter<double>("accel_random_walk", 0.003),
+     declare_parameter<double>("calibration_frequency", 200.0)},
+-  image_jitter_threshold_ms_(declare_parameter<double>("image_jitter_threshold_ms", 34.0)),
++  image_jitter_threshold_ms_(declare_parameter<double>("image_jitter_threshold_ms", 60.0)),//34.0
+   imu_jitter_threshold_ms_(declare_parameter<double>("imu_jitter_threshold_ms", 10.0)),
+   save_map_folder_path_(declare_parameter<std::string>("save_map_folder_path", "")),
+   load_map_folder_path_(declare_parameter<std::string>("load_map_folder_path", "")),
