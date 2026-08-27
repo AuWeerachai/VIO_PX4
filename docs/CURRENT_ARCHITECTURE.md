@@ -66,6 +66,6 @@ This Git repository owns:
 - PX4 interface and staged-IMU documentation.
 
 The external Isaac ROS workspace owns NVIDIA packages, Docker support, and
-`run_dev.sh`. `scripts/bootstrap_jetson.sh` installs this repository's reviewed
+`run_dev.sh`. `bootstrap/bootstrap_jetson.sh` installs this repository's reviewed
 overrides into that workspace. Docker images, ROS build products, runtime logs,
 flight bags, maps, and credentials are intentionally excluded from Git.

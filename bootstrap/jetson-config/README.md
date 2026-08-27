@@ -8,12 +8,12 @@ workspace:
 
 ```bash
 cd ~/workspaces/VIO_PX4
-./scripts/bootstrap_jetson.sh --install-deps
+./bootstrap/bootstrap_jetson.sh --install-deps
 ~/vio-launch
 ```
 
 For a Jetson without the NVIDIA workspace, run
-`./scripts/bootstrap_isaac_ros.sh --install-deps` instead. It selects only the
+`./bootstrap/bootstrap_isaac_ros.sh --install-deps` instead. It selects only the
 supported ROS 2 Humble Isaac ROS release for the detected JetPack/L4T version,
 clones NVIDIA's `isaac_ros_common`, downloads the matching visual-SLAM assets,
 and then invokes `bootstrap_jetson.sh`. It deliberately rejects unknown JetPack
@@ -28,7 +28,7 @@ ${ISAAC_ROS_WS}/src/isaac_ros_common/scripts/.isaac_ros_common-config
 ```
 
 It creates timestamped backups before replacing existing files. The Git copies
-under `jetson-config/isaac_ros_overrides/` remain authoritative.
+under `bootstrap/jetson-config/isaac_ros_overrides/` remain authoritative.
 
 Both large runtime workspaces remain standalone siblings:
 

@@ -43,7 +43,7 @@ forward their escape sequences correctly.
 ## First-time on Jetson
 
 1. Clone this repository into `~/workspaces/VIO_PX4`.
-2. Run `./scripts/bootstrap_jetson.sh --install-deps` from the repository root.
+2. Run `./bootstrap/bootstrap_jetson.sh --install-deps` from the repository root.
 3. Run `~/vio-launch`.
 4. **FC link → UART** → pick your serial device / baud.
 5. **Path A** for internship-style GPS, or **Path B** for local EV.

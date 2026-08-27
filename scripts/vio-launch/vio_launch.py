@@ -861,7 +861,7 @@ def cmd_ev_bridge(cfg: Config) -> None:
         )
         if mavros_check.returncode != 0:
             raise RuntimeError(
-                "MAVROS is not installed. Run scripts/bootstrap_jetson.sh --install-deps"
+                "MAVROS is not installed. Run bootstrap/bootstrap_jetson.sh --install-deps"
             )
         if not cfg.mavlink_url.startswith("/dev/"):
             raise RuntimeError("Path B currently requires the Jetson serial link")

@@ -20,7 +20,7 @@ ROS 2 Humble system.
 | Docker image key | `aarch64.ros2_humble.realsense` |
 
 The authoritative machine-readable pins are in
-`jetson-config/isaac_ros_release.env`.
+`bootstrap/jetson-config/isaac_ros_release.env`.
 
 ## Why the original setup was difficult to reproduce
 
@@ -51,7 +51,7 @@ Start from a Jetson already flashed with the matching JetPack 6.2.x family:
 cd ~/workspaces
 git clone -b vio-as-gps git@github.com:AuWeerachai/VIO_PX4.git
 cd VIO_PX4
-./scripts/bootstrap_isaac_ros.sh --install-deps
+./bootstrap/bootstrap_isaac_ros.sh --install-deps
 ./vio-launch
 ```
 
@@ -67,7 +67,7 @@ The bootstrap performs these operations in order:
 
 `bootstrap_jetson.sh` also reconstructs the standalone
 `~/workspaces/mavros` workspace at the pinned commit recorded in
-`jetson-config/mavros_release.env`, applies the proven Jetson patch, and builds it.
+`bootstrap/jetson-config/mavros_release.env`, applies the proven Jetson patch, and builds it.
 MAVROS remains a sibling dependency rather than being nested in VIO_PX4. It is
 used by Path B; Path A talks MAVLink directly and does not start MAVROS.
 
