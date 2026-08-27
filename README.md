@@ -37,6 +37,19 @@ creates backups of existing Isaac launch scripts, installs the versioned
 overrides, builds `vio_px4_bridge`, and creates both `~/vio-launch` and
 `~/.local/bin/vio-launch`.
 
+The deployment keeps NVIDIA Isaac ROS and MAVROS as standalone sibling
+workspaces rather than vendoring their generated build trees:
+
+```text
+~/workspaces/isaac_ros-dev
+~/workspaces/mavros
+~/workspaces/VIO_PX4
+```
+
+The full bootstrap creates both dependency workspaces at the pinned, proven
+revisions. Path A uses `isaac_ros-dev` but owns MAVLink directly; Path B uses
+both `isaac_ros-dev` and MAVROS.
+
 See `jetson/README.md` for the installed paths. Generated ROS build trees,
 logs, bags, credentials, and Docker images are intentionally not stored in Git.
 

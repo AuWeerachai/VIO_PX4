@@ -65,6 +65,12 @@ The bootstrap performs these operations in order:
 6. Installs the project-owned body-frame/extrinsic launch scripts.
 7. Builds the VIO/PX4 ROS package and exposes `~/vio-launch`.
 
+`bootstrap_jetson.sh` also reconstructs the standalone
+`~/workspaces/mavros` workspace at the pinned commit recorded in
+`jetson/mavros_release.env`, applies the proven Jetson patch, and builds it.
+MAVROS remains a sibling dependency rather than being nested in VIO_PX4. It is
+used by Path B; Path A talks MAVLink directly and does not start MAVROS.
+
 The first `./vio-launch` invocation asks `run_dev.sh` to build/pull the large
 Isaac ROS image. Docker caches unchanged layers, so subsequent launches should
 reuse the image. Changing a relevant Dockerfile invalidates that layer and

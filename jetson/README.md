@@ -30,6 +30,17 @@ ${ISAAC_ROS_WS}/src/isaac_ros_common/scripts/.isaac_ros_common-config
 It creates timestamped backups before replacing existing files. The Git copies
 under `jetson/isaac_ros_overrides/` remain authoritative.
 
+Both large runtime workspaces remain standalone siblings:
+
+```text
+~/workspaces/isaac_ros-dev   # NVIDIA cuVSLAM/RealSense container workspace
+~/workspaces/mavros          # MAVROS source/build workspace for Path B
+~/workspaces/VIO_PX4         # this project
+```
+
+The full bootstrap creates and builds the first two; generated build trees and
+Docker images are intentionally not nested in this repository or committed.
+
 The default launch is the proven visual-only cuVSLAM configuration. The staged
 RealSense IMU design is documented in `docs/STAGED_IMU_IMPLEMENTATION.md` and
 must not become the default until it passes the documented bench tests.

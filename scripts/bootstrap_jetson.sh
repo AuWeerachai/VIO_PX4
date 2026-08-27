@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: bootstrap_jetson.sh [--install-deps] [--isaac-ws PATH]
+Usage: bootstrap_jetson.sh [--install-deps] [--isaac-ws PATH] [--mavros-ws PATH]
 
 Prepare a Jetson that already has an Isaac ROS cuVSLAM workspace. This installs
 project-owned Isaac launch overrides, builds vio_px4_bridge, and creates
@@ -14,10 +14,12 @@ EOF
 
 INSTALL_DEPS=false
 ISAAC_WS="${ISAAC_ROS_WS:-$HOME/workspaces/isaac_ros-dev}"
+MAVROS_WS="$HOME/workspaces/mavros"
 while (($#)); do
   case "$1" in
     --install-deps) INSTALL_DEPS=true; shift ;;
     --isaac-ws) ISAAC_WS="${2:?--isaac-ws requires a path}"; shift 2 ;;
+    --mavros-ws) MAVROS_WS="${2:?--mavros-ws requires a path}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -28,6 +30,15 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 ISAAC_SCRIPTS="$ISAAC_WS/src/isaac_ros_common/scripts"
 ISAAC_COMMON="$ISAAC_WS/src/isaac_ros_common"
 ISAAC_VSLAM="$ISAAC_COMMON/isaac_ros_visual_slam"
+MAVROS_SRC="$MAVROS_WS/src/mavros"
+MAVROS_RELEASE_FILE="$REPO_DIR/jetson/mavros_release.env"
+
+[[ -r "$MAVROS_RELEASE_FILE" ]] || {
+  echo "Missing MAVROS release manifest: $MAVROS_RELEASE_FILE" >&2
+  exit 1
+}
+# shellcheck disable=SC1090
+source "$MAVROS_RELEASE_FILE"
 
 [[ -f /opt/ros/humble/setup.bash ]] || {
   echo "ROS 2 Humble is required at /opt/ros/humble." >&2
@@ -63,6 +74,36 @@ command -v gnome-terminal >/dev/null || {
   echo "Missing gnome-terminal; re-run with --install-deps." >&2
   exit 1
 }
+
+mkdir -p "$MAVROS_WS/src"
+if [[ ! -d "$MAVROS_SRC/.git" ]]; then
+  git clone "$MAVROS_REPOSITORY" "$MAVROS_SRC"
+  git -C "$MAVROS_SRC" checkout --detach "$MAVROS_COMMIT"
+else
+  mavros_commit="$(git -C "$MAVROS_SRC" rev-parse HEAD)"
+  if [[ "$mavros_commit" != "$MAVROS_COMMIT" ]]; then
+    echo "Existing MAVROS is $mavros_commit; expected $MAVROS_COMMIT." >&2
+    echo "Refusing to rewrite an existing MAVROS workspace." >&2
+    exit 1
+  fi
+fi
+
+mavros_patch="$REPO_DIR/jetson/mavros_overrides/proven_jetson.patch"
+if git -C "$MAVROS_SRC" apply --reverse --check "$mavros_patch" 2>/dev/null; then
+  echo "MAVROS source already matches the proven Jetson patch."
+elif git -C "$MAVROS_SRC" apply --check "$mavros_patch"; then
+  git -C "$MAVROS_SRC" apply "$mavros_patch"
+  echo "Installed the proven Jetson MAVROS patch."
+else
+  echo "MAVROS does not match the pinned source; refusing to patch it." >&2
+  exit 1
+fi
+
+set +u
+source /opt/ros/humble/setup.bash
+set -u
+cd "$MAVROS_WS"
+colcon build
 
 backup_stamp="$(date +%Y%m%d-%H%M%S)"
 install_override() {
@@ -108,6 +149,7 @@ fi
 
 set +u
 source /opt/ros/humble/setup.bash
+source "$MAVROS_WS/install/setup.bash"
 set -u
 cd "$REPO_DIR"
 colcon build --packages-select vio_px4_bridge
@@ -120,6 +162,7 @@ echo
 echo "Jetson bootstrap complete."
 echo "Repository:      $REPO_DIR"
 echo "Isaac workspace: $ISAAC_WS"
+echo "MAVROS workspace: $MAVROS_WS"
 echo "Launcher:        $HOME/vio-launch"
 echo
 echo "Start with: ~/vio-launch"
