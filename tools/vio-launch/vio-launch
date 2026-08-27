@@ -7,4 +7,4 @@ while [[ -L "$SOURCE" ]]; do
   [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
 done
 ROOT="$(cd "$(dirname "$SOURCE")" && pwd)"
-exec python3 "$ROOT/vio_test.py" "$@"
+exec python3 "$ROOT/vio_launch.py" "$@"

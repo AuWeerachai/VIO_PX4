@@ -18,24 +18,20 @@ colcon build --packages-select vio_px4_bridge
 source install/setup.bash
 ```
 
-## Automate test_procedure (`vio-test` CLI)
+## Automate test_procedure (`vio-launch` CLI)
 
-Commander-style helper (inspired by `theseus-packages`) lives in `tools/vio-test/`:
+Commander-style helper (inspired by `theseus-packages`) lives in `tools/vio-launch/`:
 
 ```bash
-ln -sf ~/workspaces/VIO_PX4_NEW_PIPELINE/tools/vio-test/vio-test ~/.local/bin/vio-test
-vio-test doctor
-vio-test run a    # GPS spoof → live
-vio-test run b    # EV path
-vio-test stop
+~/vio-launch
 ```
 
-See `tools/vio-test/README.md` and `~/test_procedure.txt`.
+See `tools/vio-launch/README.md`.
 
 ## 1) External vision through MAVROS
 
 ```bash
-vio-test run b
+vio-launch run b
 ```
 
 PX4 params (EV):
@@ -89,16 +85,21 @@ ros2 run vio_px4_bridge vio_px4_gps_bridge --ros-args \
 | Param | Value | Why |
 |-------|-------|-----|
 | `MAV_USEHILGPS` | `1` | Accept companion `HIL_GPS` |
-| `EKF2_GPS_CTRL` | normally `7` | Position, altitude, velocity; heading bit off |
+| `EKF2_GPS_CTRL` | `1` | Fuse GPS longitude/latitude only, matching vns-sdk |
 | `EKF2_EV_CTRL` | `0` (while testing GPS path) | Avoid fighting EV |
 | `EKF2_HGT_REF` | GPS or Baro | Match your height source |
-| Onboard GNSS | disable or carefully blend | Real Cube+ GPS will fight the inject |
+| `GPS_1_CONFIG` | `201` | Keep physical Here GNSS on GPS1 |
+| `GPS_2_CONFIG` | `0` | VIO arrives over MAVLink, not a second GPS serial driver |
+| `SENS_GPS_MASK` | `0` | Do not blend physical GNSS and VIO |
+| `SENS_GPS_PRIME` | `1` | Prefer verified VIO instance; Here GNSS is fallback |
 
 Reboot FC after param changes.
 
 The bridge refuses to start if `MAV_USEHILGPS` is not `1`, position/velocity
-fusion is missing, GPS heading fusion is enabled, or the sender system ID does
-not match PX4. Set the real magnetic declination and measured cuVSLAM
+fusion is missing, GPS heading fusion is enabled, the sender system ID does
+not match PX4, or exposed dual-GPS selector values contradict the VIO-first
+policy. Firmware without `SENS_GPS_MASK`/`SENS_GPS_PRIME` produces an explicit
+unverified-selection warning and requires inspection before flight. Set the real magnetic declination and measured cuVSLAM
 child-to-body yaw in the CLI's **Heading alignment** menu. Review
 `PX4_INTERFACE_CHECKLIST.md` before hardware testing.
 

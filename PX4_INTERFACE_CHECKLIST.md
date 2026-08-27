@@ -14,17 +14,23 @@ firmware because message handling and estimator requirements can change.
 - [ ] The odometry `frame_id`, `child_frame_id`, twist frame, and camera-to-body
   mounting convention have been verified on the actual Jetson.
 - [ ] Only one of Path A (GPS) and Path B (external vision) is active.
-- [ ] The real GNSS receiver is disabled or deliberately configured for blending;
-  injected GPS must not silently compete for the same GPS instance.
+- [ ] Physical Here GNSS remains GPS instance 0 and injected VIO is verified as
+  GPS instance 1. Do not infer the instance solely from connector names.
 - [ ] PX4 estimator status and innovations are observed before arming.
 
 ## Path A: HIL_GPS contract
 
 - [ ] `MAV_USEHILGPS=1` and PX4 has been rebooted if required.
+- [ ] `SENS_GPS_MASK=0` (no blending) and `SENS_GPS_PRIME=1` (VIO preferred),
+  if this firmware exposes the legacy dual-GPS selector. Missing selector
+  parameters require firmware-specific inspection before flight.
+- [ ] Bridge `gps_id=1`; physical Here GNSS is retained with
+  `GPS_1_CONFIG=201`, while `GPS_2_CONFIG=0` because VIO arrives via MAVLink.
 - [ ] Bridge MAVLink source system ID equals PX4 `MAV_SYS_ID`. PX4's receiver
   rejects non-HIL `HIL_GPS` from a different system ID.
-- [ ] `EKF2_GPS_CTRL` enables only the intended data. Normally use bits 0, 1 and
-  2 (value 7); do **not** enable dual-antenna heading bit 3.
+- [ ] `EKF2_GPS_CTRL=1`: fuse longitude/latitude only, matching vns-sdk.
+  Altitude remains on the configured height source, velocity is not fused, and
+  heading remains on the compass.
 - [ ] Send at 10 Hz without long gaps. PX4 timestamps receipt locally.
 - [ ] `fix_type >= 3`, satellites >= `EKF2_REQ_NSATS`, speed accuracy below
   `EKF2_REQ_SACC`, and EPH/EPV below their configured gates.
@@ -43,7 +49,10 @@ firmware because message handling and estimator requirements can change.
 - [ ] Live handoff is forbidden until VIO is fresh and its world yaw has been
   aligned to true north from an independent reference.
 - [ ] Loss/staleness of VIO stops GPS messages rather than freezing a plausible
-  moving fix.
+  moving fix, allowing PX4 to time out instance 1 and fall back to Here GNSS.
+- [ ] Confirm `VIO_GPS_OUTPUT_STOPPED` and `VIO_GPS_OUTPUT_RESUMED` transitions
+  in the bridge log and corresponding `VIO GPS:` messages in QGroundControl
+  during a propeller-off VIO disconnect/recovery test.
 
 ## Non-circular heading alignment
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""vio-test — interactive hardware CLI for Jetson VIO ↔ PX4 Cube.
+"""vio-launch — interactive hardware CLI for Jetson VIO ↔ PX4 Cube.
 
 Default (no args): numbered interactive menu that works reliably over AnyDesk.
 Also supports direct subcommands: doctor, run a, gps, stop, ...
@@ -12,6 +12,7 @@ import errno
 import json
 import math
 import os
+import select
 import shutil
 import shlex
 import signal
@@ -43,6 +44,11 @@ def first_existing(candidates: list[str]) -> Optional[Path]:
 
 
 def user_config_path() -> Path:
+    return Path.home() / ".config" / "vio-launch" / "config.json"
+
+
+def legacy_user_config_path() -> Path:
+    """Read pre-rename settings once so existing installations retain values."""
     return Path.home() / ".config" / "vio-test" / "config.json"
 
 
@@ -69,7 +75,10 @@ class Config:
     mag_declination_source: str = "table"
     mag_declination_deg: float = 0.0
     child_to_body_yaw_deg: float = 0.0
-    state_dir: Path = field(default_factory=lambda: Path.home() / ".local/state/vio-test")
+    # ROS FLU rotation about body +Y: positive points the camera downward.
+    camera_tilt_deg: float = 0.0
+    rviz_enabled: bool = False
+    state_dir: Path = field(default_factory=lambda: Path.home() / ".local/state/vio-launch")
 
     @property
     def log_dir(self) -> Path:
@@ -103,6 +112,8 @@ def default_config() -> Config:
 
 def load_saved_overrides() -> dict:
     path = user_config_path()
+    if not path.exists() and legacy_user_config_path().exists():
+        path = legacy_user_config_path()
     if not path.exists():
         return {}
     try:
@@ -127,6 +138,8 @@ def save_config(cfg: Config) -> None:
         "mag_declination_source": cfg.mag_declination_source,
         "mag_declination_deg": cfg.mag_declination_deg,
         "child_to_body_yaw_deg": cfg.child_to_body_yaw_deg,
+        "camera_tilt_deg": cfg.camera_tilt_deg,
+        "rviz_enabled": cfg.rviz_enabled,
         "vio_px4_dir": str(cfg.vio_px4_dir),
         "ros_setup": str(cfg.ros_setup),
         "mavros_dir": str(cfg.mavros_dir),
@@ -193,6 +206,8 @@ def apply_dict(cfg: Config, data: dict) -> Config:
         "mag_declination_source",
         "mag_declination_deg",
         "child_to_body_yaw_deg",
+        "camera_tilt_deg",
+        "rviz_enabled",
     ):
         if key in data and data[key] is not None:
             updates[key] = data[key]
@@ -208,6 +223,10 @@ def load_config(ns: argparse.Namespace | None = None) -> Config:
     saved = load_saved_overrides()
     if "mavlink_url" not in saved:
         cfg = replace(cfg, mavlink_url="/dev/ttyUSB0:921600")
+    # Migrate configurations created before camera-to-body odometry became a
+    # required safety boundary for the tilted D456 installation.
+    if saved.get("odom_topic") == "/vio/body/odometry":
+        cfg = replace(cfg, odom_topic="/visual_slam/tracking/odometry")
     if ns is None:
         return cfg
     updates = {}
@@ -261,7 +280,7 @@ def select_menu(
     while True:
         _clear()
         print("=" * 52)
-        print(f"  vio-test  v{VERSION}")
+        print(f"  vio-launch  v{VERSION}")
         print(f"  {title}")
         if subtitle:
             print(f"  {subtitle}")
@@ -552,37 +571,88 @@ def isaac_container_running() -> bool:
     return result.returncode == 0 and result.stdout.strip() == "true"
 
 
-def ensure_isaac_container(cfg: Config, timeout_s: float = 90.0) -> None:
+def ensure_isaac_container(cfg: Config, timeout_s: float = 600.0) -> None:
     if isaac_container_running():
         print(f"Isaac container already running: {ISAAC_CONTAINER}")
         return
     run_dev = cfg.isaac_ros_dir / "src/isaac_ros_common/scripts/run_dev.sh"
     if not run_dev.exists():
         raise RuntimeError(f"Missing NVIDIA container launcher: {run_dev}")
-    if not os.environ.get("DISPLAY"):
-        raise RuntimeError(
-            "DISPLAY is not set. Open vio-test from the Jetson AnyDesk desktop "
-            "terminal so it can create the required interactive container tab."
-        )
     if not shutil.which("gnome-terminal"):
         raise RuntimeError("gnome-terminal is required to host NVIDIA's interactive container")
+    terminal_env = os.environ.copy()
+    if not terminal_env.get("DISPLAY"):
+        # An SSH shell is not attached to the graphical login, but the Jetson's
+        # local GNOME session is. Explicitly target that session so the window
+        # is visible through AnyDesk.
+        uid = os.getuid()
+        xauthority = Path(f"/run/user/{uid}/gdm/Xauthority")
+        session_bus = Path(f"/run/user/{uid}/bus")
+        if not xauthority.exists() or not session_bus.exists():
+            raise RuntimeError(
+                "No active Jetson graphical session was found. Log into the "
+                "Jetson desktop/AnyDesk first, then retry."
+            )
+        terminal_env["DISPLAY"] = ":0"
+        terminal_env["XAUTHORITY"] = str(xauthority)
+        terminal_env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={session_bus}"
+        terminal_env["XDG_RUNTIME_DIR"] = f"/run/user/{uid}"
+    # A disconnected AnyDesk client does not make desktop windows disappear.
+    # Remove stale windows from earlier failed/retried launches before opening
+    # one new, uniquely titled run_dev terminal.
+    if shutil.which("xdotool"):
+        for stale_title in (
+            "Isaac ROS run_dev.sh",
+            "vio-launch visibility probe",
+            "vio-test visibility probe",
+        ):
+            found = subprocess.run(
+                ["xdotool", "search", "--name", stale_title],
+                capture_output=True, text=True, env=terminal_env, check=False,
+            )
+            for window_id in found.stdout.split():
+                subprocess.run(
+                    ["xdotool", "windowclose", window_id], env=terminal_env,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    check=False,
+                )
     command = (
         f"export ISAAC_ROS_WS={shlex.quote(str(cfg.isaac_ros_dir))}; "
-        f"cd {shlex.quote(str(run_dev.parent))}; "
-        f"{shlex.quote(str(run_dev))} --skip_image_build; "
-        "echo 'Isaac container exited. Press Enter to close.'; read"
+        "printf 'teamc@teamc-desktop:~/workspaces$ cd ${ISAAC_ROS_WS}/src/isaac_ros_common && \\\n   ./scripts/run_dev.sh\\n'; "
+        f"cd {shlex.quote(str(run_dev.parent))} && "
+        "./run_dev.sh; "
+        "rc=$?; echo \"Isaac run_dev.sh exited (code $rc).\"; "
+        "echo 'This diagnostic shell remains open; type exit to close it.'; exec bash"
     )
     subprocess.Popen(
-        ["gnome-terminal", "--title", "Isaac ROS Container", "--",
+        ["gnome-terminal", "--window",
+         "--title", "Isaac ROS run_dev.sh", "--",
          "bash", "-lc", command],
         start_new_session=True,
+        env=terminal_env,
     )
-    print("Opened Isaac ROS container terminal; waiting for Docker readiness...")
+    print(
+        f"Opened 'Isaac ROS run_dev.sh' on Jetson desktop "
+        f"{terminal_env['DISPLAY']}; waiting for Docker readiness..."
+    )
     deadline = time.monotonic() + timeout_s
+    stable_since = None
+    next_progress = time.monotonic() + 15.0
     while time.monotonic() < deadline:
         if isaac_container_running():
-            print(f"Isaac container ready: {ISAAC_CONTAINER}")
-            return
+            stable_since = stable_since or time.monotonic()
+            if time.monotonic() - stable_since >= 2.0:
+                print(f"Isaac container ready: {ISAAC_CONTAINER}")
+                print(
+                    "run_dev.sh is visible in the separate 'Isaac ROS run_dev.sh' window; "
+                    "vio-launch is continuing here.", flush=True
+                )
+                return
+        else:
+            stable_since = None
+        if time.monotonic() >= next_progress:
+            print("Still waiting; follow build/startup output in the run_dev.sh window...", flush=True)
+            next_progress = time.monotonic() + 15.0
         time.sleep(1.0)
     raise RuntimeError(
         f"Isaac container did not become ready within {timeout_s:.0f}s. "
@@ -628,28 +698,38 @@ def require_ros_message(
     topic: str,
     label: str,
     timeout_s: float,
+    message_type: Optional[str] = None,
 ) -> None:
+    type_arg = f" {shlex.quote(message_type)}" if message_type else ""
     command = (
         f"{ros_prefix(cfg, [cfg.vio_px4_dir / 'install/setup.bash'])} && "
-        f"ros2 topic echo --no-daemon --once {shlex.quote(topic)}"
+        f"ros2 topic echo --no-daemon --once {shlex.quote(topic)}{type_arg}"
     )
-    try:
-        result = subprocess.run(
-            ["bash", "-lc", command],
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(
-            f"{label} is not ready: no message arrived on {topic} "
-            f"within {timeout_s:.0f} seconds"
-        ) from exc
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"{label} check failed on {topic}. Confirm the publisher and your "
-            "ROS 2 middleware are running."
-        )
+    deadline = time.monotonic() + timeout_s
+    last_error = ""
+    # Do not gate this on `ros2 topic list --no-daemon`: short-lived DDS
+    # discovery on the Jetson intermittently returns an empty list even while
+    # type resolution and samples are available. A real received sample is the
+    # only readiness criterion and also rejects stale endpoint names.
+    while time.monotonic() < deadline:
+        try:
+            result = subprocess.run(
+                ["bash", "-lc", command], capture_output=True, text=True,
+                timeout=max(0.2, min(8.0, deadline - time.monotonic())),
+            )
+        except subprocess.TimeoutExpired:
+            last_error = "topic discovered but no sample received"
+            continue
+        if result.returncode == 0:
+            return
+        details = (result.stderr or result.stdout).strip().splitlines()
+        last_error = details[-1] if details else "ros2 topic echo failed"
+        time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+
+    raise RuntimeError(
+        f"{label} is not ready: no current message arrived on {topic} within "
+        f"{timeout_s:.0f} seconds ({last_error or 'topic not discovered'})"
+    )
 
 
 def require_mavros_connected(cfg: Config, timeout_s: float = 10.0) -> None:
@@ -710,13 +790,13 @@ def cmd_doctor(cfg: Config) -> int:
             ("Serial permission", exists and os.access(dev, os.R_OK | os.W_OK), dev)
         )
 
-    print("vio-test doctor\n")
+    print("vio-launch doctor\n")
     failed = 0
     for label, ok, detail in checks:
         print(f"{'[OK]' if ok else '[!!]'} {label}: {detail}")
         if not ok:
             failed += 1
-    print(f"\nhome LLA: {cfg.home_lat}, {cfg.home_lon}, {cfg.home_alt}")
+    print(f"\nhorizontal origin: {cfg.home_lat}, {cfg.home_lon}")
     print(f"odom:     {cfg.odom_topic}")
     print(f"heading:  {cfg.heading_source}, declination={declination_label(cfg)}, "
           f"child-to-body={cfg.child_to_body_yaw_deg} deg")
@@ -793,20 +873,231 @@ def cmd_ev_bridge(cfg: Config) -> None:
     print(f"log: {proc['logFile']}")
 
 
+ISAAC_TMUX_VIO = "vio-launch-isaac-vio"
+ISAAC_TMUX_RVIZ = "vio-launch-isaac-rviz"
+LEGACY_ISAAC_TMUX_SESSIONS = ("vio-test-isaac-vio", "vio-test-isaac-rviz")
+
+
+def jetson_desktop_env() -> dict[str, str]:
+    env = os.environ.copy()
+    if env.get("DISPLAY"):
+        return env
+    uid = os.getuid()
+    xauthority = Path(f"/run/user/{uid}/gdm/Xauthority")
+    session_bus = Path(f"/run/user/{uid}/bus")
+    if not xauthority.exists() or not session_bus.exists():
+        raise RuntimeError(
+            "No active Jetson graphical session. Log into AnyDesk first, then retry."
+        )
+    env.update({
+        "DISPLAY": ":0",
+        "XAUTHORITY": str(xauthority),
+        "DBUS_SESSION_BUS_ADDRESS": f"unix:path={session_bus}",
+        "XDG_RUNTIME_DIR": f"/run/user/{uid}",
+    })
+    return env
+
+
+def tmux_command(session: str, command: str) -> None:
+    subprocess.run(
+        ["tmux", "send-keys", "-t", session, "-l", command], check=True
+    )
+    subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], check=True)
+
+
+def tmux_session_exists(session: str) -> bool:
+    return subprocess.run(
+        ["tmux", "has-session", "-t", session],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+
+def tmux_recent_output(session: str, lines: int = 80) -> str:
+    result = subprocess.run(
+        ["tmux", "capture-pane", "-pt", session, "-S", f"-{lines}"],
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout if result.returncode == 0 else ""
+
+
+def start_visible_isaac_session(cfg: Config, session: str, title: str) -> None:
+    replacing_vio_owner = session == ISAAC_TMUX_VIO and tmux_session_exists(session)
+    subprocess.run(["tmux", "kill-session", "-t", session], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if replacing_vio_owner:
+        # run_dev.sh owns an auto-removed Docker container. Killing its terminal
+        # begins asynchronous container teardown. Starting another run_dev.sh
+        # too soon can see that dying container, try to attach, and then fail
+        # with "No such container". Wait for teardown to finish first.
+        deadline = time.monotonic() + 45.0
+        while isaac_container_running() and time.monotonic() < deadline:
+            time.sleep(0.5)
+        if isaac_container_running():
+            raise RuntimeError(
+                "Previous Isaac container did not stop after its VIO session closed. "
+                "Use option 8, wait a few seconds, then retry."
+            )
+    subprocess.run(["tmux", "new-session", "-d", "-s", session], check=True)
+    env = jetson_desktop_env()
+    subprocess.Popen(
+        ["gnome-terminal", "--window", "--title", title, "--",
+         "tmux", "attach-session", "-t", session],
+        env=env, start_new_session=True,
+    )
+    run_dev_dir = cfg.isaac_ros_dir / "src/isaac_ros_common"
+    tmux_command(
+        session,
+        f"export ISAAC_ROS_WS={shlex.quote(str(cfg.isaac_ros_dir))}; "
+        f"cd {shlex.quote(str(run_dev_dir))} && ./scripts/run_dev.sh",
+    )
+
+
+def stop_visible_isaac_sessions() -> None:
+    # RViz attaches to the existing container; stop it first. Stopping the VIO
+    # session then ends the owning docker-run shell and removes the container.
+    stop_rviz_session()
+    for session in (ISAAC_TMUX_VIO, *LEGACY_ISAAC_TMUX_SESSIONS):
+        subprocess.run(["tmux", "kill-session", "-t", session], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def stop_rviz_session() -> None:
+    """Stop RViz inside Docker, then remove its terminal/session wrapper."""
+    if isaac_container_running():
+        subprocess.run(
+            ["docker", "exec", ISAAC_CONTAINER, "pkill", "-TERM", "-x", "rviz2"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            alive = subprocess.run(
+                ["docker", "exec", ISAAC_CONTAINER, "pgrep", "-x", "rviz2"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ).returncode == 0
+            if not alive:
+                break
+            time.sleep(0.25)
+        else:
+            subprocess.run(
+                ["docker", "exec", ISAAC_CONTAINER, "pkill", "-KILL", "-x", "rviz2"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+    for session in (ISAAC_TMUX_RVIZ, "vio-test-isaac-rviz"):
+        subprocess.run(
+            ["tmux", "kill-session", "-t", session], check=False,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+
+def start_rviz_session(cfg: Config) -> None:
+    stop_rviz_session()
+    print("- Opening Terminal 2: Isaac ROS RViz (run_dev.sh → start_rviz.sh)...")
+    start_visible_isaac_session(cfg, ISAAC_TMUX_RVIZ, "Isaac ROS RViz")
+    time.sleep(3.0)
+    tmux_command(
+        ISAAC_TMUX_RVIZ,
+        "source ${ISAAC_ROS_WS}/install/setup.bash && "
+        "cd ${ISAAC_ROS_WS}/src/isaac_ros_common && ./scripts/start_rviz.sh; exit",
+    )
+
+
 def cmd_vio(cfg: Config) -> None:
-    ensure_isaac_container(cfg)
-    script = cfg.vio_px4_dir / "scripts/start_cuvslam_body.sh"
-    if not script.exists():
-        raise RuntimeError(f"Missing cuVSLAM launcher: {script}")
-    cmd = f"{ros_prefix(cfg)} && bash {shlex.quote(str(script))}"
-    proc = start_managed(cfg, "cuvslam", cmd, startup_check_s=3.0)
-    print(f"Started body-frame cuVSLAM pid={proc['pid']}; waiting for odometry...")
+    if not shutil.which("tmux") or not shutil.which("gnome-terminal"):
+        raise RuntimeError("tmux and gnome-terminal are required for visible Isaac sessions")
+    raw_topic = "/visual_slam/tracking/odometry"
+    if tmux_session_exists(ISAAC_TMUX_VIO) and isaac_container_running():
+        try:
+            require_ros_message(
+                cfg, raw_topic, "existing cuVSLAM body odometry", 6.0,
+                message_type="nav_msgs/msg/Odometry",
+            )
+        except RuntimeError:
+            print("Existing Isaac VIO session is not healthy; restarting it...", flush=True)
+        else:
+            print("- Existing cuVSLAM body odometry is healthy; reusing Terminal 1.")
+            if cfg.rviz_enabled and not tmux_session_exists(ISAAC_TMUX_RVIZ):
+                start_rviz_session(cfg)
+            print(
+                "- RViz is running." if tmux_session_exists(ISAAC_TMUX_RVIZ)
+                else "- RViz auto-launch is OFF; continuing without RViz."
+            )
+            print("- cuVSLAM body odometry ready.")
+            return
+    print("- Opening Terminal 1: Isaac ROS VIO (run_dev.sh → start_vio.sh)...")
+    start_visible_isaac_session(cfg, ISAAC_TMUX_VIO, "Isaac ROS VIO")
+    deadline = time.monotonic() + 600.0
+    while not isaac_container_running():
+        recent = tmux_recent_output(ISAAC_TMUX_VIO)
+        if (
+            "Error response from daemon: No such container" in recent
+            or "Container isaac_ros_dev-aarch64-container is not running" in recent
+        ):
+            stop_visible_isaac_sessions()
+            raise RuntimeError(
+                "Isaac run_dev.sh failed while attaching to a stale container. "
+                "The stale session was cleaned up; start the path again."
+            )
+        if time.monotonic() >= deadline:
+            stop_visible_isaac_sessions()
+            raise RuntimeError("Isaac container did not start within 10 minutes")
+        time.sleep(1.0)
+    # The keystrokes remain queued until run_dev.sh presents the admin shell.
+    time.sleep(2.0)
+    tmux_command(
+        ISAAC_TMUX_VIO,
+        "cd ${ISAAC_ROS_WS} && source /opt/ros/humble/setup.bash && "
+        "echo '=== Incremental build: isaac_ros_visual_slam ===' && "
+        "colcon build --packages-select isaac_ros_visual_slam && "
+        "source ${ISAAC_ROS_WS}/install/setup.bash && "
+        "echo \"=== Using: $(ros2 pkg prefix isaac_ros_visual_slam) ===\" && "
+        "cd ${ISAAC_ROS_WS}/src/isaac_ros_common && "
+        f"CAMERA_PITCH_RAD={math.radians(cfg.camera_tilt_deg):.17g} "
+        "./scripts/start_vio.sh",
+    )
+    print("- Terminal 1 is rebuilding changed VSLAM files, then starting cuVSLAM...")
     try:
-        require_ros_message(cfg, cfg.odom_topic, "body-frame cuVSLAM odometry", 30.0)
+        odom_deadline = time.monotonic() + 600.0
+        while True:
+            try:
+                require_ros_message(
+                    cfg, raw_topic, "cuVSLAM body odometry", 3.0,
+                    message_type="nav_msgs/msg/Odometry",
+                )
+                break
+            except RuntimeError as exc:
+                recent = tmux_recent_output(ISAAC_TMUX_VIO, lines=120)
+                launch_stopped = (
+                    "process has finished cleanly" in recent
+                    or "process has died" in recent
+                    or "user interrupted with ctrl-c" in recent
+                )
+                if launch_stopped or not tmux_session_exists(ISAAC_TMUX_VIO):
+                    raise RuntimeError(
+                        "cuVSLAM stopped before body odometry became ready. "
+                        "Check the visible Isaac ROS VIO terminal."
+                    ) from exc
+                if time.monotonic() >= odom_deadline:
+                    raise RuntimeError(
+                        f"No body odometry arrived on {raw_topic} within 10 minutes"
+                    ) from exc
+        if cfg.rviz_enabled:
+            start_rviz_session(cfg)
+            print("- RViz is running.")
+        else:
+            print("- RViz auto-launch is OFF; continuing without RViz.")
+        print("- cuVSLAM is publishing vehicle-body odometry directly (drone_link).")
     except Exception:
-        stop_managed(cfg, "cuvslam")
+        stop_visible_isaac_sessions()
         raise
-    print("cuVSLAM body odometry ready.")
+    print("- cuVSLAM body odometry ready.")
 
 
 def cmd_gps(cfg: Config) -> None:
@@ -842,7 +1133,15 @@ def cmd_gps(cfg: Config) -> None:
         "home_lon_deg": cfg.home_lon,
         "home_alt_m": cfg.home_alt,
         "spoof_duration_s": 15.0,
-        "spoof_until_vio": "true",
+        # Keep the stationary bootstrap active for the full configured duration.
+        # PX4/QGroundControl receives STATUSTEXT when spoof starts and when VIO takes over.
+        "spoof_until_vio": "false",
+        "boot_accuracy_m": 0.5,
+        "cruise_eph_m": 0.5,
+        "horizontal_only_output": "true",
+        "gps_id": 1,
+        "validate_dual_gps_selection": "true",
+        "expected_vio_gps_instance": -1,
         "rc_trigger_enabled": "true",
         "rc_channel": 6,
         "rc_low_pwm_max": 1300,
@@ -856,6 +1155,7 @@ def cmd_gps(cfg: Config) -> None:
         "mag_declination_deg": cfg.mag_declination_deg,
         "child_to_body_yaw_deg": cfg.child_to_body_yaw_deg,
         "expected_child_frame": "drone_link",
+        "status_file": str(cfg.state_dir / "navigation-status.json"),
     }
     param_args = " ".join(
         f"-p {shlex.quote(f'{name}:={value}')}" for name, value in params.items()
@@ -864,11 +1164,93 @@ def cmd_gps(cfg: Config) -> None:
         f"{ros_prefix(cfg, [setup])} && ros2 run vio_px4_bridge vio_px4_gps_bridge --ros-args"
         f" {param_args}"
     )
+    navigation_status = cfg.state_dir / "navigation-status.json"
+    navigation_status.unlink(missing_ok=True)
     proc = start_managed(cfg, "gps-bridge", cmd, startup_check_s=6.0)
-    print(f"Path A connected to PX4 on {cfg.mavlink_url} (pid {proc['pid']}).")
-    print("Waiting for RC channel 6 LOW/MID -> HIGH to start the 15-second home spoof.")
-    print("Live VIO will take over automatically when odometry becomes ready.")
-    print(f"Log: {proc['logFile']}")
+    print(f"- Path A connected to PX4 on {cfg.mavlink_url} (pid {proc['pid']}).")
+    print("- Waiting for spoof: move RC channel 6 LOW/MID → HIGH.", flush=True)
+
+    saw_spoof = False
+    while True:
+        try:
+            status = json.loads(navigation_status.read_text())
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            status = {}
+        navigation = status.get("navigation")
+        if navigation == "spoof_active" and not saw_spoof:
+            saw_spoof = True
+            print(
+                f"- Spoofing at {cfg.home_lat:.7f}, {cfg.home_lon:.7f} for 15 s.",
+                flush=True,
+            )
+        if saw_spoof and navigation == "live_vio":
+            print("- 15 s done. VIO takes over. See option 3) Status.", flush=True)
+            return
+        if saw_spoof and navigation == "waiting_for_rc":
+            raise RuntimeError(
+                "The spoof ended without a healthy heading-aligned VIO handoff. "
+                "See option 3) Status."
+            )
+        try:
+            os.kill(int(proc["pid"]), 0)
+        except (OSError, ValueError):
+            raise RuntimeError("GPS bridge stopped during the spoof sequence")
+        time.sleep(0.2)
+
+
+def show_navigation_status(cfg: Config) -> None:
+    path = cfg.state_dir / "navigation-status.json"
+    print("Navigation status\n")
+    try:
+        status = json.loads(path.read_text())
+    except FileNotFoundError:
+        print("- Bridge: not running (no status received)")
+        print("- Navigation: PX4 uses its physical GPS or configured failsafe")
+        return
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"- Status unavailable: {exc}")
+        return
+
+    age = max(0.0, time.time() - float(status.get("updated_unix_s", 0.0)))
+    if age > 2.0:
+        print(f"- Bridge: not reporting (last update {age:.1f} s ago)")
+        print("- Navigation: PX4 may use physical GPS, then dead reckoning/failsafe")
+        return
+
+    navigation = status.get("navigation", "unknown")
+    connection = "connected to PX4" if status.get("px4_connected") else "disconnected from PX4"
+    if navigation == "spoof_active":
+        vio_status = "spoofing"
+    elif status.get("vio_fresh") and not status.get("pose_gate_quarantine"):
+        vio_status = "VIO healthy"
+    else:
+        vio_status = "VIO unhealthy"
+    gate_status = "unhealthy" if status.get("pose_gate_quarantine") else "healthy"
+    vio_age = status.get("vio_age_s")
+    latency = f"{float(vio_age) * 1000.0:.1f} ms" if vio_age is not None else "unavailable"
+
+    print(f"- Connection status: {connection}")
+    print(f"- VIO status: {vio_status}")
+    print(f"- Pose-jump gate status: {gate_status}")
+    print(f"- Latency: {latency}")
+    remaining = status.get("spoof_remaining_s")
+    if remaining is not None:
+        print(f"- Spoof remaining: {float(remaining):.1f} s")
+    if not status.get("hil_gps_output_active") and navigation != "spoof_active":
+        print(f"- Output blocked: {status.get('output_block_reason', 'unknown')}")
+        print(f"- Fallback: {status.get('px4_fallback')}")
+
+
+def watch_navigation_status(cfg: Config) -> None:
+    """Refresh the status screen until the operator presses Enter."""
+    while True:
+        _clear()
+        show_navigation_status(cfg)
+        print("\nUpdates every 0.5 s. Press Enter to return...", flush=True)
+        readable, _, _ = select.select([sys.stdin], [], [], 0.5)
+        if readable:
+            sys.stdin.readline()
+            return
 
 
 def cmd_run(
@@ -938,10 +1320,36 @@ def cmd_logs(cfg: Config, name: str, lines: int = 40, full: bool = False) -> Non
 
 def cmd_stop(cfg: Config, name: Optional[str] = None) -> None:
     stopped = stop_managed(cfg, name)
+    if name is None:
+        stop_visible_isaac_sessions()
+    if name in (None, "cuvslam"):
+        cleanup = cfg.vio_px4_dir / "scripts/stop_cuvslam_body.sh"
+        if cleanup.exists():
+            subprocess.run(["bash", str(cleanup)], check=False, timeout=8.0)
     if not stopped:
         print(f"Nothing named '{name}' to stop." if name else "Nothing to stop.")
         return
     print(f"Stopped: {', '.join(stopped)}")
+
+
+def cmd_shutdown(cfg: Config) -> None:
+    """Stop this pipeline and its Isaac ROS container/session."""
+    cmd_stop(cfg)
+    if not isaac_container_running():
+        print(f"Isaac container already stopped: {ISAAC_CONTAINER}")
+        return
+    print(f"Stopping Isaac container: {ISAAC_CONTAINER}...")
+    result = subprocess.run(
+        ["docker", "stop", "--time", "10", ISAAC_CONTAINER],
+        capture_output=True,
+        text=True,
+        timeout=20.0,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"Could not stop Isaac container: {detail}")
+    print("Isaac container stopped; the run_dev.sh session can now close.")
 
 
 # ---------------------------------------------------------------------------
@@ -1008,19 +1416,17 @@ def configure_link(cfg: Config) -> Config:
 
 def configure_home(cfg: Config) -> Config:
     _clear()
-    print("Configure home / spoof origin (lat lon alt)\n")
-    print(f"Current: {cfg.home_lat}, {cfg.home_lon}, {cfg.home_alt}")
+    print("Configure home / spoof origin (latitude and longitude)\n")
+    print(f"Current: {cfg.home_lat}, {cfg.home_lon}")
     lat = prompt_line("Latitude deg", str(cfg.home_lat))
     lon = prompt_line("Longitude deg", str(cfg.home_lon))
-    alt = prompt_line("Altitude MSL m", str(cfg.home_alt))
     if lat is None:
         return cfg
     try:
         lat_value = float(lat)
         lon_value = float(lon or cfg.home_lon)
-        alt_value = float(alt or cfg.home_alt)
-        if not all(math.isfinite(value) for value in (lat_value, lon_value, alt_value)):
-            raise ValueError("latitude, longitude, and altitude must be finite numbers")
+        if not all(math.isfinite(value) for value in (lat_value, lon_value)):
+            raise ValueError("latitude and longitude must be finite numbers")
         if not -90.0 <= lat_value <= 90.0:
             raise ValueError("latitude must be between -90 and 90")
         if not -180.0 <= lon_value <= 180.0:
@@ -1029,7 +1435,6 @@ def configure_home(cfg: Config) -> Config:
             cfg,
             home_lat=lat_value,
             home_lon=lon_value,
-            home_alt=alt_value,
         )
     except ValueError as exc:
         print(f"Invalid home: {exc}")
@@ -1095,6 +1500,57 @@ def configure_heading(cfg: Config) -> Config:
     return cfg
 
 
+def configure_camera_tilt(cfg: Config) -> Config:
+    _clear()
+    print("Configure camera tilt from the vehicle horizon\n")
+    print("ROS FLU sign convention:")
+    print("  + angle = camera points downward")
+    print("  - angle = camera points upward")
+    print("    0 deg = camera points along the vehicle horizon\n")
+    value = prompt_line("Camera tilt deg", str(cfg.camera_tilt_deg))
+    if value is None:
+        return cfg
+    try:
+        tilt = float(value)
+        if not math.isfinite(tilt):
+            raise ValueError("angle must be finite")
+        if not -90.0 <= tilt <= 90.0:
+            raise ValueError("angle must be between -90 and +90 degrees")
+    except ValueError as exc:
+        print(f"Invalid camera tilt: {exc}")
+        pause()
+        return cfg
+    cfg = replace(cfg, camera_tilt_deg=tilt)
+    save_config(cfg)
+    print(f"Saved camera tilt: {tilt:+g}° ({math.radians(tilt):+.6f} rad).")
+    print("The new extrinsic takes effect the next time Path A or Path B starts cuVSLAM.")
+    pause()
+    return cfg
+
+
+def toggle_rviz(cfg: Config) -> Config:
+    enabled = not cfg.rviz_enabled
+    cfg = replace(cfg, rviz_enabled=enabled)
+    save_config(cfg)
+    if not enabled:
+        stop_rviz_session()
+        print("RViz auto-launch is OFF; the existing RViz session was stopped.")
+    elif tmux_session_exists(ISAAC_TMUX_VIO) and isaac_container_running():
+        try:
+            require_ros_message(
+                cfg, "/visual_slam/tracking/odometry", "existing cuVSLAM body odometry",
+                6.0, message_type="nav_msgs/msg/Odometry",
+            )
+            start_rviz_session(cfg)
+            print("RViz auto-launch is ON and RViz is starting now.")
+        except RuntimeError as exc:
+            print(f"RViz auto-launch is ON; it will start with the next path ({exc}).")
+    else:
+        print("RViz auto-launch is ON; it will start with the next path.")
+    pause()
+    return cfg
+
+
 def pick_log(cfg: Config) -> None:
     ensure_dirs(cfg)
     # Only show logs that exist for components used by the hardware paths.
@@ -1128,8 +1584,6 @@ def pick_log(cfg: Config) -> None:
 
 def interactive_main(cfg: Config) -> int:
     while True:
-        running = prune_state(cfg)
-        run_note = f"{len(running)} running" if running else "idle"
         choice = select_menu(
             "Main Menu",
             [
@@ -1138,13 +1592,12 @@ def interactive_main(cfg: Config) -> int:
                 MenuItem(
                     "Path A — GPS spoof → live VIO (global)",
                     "run-a",
-                    "Recommended internship-style HIL_GPS path",
                 ),
                 MenuItem(
                     "Path B — External vision (local)",
                     "run-b",
-                    "body-frame VIO → MAVROS → PX4 ODOMETRY",
                 ),
+                MenuItem("Status", "nav-status"),
                 MenuItem("", "h2", disabled=True),
                 MenuItem("Setup", "hdr2", disabled=True),
                 MenuItem(
@@ -1153,9 +1606,9 @@ def interactive_main(cfg: Config) -> int:
                     cfg.mavlink_url,
                 ),
                 MenuItem(
-                    "Home lat/lon/alt",
+                    "Home latitude/longitude",
                     "home",
-                    f"{cfg.home_lat}, {cfg.home_lon}, {cfg.home_alt}",
+                    f"{cfg.home_lat}, {cfg.home_lon}",
                 ),
                 MenuItem(
                     "Heading alignment",
@@ -1163,30 +1616,43 @@ def interactive_main(cfg: Config) -> int:
                     f"{cfg.heading_source}; declination={declination_label(cfg)}, "
                     f"child→body={cfg.child_to_body_yaw_deg}°",
                 ),
-                MenuItem("", "h3", disabled=True),
-                MenuItem("Ops", "hdr3", disabled=True),
                 MenuItem(
-                    "Doctor (Checks ROS, bridge, FC link, and required files)",
-                    "doctor",
+                    "Camera tilt from horizon (+down / -up)",
+                    "camera-tilt",
+                    f"{cfg.camera_tilt_deg:+g}°",
                 ),
                 MenuItem(
-                    f"Status (Shows running bridge processes; {run_note})",
-                    "status",
+                    "RViz auto-launch (toggle ON/OFF)",
+                    "rviz-toggle",
+                    "ON" if cfg.rviz_enabled else "OFF",
                 ),
-                MenuItem(
-                    "Logs (Shows recent output/errors from a process)",
-                    "logs",
-                ),
-                MenuItem("Stop all", "stop"),
                 MenuItem("", "h4", disabled=True),
-                MenuItem("Exit", "exit"),
+                MenuItem("Leave CLI (keep processes running)", "detach"),
+                MenuItem("Stop all processes (including Isaac container)", "stop-all"),
             ],
             subtitle=f"Hardware: Jetson + Cube · link={cfg.mavlink_url}",
         )
 
-        if choice in (None, "exit"):
+        if choice is None:
             _clear()
             return 0
+
+        if choice == "detach":
+            _clear()
+            print("Left vio-launch; managed processes are still running.")
+            return 0
+
+        if choice == "stop-all":
+            _clear()
+            print("Stopping all managed processes...\n")
+            try:
+                cmd_shutdown(cfg)
+            except Exception as exc:  # noqa: BLE001
+                print(f"Error during shutdown: {exc}")
+                pause()
+                continue
+            pause()
+            continue
 
         try:
             if choice == "run-a":
@@ -1203,20 +1669,12 @@ def interactive_main(cfg: Config) -> int:
                 cfg = configure_home(cfg)
             elif choice == "heading":
                 cfg = configure_heading(cfg)
-            elif choice == "doctor":
-                _clear()
-                cmd_doctor(cfg)
-                pause()
-            elif choice == "status":
-                _clear()
-                cmd_status(cfg)
-                pause()
-            elif choice == "logs":
-                pick_log(cfg)
-            elif choice == "stop":
-                _clear()
-                cmd_stop(cfg)
-                pause()
+            elif choice == "camera-tilt":
+                cfg = configure_camera_tilt(cfg)
+            elif choice == "rviz-toggle":
+                cfg = toggle_rviz(cfg)
+            elif choice == "nav-status":
+                watch_navigation_status(cfg)
         except KeyboardInterrupt:
             print("\nCancelled.")
             pause()
@@ -1232,7 +1690,7 @@ def interactive_main(cfg: Config) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="vio-test",
+        prog="vio-launch",
         description="VIO/PX4 hardware CLI for Jetson + Cube. Run with no args for menu.",
     )
     p.add_argument("--version", action="version", version=VERSION)
@@ -1245,8 +1703,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = p.add_subparsers(dest="command")
     sub.add_parser("tui", help="Open interactive menu (default)")
-    sub.add_parser("doctor")
-    sub.add_parser("status")
     sub.add_parser("ev-bridge")
     sub.add_parser("vio")
     sub.add_parser("gps")
@@ -1254,13 +1710,6 @@ def build_parser() -> argparse.ArgumentParser:
     run_p = sub.add_parser("run")
     run_p.add_argument("path")
 
-    logs_p = sub.add_parser("logs")
-    logs_p.add_argument("name")
-    logs_p.add_argument("-n", "--lines", type=int, default=40)
-    logs_p.add_argument("--full", action="store_true", help="Show the complete raw log")
-
-    stop_p = sub.add_parser("stop")
-    stop_p.add_argument("name", nargs="?")
     return p
 
 
@@ -1277,11 +1726,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return interactive_main(cfg)
 
     try:
-        if args.command == "doctor":
-            return cmd_doctor(cfg)
-        if args.command == "status":
-            cmd_status(cfg)
-        elif args.command == "ev-bridge":
+        if args.command == "ev-bridge":
             cmd_ev_bridge(cfg)
         elif args.command == "vio":
             cmd_vio(cfg)
@@ -1289,10 +1734,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             cmd_gps(cfg)
         elif args.command == "run":
             cmd_run(cfg, args.path)
-        elif args.command == "logs":
-            cmd_logs(cfg, args.name, args.lines, full=args.full)
-        elif args.command == "stop":
-            cmd_stop(cfg, args.name)
         else:
             parser.print_help()
             return 1

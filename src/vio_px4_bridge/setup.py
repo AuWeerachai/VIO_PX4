@@ -22,6 +22,7 @@ setup(
         'console_scripts': [
             'vio_px4_gps_bridge = vio_px4_bridge.vio_px4_gps_bridge:main',
             'mavros_ev_bridge = vio_px4_bridge.mavros_ev_bridge:main',
+            'cuvslam_body_relay = vio_px4_bridge.cuvslam_body_relay:main',
         ],
     },
 )

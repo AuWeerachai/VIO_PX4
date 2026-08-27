@@ -14,8 +14,11 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import struct
 import time
 from enum import Enum
+from pathlib import Path
 
 import rclpy
 from nav_msgs.msg import Odometry
@@ -66,6 +69,7 @@ class VioPx4GpsBridge(Node):
         self.declare_parameter("heartbeat_timeout_s", 5.0)
         self.declare_parameter("ros2_gps_topic", "/fmu/in/sensor_gps")
         self.declare_parameter("rate_hz", 10.0)
+        self.declare_parameter("status_file", "")
 
         # Home / EKF origin (spoof target and LLA anchor for live VIO)
         self.declare_parameter("home_lat_deg", 40.4433)
@@ -84,10 +88,20 @@ class VioPx4GpsBridge(Node):
         self.declare_parameter("cruise_eph_m", 5.0)
         self.declare_parameter("cruise_epv_m", 1.5)
         self.declare_parameter("speed_accuracy_m_s", 0.25)
+        # HIL_GPS requires altitude and velocity fields even when PX4 is
+        # configured to fuse horizontal position only. In this mode those
+        # required fields are stable fillers; only lat/lon carry VIO motion.
+        self.declare_parameter("horizontal_only_output", True)
 
         self.declare_parameter("fix_type", 3)
         self.declare_parameter("satellites", 10)
-        self.declare_parameter("gps_id", 0)
+        # Keep the injected receiver distinct from the physical Here GNSS
+        # (GPS1 / instance 0). HIL_GPS.id is carried into PX4's GPS device id.
+        self.declare_parameter("gps_id", 1)
+        self.declare_parameter("validate_dual_gps_selection", True)
+        # -1 accepts either instance after checking that blending is disabled.
+        # Instance numbering changes when the optional physical Here GPS is absent.
+        self.declare_parameter("expected_vio_gps_instance", -1)
         self.declare_parameter("odom_is_enu", True)
         self.declare_parameter("anchor_on_first_odom", True)
         self.declare_parameter("twist_is_body_frame", True)
@@ -153,10 +167,19 @@ class VioPx4GpsBridge(Node):
         self.cruise_eph_m = float(self.get_parameter("cruise_eph_m").value)
         self.cruise_epv_m = float(self.get_parameter("cruise_epv_m").value)
         self.speed_accuracy_m_s = float(self.get_parameter("speed_accuracy_m_s").value)
+        self.horizontal_only_output = bool(
+            self.get_parameter("horizontal_only_output").value
+        )
 
         self.fix_type = int(self.get_parameter("fix_type").value)
         self.satellites = int(self.get_parameter("satellites").value)
         self.gps_id = int(self.get_parameter("gps_id").value)
+        self.validate_dual_gps_selection = bool(
+            self.get_parameter("validate_dual_gps_selection").value
+        )
+        self.expected_vio_gps_instance = int(
+            self.get_parameter("expected_vio_gps_instance").value
+        )
         self.odom_is_enu = bool(self.get_parameter("odom_is_enu").value)
         self.anchor_on_first_odom = bool(self.get_parameter("anchor_on_first_odom").value)
         self.twist_is_body_frame = bool(self.get_parameter("twist_is_body_frame").value)
@@ -296,9 +319,15 @@ class VioPx4GpsBridge(Node):
         self.last_alignment_mag_id = None
         self.logged_odom_frames = False
         self.continuity_recovering = False
+        self.live_output_active = False
+        self.live_output_block_reason = "not_live"
+        self.last_px4_heartbeat_time = None
+        self.px4_target_sysid = None
+        self.status_file = str(self.get_parameter("status_file").value).strip()
 
         self._mav = None
         self._gps_pub = None
+        self._hil_gps_extensions_supported = None
         self._init_transport()
 
         qos = QoSProfile(
@@ -309,6 +338,8 @@ class VioPx4GpsBridge(Node):
         )
         self.create_subscription(Odometry, self.odom_topic, self._odom_callback, qos)
         self.create_timer(1.0 / self.rate_hz, self._tick)
+        if self.status_file:
+            self.create_timer(0.5, self._write_status_file)
 
         self.get_logger().info(
             f"GPS bridge started transport={self.transport} "
@@ -324,9 +355,62 @@ class VioPx4GpsBridge(Node):
                 f"Waiting for RC channel {self.rc_channel} LOW/MID->HIGH trigger "
                 f"(low<={self.rc_low_pwm_max}, high>={self.rc_high_pwm_min})"
             )
+            self._send_status_text(
+                f"VIO GPS: waiting for RC channel {self.rc_channel}", 6
+            )
         self.get_logger().info(
             f"Heading alignment source={self.heading_source}; live GPS is gated until aligned"
         )
+
+    def _write_status_file(self):
+        """Publish a small atomic snapshot for the companion launcher UI."""
+        now = time.monotonic()
+        vio_age = None if self.last_vio_time is None else max(0.0, now - self.last_vio_time)
+        vio_fresh = bool(
+            self.have_vio and vio_age is not None and vio_age <= self.vio_timeout_s
+        )
+        spoof_remaining = None
+        if self.phase in (Phase.SPOOF, Phase.ALIGNING) and self.start_time is not None:
+            spoof_remaining = max(0.0, self.spoof_duration_s - (now - self.start_time))
+        if self.live_output_active:
+            navigation = "live_vio"
+        elif self.phase in (Phase.SPOOF, Phase.ALIGNING):
+            navigation = "spoof_active"
+        elif self.phase == Phase.WAITING:
+            navigation = "waiting_for_rc"
+        else:
+            navigation = "gps_output_stopped"
+        payload = {
+            "updated_unix_s": time.time(),
+            "pid": os.getpid(),
+            "phase": self.phase.value,
+            "navigation": navigation,
+            "rc_position": self.last_rc_position,
+            "spoof_remaining_s": spoof_remaining,
+            "vio_received": self.have_vio,
+            "vio_fresh": vio_fresh,
+            "vio_age_s": vio_age,
+            "px4_connected": bool(
+                self.last_px4_heartbeat_time is not None
+                and (now - self.last_px4_heartbeat_time) <= self.heartbeat_timeout_s
+            ),
+            "heading_aligned": self.heading_offset_rad is not None,
+            "pose_gate_quarantine": self.continuity_recovering,
+            "hil_gps_output_active": self.live_output_active,
+            "output_block_reason": self.live_output_block_reason,
+            "px4_fallback": (
+                "not_needed" if self.live_output_active or navigation == "spoof_active"
+                else "PX4 selects physical GPS if healthy; otherwise dead reckoning/failsafe"
+            ),
+        }
+        target = Path(self.status_file).expanduser()
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(json.dumps(payload, indent=2) + "\n")
+            temporary.replace(target)
+        except OSError as exc:
+            self.get_logger().warn(f"Could not write navigation status: {exc}")
 
     def _init_transport(self):
         if self.transport == "mavlink":
@@ -369,6 +453,8 @@ class VioPx4GpsBridge(Node):
                     f"within {self.heartbeat_timeout_s:.1f}s"
                 )
             px4_sysid = int(heartbeat.get_srcSystem())
+            self.px4_target_sysid = px4_sysid
+            self.last_px4_heartbeat_time = time.monotonic()
             if self.mavlink_sysid != px4_sysid:
                 self._mav.close()
                 raise RuntimeError(
@@ -388,19 +474,17 @@ class VioPx4GpsBridge(Node):
             if gps_ctrl is None:
                 raise RuntimeError("PX4 did not return required parameter EKF2_GPS_CTRL")
             gps_ctrl_bits = int(round(gps_ctrl))
-            if (gps_ctrl_bits & 0b101) != 0b101:
+            if gps_ctrl_bits != 0b0001:
                 raise RuntimeError(
-                    "EKF2_GPS_CTRL must enable longitude/latitude and 3D velocity "
-                    f"fusion (current value {gps_ctrl_bits})"
-                )
-            if gps_ctrl_bits & 0b1000:
-                raise RuntimeError(
-                    "EKF2_GPS_CTRL dual-antenna heading bit must be off; HIL_GPS "
-                    "does not provide independent GPS yaw"
+                    "EKF2_GPS_CTRL must be 1: longitude/latitude only; altitude "
+                    "uses the configured height source, velocity is not fused, "
+                    f"and heading stays on compass (current={gps_ctrl_bits})"
                 )
             self.get_logger().info(
                 f"PX4 parameter gates passed: MAV_USEHILGPS=1 EKF2_GPS_CTRL={gps_ctrl_bits}"
             )
+            if self.validate_dual_gps_selection:
+                self._validate_dual_gps_selection(heartbeat)
             if self.rc_trigger_enabled:
                 self._request_mavlink_stream(
                     heartbeat, mavutil.mavlink.MAVLINK_MSG_ID_RC_CHANNELS,
@@ -417,6 +501,7 @@ class VioPx4GpsBridge(Node):
                     heartbeat, mavutil.mavlink.MAVLINK_MSG_ID_HIGHRES_IMU, 20.0
                 )
                 self.get_logger().info("Requested ATTITUDE and HIGHRES_IMU at 20 Hz")
+            self._send_status_text("VIO GPS: PX4 link ready", 6)
         elif self.transport == "ros2":
             if SensorGps is None:
                 raise RuntimeError(
@@ -460,8 +545,91 @@ class VioPx4GpsBridge(Node):
             if isinstance(param_id, bytes):
                 param_id = param_id.decode("ascii", errors="ignore")
             if str(param_id).rstrip("\x00") == name:
+                # PX4 uses MAVLink's byte-wise parameter encoding. Integer
+                # bits occupy the PARAM_VALUE float payload directly, so an
+                # INT32 value of 1 appears to Python as 1.401298e-45 unless
+                # decoded according to param_type.
+                param_type = int(msg.param_type)
+                raw = struct.pack("<f", float(msg.param_value))
+                if param_type == 5:  # MAV_PARAM_TYPE_UINT32
+                    return float(struct.unpack("<I", raw)[0])
+                if param_type == 6:  # MAV_PARAM_TYPE_INT32
+                    return float(struct.unpack("<i", raw)[0])
                 return float(msg.param_value)
         return None
+
+    def _send_status_text(self, message: str, severity: int):
+        """Send one short operational state message to PX4 and QGroundControl."""
+        if self.transport != "mavlink" or self._mav is None:
+            return
+        # MAVLink STATUSTEXT is 50 bytes. Keep messages ASCII and unchunked so
+        # older PX4/QGC versions display them consistently.
+        payload = message.encode("ascii", errors="replace")[:50]
+        try:
+            self._mav.mav.statustext_send(severity, payload, 0, 0)
+        except TypeError:
+            # MAVLink 1 dialects omit the MAVLink 2 id/chunk_seq extensions.
+            self._mav.mav.statustext_send(severity, payload)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f"Could not send QGC status text: {exc}")
+
+    def _validate_dual_gps_selection(self, heartbeat):
+        """Validate the legacy PX4 selector when this firmware exposes it."""
+        blend_mask = self._read_px4_param(heartbeat, "SENS_GPS_MASK")
+        primary = self._read_px4_param(heartbeat, "SENS_GPS_PRIME")
+        if blend_mask is None and primary is None:
+            self.get_logger().warn(
+                "PX4_DUAL_GPS_SELECTION_UNVERIFIED: firmware exposes neither "
+                "SENS_GPS_MASK nor SENS_GPS_PRIME; verify sensor_gps instances "
+                "and this firmware's GNSS selector before flight"
+            )
+            return
+        if blend_mask is None or primary is None:
+            raise RuntimeError(
+                "PX4 exposes only part of the legacy dual-GPS selector "
+                "(SENS_GPS_MASK/SENS_GPS_PRIME); source priority is ambiguous"
+            )
+        mask = int(round(blend_mask))
+        selected = int(round(primary))
+        if mask != 0:
+            raise RuntimeError(
+                f"SENS_GPS_MASK must be 0 (no blending) for VIO-first failover; current={mask}"
+            )
+        if (
+            self.expected_vio_gps_instance >= 0
+            and selected != self.expected_vio_gps_instance
+        ):
+            raise RuntimeError(
+                "SENS_GPS_PRIME must select the verified VIO sensor_gps instance "
+                f"{self.expected_vio_gps_instance}; current={selected}"
+            )
+        self.get_logger().info(
+            "PX4 dual-GPS policy verified: blending=off "
+            f"preferred_instance={selected}; verify this instance is VIO before flight"
+        )
+
+    def _set_live_output_state(self, active: bool, reason: str):
+        if active == self.live_output_active and reason == self.live_output_block_reason:
+            return
+        was_active = self.live_output_active
+        self.live_output_active = active
+        self.live_output_block_reason = reason
+        if active:
+            self.get_logger().info(
+                f"VIO_GPS_OUTPUT_RESUMED reason={reason}; PX4 may reselect preferred VIO GPS"
+            )
+            self._send_status_text("VIO GPS: live output resumed", 6)
+        elif was_active:
+            self.get_logger().error(
+                f"VIO_GPS_OUTPUT_STOPPED reason={reason}; waiting for PX4 GPS timeout/fallback"
+            )
+            if reason == "vio_stale":
+                text = "VIO GPS stopped: VIO stale; GPS1 fallback"
+            elif reason == "continuity_quarantine":
+                text = "VIO GPS stopped: pose gate; GPS1 fallback"
+            else:
+                text = f"VIO GPS stopped: {reason}"
+            self._send_status_text(text, 3)
 
     def _odom_callback(self, msg: Odometry):
         if msg.child_frame_id != self.expected_child_frame:
@@ -618,6 +786,7 @@ class VioPx4GpsBridge(Node):
                 self.get_logger().info(
                     "VIO ready; continuing static GPS while heading alignment completes"
                 )
+                self._send_status_text("VIO GPS: VIO ready, aligning heading", 6)
 
     def _update_heading_alignment(self, vio_body_yaw_ned: float, horizontal_speed: float):
         if self.heading_offset_rad is not None:
@@ -677,6 +846,7 @@ class VioPx4GpsBridge(Node):
             f"offset={math.degrees(self.heading_offset_rad):.2f} deg, "
             f"std={math.degrees(circular_std):.2f} deg, n={len(self.heading_samples)}"
         )
+        self._send_status_text("VIO GPS: heading aligned", 6)
 
     def _rotate_mag_mount(self, x: float, y: float, z: float):
         """Apply configured Rx, then Ry, then Rz compass-to-body offsets."""
@@ -707,6 +877,7 @@ class VioPx4GpsBridge(Node):
             self.get_logger().info(f"GPS spoof ended -> live VIO GPS ({reason})")
         else:
             self.get_logger().info(f"RC activated live VIO GPS ({reason})")
+        self._send_status_text("VIO GPS: live VIO active", 6)
 
     def _rc_position(self, pwm: int) -> str | None:
         if pwm in (0, 65535):
@@ -727,6 +898,13 @@ class VioPx4GpsBridge(Node):
                 return
             message_type = msg.get_type()
             now = time.monotonic()
+            if (
+                message_type == "HEARTBEAT"
+                and self.px4_target_sysid is not None
+                and int(msg.get_srcSystem()) == self.px4_target_sysid
+            ):
+                self.last_px4_heartbeat_time = now
+                continue
             if message_type == "ATTITUDE":
                 roll, pitch = float(msg.roll), float(msg.pitch)
                 if math.isfinite(roll) and math.isfinite(pitch):
@@ -763,7 +941,14 @@ class VioPx4GpsBridge(Node):
             self.get_logger().info(
                 f"RC channel {self.rc_channel} pwm={pwm} triggered GPS bootstrap"
             )
-            if vio_is_fresh and self.heading_offset_rad is not None:
+            # `spoof_until_vio=true` permits an immediate handoff when VIO is
+            # already healthy. With it disabled, always provide the complete
+            # timed stationary bootstrap before switching to live VIO.
+            if (
+                self.spoof_until_vio
+                and vio_is_fresh
+                and self.heading_offset_rad is not None
+            ):
                 self._enter_live("rc_trigger_vio_already_ready")
             else:
                 self.phase = Phase.SPOOF
@@ -772,6 +957,7 @@ class VioPx4GpsBridge(Node):
                     f"GPS spoof started from RC channel {self.rc_channel} "
                     f"for up to {self.spoof_duration_s:.1f}s"
                 )
+                self._send_status_text("VIO GPS: home spoof active (15 s max)", 6)
 
     def _maybe_end_spoof_by_timer(self):
         if self.phase not in (Phase.SPOOF, Phase.ALIGNING):
@@ -791,19 +977,23 @@ class VioPx4GpsBridge(Node):
                     "fresh, heading-aligned VIO; "
                     f"GPS output stopped. Toggle RC channel {self.rc_channel} LOW then HIGH to retry"
                 )
+                self._send_status_text("VIO GPS: spoof expired; output stopped", 4)
 
     def _tick(self):
         self._poll_mavlink()
         if self.phase == Phase.WAITING:
+            self._set_live_output_state(False, "waiting_for_activation")
             return
         self._maybe_end_spoof_by_timer()
         if self.phase == Phase.WAITING:
+            self._set_live_output_state(False, "spoof_expired")
             return
 
         if (
             self.phase == Phase.LIVE
             and self.continuity_recovering
         ):
+            self._set_live_output_state(False, "continuity_quarantine")
             return
 
         if (
@@ -817,6 +1007,7 @@ class VioPx4GpsBridge(Node):
                     "stopping GPS updates so PX4 can time out the aid source"
                 )
                 self.vio_stale_warned = True
+            self._set_live_output_state(False, "vio_stale")
             return
 
         if self.phase in (Phase.SPOOF, Phase.ALIGNING) or not self.have_vio:
@@ -836,6 +1027,12 @@ class VioPx4GpsBridge(Node):
             fix = dict(self.latest_fix)
             fix["eph"] = eph
             fix["epv"] = epv
+            if self.horizontal_only_output:
+                fix["alt"] = self.home_alt
+                fix["vn"] = 0.0
+                fix["ve"] = 0.0
+                fix["vd"] = 0.0
+            self._set_live_output_state(True, "all_health_gates_passed")
 
         if self.send_set_gps_global_origin and not self.origin_sent:
             self._send_global_origin()
@@ -879,7 +1076,7 @@ class VioPx4GpsBridge(Node):
         cog = course_over_ground_cdeg(vn, ve)
         now_us = int(time.time() * 1e6)
         # Units: lat/lon degE7, alt mm, eph/epv cm, vel cm/s
-        self._mav.mav.hil_gps_send(
+        base_args = (
             now_us,
             clamp_int(self.fix_type, 0, 255),
             clamp_int(fix["lat"] * 1e7, -2147483648, 2147483647),
@@ -893,9 +1090,23 @@ class VioPx4GpsBridge(Node):
             clamp_int(vd * 100.0, -32768, 32767),
             int(cog),
             clamp_int(self.satellites, 0, 255),
-            clamp_int(self.gps_id, 0, 255),
-            0,  # yaw unavailable (PX4 HIL_GPS receiver also forces heading NaN)
         )
+        if self._hil_gps_extensions_supported is not False:
+            try:
+                self._mav.mav.hil_gps_send(
+                    *base_args,
+                    clamp_int(self.gps_id, 0, 255),
+                    0,  # yaw unavailable; PX4 also forces heading NaN
+                )
+                self._hil_gps_extensions_supported = True
+                return
+            except TypeError:
+                self._hil_gps_extensions_supported = False
+                self.get_logger().warn(
+                    "Jetson pymavlink HIL_GPS has no id/yaw extensions; "
+                    "using compatible base message (PX4 ignores those fields)"
+                )
+        self._mav.mav.hil_gps_send(*base_args)
 
     def _publish_ros2_sensor_gps(self, fix: dict):
         msg = SensorGps()
