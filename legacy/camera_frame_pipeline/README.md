@@ -12,7 +12,7 @@ with `base_frame:=drone_link`.
 Production files live under:
 
 ```text
-jetson/isaac_ros_overrides/
+jetson-config/isaac_ros_overrides/
 scripts/vio-launch/
 src/vio_px4_bridge/
 ```

@@ -20,7 +20,7 @@ ROS 2 Humble system.
 | Docker image key | `aarch64.ros2_humble.realsense` |
 
 The authoritative machine-readable pins are in
-`jetson/isaac_ros_release.env`.
+`jetson-config/isaac_ros_release.env`.
 
 ## Why the original setup was difficult to reproduce
 
@@ -67,7 +67,7 @@ The bootstrap performs these operations in order:
 
 `bootstrap_jetson.sh` also reconstructs the standalone
 `~/workspaces/mavros` workspace at the pinned commit recorded in
-`jetson/mavros_release.env`, applies the proven Jetson patch, and builds it.
+`jetson-config/mavros_release.env`, applies the proven Jetson patch, and builds it.
 MAVROS remains a sibling dependency rather than being nested in VIO_PX4. It is
 used by Path B; Path A talks MAVLink directly and does not start MAVROS.
 

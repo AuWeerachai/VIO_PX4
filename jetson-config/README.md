@@ -28,7 +28,7 @@ ${ISAAC_ROS_WS}/src/isaac_ros_common/scripts/.isaac_ros_common-config
 ```
 
 It creates timestamped backups before replacing existing files. The Git copies
-under `jetson/isaac_ros_overrides/` remain authoritative.
+under `jetson-config/isaac_ros_overrides/` remain authoritative.
 
 Both large runtime workspaces remain standalone siblings:
 

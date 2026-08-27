@@ -9,7 +9,7 @@ Provision the NVIDIA Isaac ROS/cuVSLAM base workspace needed by VIO_PX4, then
 run bootstrap_jetson.sh to install this repository's launch configuration.
 
 The exact Isaac ROS Common commit and NGC asset are pinned in
-jetson/isaac_ros_release.env. The script rejects a different JetPack/L4T family
+jetson-config/isaac_ros_release.env. The script rejects a different JetPack/L4T family
 instead of silently installing an incompatible NVIDIA release.
 EOF
 }
@@ -31,7 +31,7 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 COMMON_DIR="$ISAAC_WS/src/isaac_ros_common"
 VSLAM_DIR="$COMMON_DIR/isaac_ros_visual_slam"
 ASSET_FILE="$ISAAC_WS/isaac_ros_assets/isaac_ros_visual_slam/quickstart_interface_specs.json"
-RELEASE_FILE="$REPO_DIR/jetson/isaac_ros_release.env"
+RELEASE_FILE="$REPO_DIR/jetson-config/isaac_ros_release.env"
 
 [[ -r "$RELEASE_FILE" ]] || { echo "Missing release manifest: $RELEASE_FILE" >&2; exit 1; }
 # shellcheck disable=SC1090

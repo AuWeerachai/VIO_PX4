@@ -31,7 +31,7 @@ ISAAC_SCRIPTS="$ISAAC_WS/src/isaac_ros_common/scripts"
 ISAAC_COMMON="$ISAAC_WS/src/isaac_ros_common"
 ISAAC_VSLAM="$ISAAC_COMMON/isaac_ros_visual_slam"
 MAVROS_SRC="$MAVROS_WS/src/mavros"
-MAVROS_RELEASE_FILE="$REPO_DIR/jetson/mavros_release.env"
+MAVROS_RELEASE_FILE="$REPO_DIR/jetson-config/mavros_release.env"
 
 [[ -r "$MAVROS_RELEASE_FILE" ]] || {
   echo "Missing MAVROS release manifest: $MAVROS_RELEASE_FILE" >&2
@@ -88,7 +88,7 @@ else
   fi
 fi
 
-mavros_patch="$REPO_DIR/jetson/mavros_overrides/proven_jetson.patch"
+mavros_patch="$REPO_DIR/jetson-config/mavros_overrides/proven_jetson.patch"
 if git -C "$MAVROS_SRC" apply --reverse --check "$mavros_patch" 2>/dev/null; then
   echo "MAVROS source already matches the proven Jetson patch."
 elif git -C "$MAVROS_SRC" apply --check "$mavros_patch"; then
@@ -116,16 +116,16 @@ install_override() {
 }
 
 install_override \
-  "$REPO_DIR/jetson/isaac_ros_overrides/scripts/start_vio.sh" \
+  "$REPO_DIR/jetson-config/isaac_ros_overrides/scripts/start_vio.sh" \
   "$ISAAC_SCRIPTS/start_vio.sh"
 install_override \
-  "$REPO_DIR/jetson/isaac_ros_overrides/scripts/start_rviz.sh" \
+  "$REPO_DIR/jetson-config/isaac_ros_overrides/scripts/start_rviz.sh" \
   "$ISAAC_SCRIPTS/start_rviz.sh"
 install -m 0644 \
-  "$REPO_DIR/jetson/isaac_ros_overrides/.isaac_ros_common-config" \
+  "$REPO_DIR/jetson-config/isaac_ros_overrides/.isaac_ros_common-config" \
   "$ISAAC_SCRIPTS/.isaac_ros_common-config"
 
-realsense_patch="$REPO_DIR/jetson/isaac_ros_overrides/docker/Dockerfile.realsense.patch"
+realsense_patch="$REPO_DIR/jetson-config/isaac_ros_overrides/docker/Dockerfile.realsense.patch"
 if grep -q 'ros-humble-isaac-ros-visual-slam' "$ISAAC_COMMON/docker/Dockerfile.realsense"; then
   echo "Isaac ROS RealSense image already contains the VIO runtime packages."
 elif git -C "$ISAAC_COMMON" apply --check "$realsense_patch"; then
@@ -136,7 +136,7 @@ else
   exit 1
 fi
 
-vslam_patch="$REPO_DIR/jetson/isaac_ros_overrides/visual_slam/proven_jetson.patch"
+vslam_patch="$REPO_DIR/jetson-config/isaac_ros_overrides/visual_slam/proven_jetson.patch"
 if git -C "$ISAAC_VSLAM" apply --reverse --check "$vslam_patch" 2>/dev/null; then
   echo "Isaac ROS visual-slam source already matches the proven Jetson patch."
 elif git -C "$ISAAC_VSLAM" apply --check "$vslam_patch"; then

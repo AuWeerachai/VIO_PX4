@@ -50,7 +50,7 @@ The full bootstrap creates both dependency workspaces at the pinned, proven
 revisions. Path A uses `isaac_ros-dev` but owns MAVLink directly; Path B uses
 both `isaac_ros-dev` and MAVROS.
 
-See `jetson/README.md` for the installed paths. Generated ROS build trees,
+See `jetson-config/README.md` for the installed paths. Generated ROS build trees,
 logs, bags, credentials, and Docker images are intentionally not stored in Git.
 
 ## Operator launcher
@@ -78,7 +78,7 @@ PX4 params (EV):
 Path B starts MAVROS on `/dev/ttyUSB0:921600`, then relays validated body-frame
 cuVSLAM odometry to `/mavros/odometry/out`. Micro XRCE-DDS and `px4_msgs` are not
 part of the Jetson deployment. The relay rejects raw `camera_link` poses; use
-the installed `jetson/isaac_ros_overrides/scripts/start_vio.sh` so cuVSLAM
+the installed `jetson-config/isaac_ros_overrides/scripts/start_vio.sh` so cuVSLAM
 publishes `child_frame_id=drone_link` directly.
 
 ## 2) Internship-style GPS spoof + live VIO GPS (recommended for GPS path)
@@ -140,7 +140,7 @@ not match PX4, or exposed dual-GPS selector values contradict the VIO-first
 policy. Firmware without `SENS_GPS_MASK`/`SENS_GPS_PRIME` produces an explicit
 unverified-selection warning and requires inspection before flight. Set the real magnetic declination and measured cuVSLAM
 child-to-body yaw in the CLI's **Heading alignment** menu. Review
-`PX4_INTERFACE_CHECKLIST.md` before hardware testing.
+`docs/PX4_INTERFACE_CHECKLIST.md` before hardware testing.
 
 ### cuVSLAM pose-jump continuity
 
