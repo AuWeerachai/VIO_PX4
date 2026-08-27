@@ -810,7 +810,7 @@ def cmd_doctor(cfg: Config) -> int:
     print(f"odom:     {cfg.odom_topic}")
     print(f"heading:  {cfg.heading_source}, declination={declination_label(cfg)}, "
           f"child-to-body={cfg.child_to_body_yaw_deg} deg")
-    print(f"checklist: {cfg.vio_px4_dir / 'docs/PX4_INTERFACE_CHECKLIST.md'}")
+    print(f"checklist: {cfg.vio_px4_dir / 'bootstrap/docs/PX4_INTERFACE_CHECKLIST.md'}")
     print(f"config:   {user_config_path()}")
     return 0 if failed == 0 else 1
 

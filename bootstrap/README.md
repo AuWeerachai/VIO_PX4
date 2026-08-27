@@ -140,7 +140,7 @@ not match PX4, or exposed dual-GPS selector values contradict the VIO-first
 policy. Firmware without `SENS_GPS_MASK`/`SENS_GPS_PRIME` produces an explicit
 unverified-selection warning and requires inspection before flight. Set the real magnetic declination and measured cuVSLAM
 child-to-body yaw in the CLI's **Heading alignment** menu. Review
-`docs/PX4_INTERFACE_CHECKLIST.md` before hardware testing.
+`bootstrap/docs/PX4_INTERFACE_CHECKLIST.md` before hardware testing.
 
 ### cuVSLAM pose-jump continuity
 

@@ -42,8 +42,8 @@ The full bootstrap creates and builds the first two; generated build trees and
 Docker images are intentionally not nested in this repository or committed.
 
 The default launch is the proven visual-only cuVSLAM configuration. The staged
-RealSense IMU design is documented in `docs/STAGED_IMU_IMPLEMENTATION.md` and
+RealSense IMU design is documented in `bootstrap/docs/STAGED_IMU_IMPLEMENTATION.md` and
 must not become the default until it passes the documented bench tests.
 
 The exact NVIDIA/JetPack pins, original manual layers, and clean-room rebuild
-sequence are documented in `docs/ISAAC_ROS_BOOTSTRAP.md`.
+sequence are documented in `bootstrap/docs/ISAAC_ROS_BOOTSTRAP.md`.

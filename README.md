@@ -6,5 +6,4 @@ external-vision paths.
 - Run the installed system with `./vio-launch`.
 - ROS source is under `src/`.
 - Operator launcher code is under `scripts/vio-launch/`.
-- PX4 and architecture documentation is under `docs/`.
-
+- Runtime architecture documentation is under `docs/`.
