@@ -119,6 +119,9 @@ install_override \
   "$SCRIPT_DIR/jetson-config/isaac_ros_overrides/scripts/start_vio.sh" \
   "$ISAAC_SCRIPTS/start_vio.sh"
 install_override \
+  "$SCRIPT_DIR/jetson-config/isaac_ros_overrides/scripts/cuvslam_vio.launch.py" \
+  "$ISAAC_SCRIPTS/cuvslam_vio.launch.py"
+install_override \
   "$SCRIPT_DIR/jetson-config/isaac_ros_overrides/scripts/start_rviz.sh" \
   "$ISAAC_SCRIPTS/start_rviz.sh"
 install -m 0644 \

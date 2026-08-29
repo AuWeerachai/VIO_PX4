@@ -19,12 +19,6 @@ extrinsic_pid=$!
 cleanup() { kill "$extrinsic_pid" 2>/dev/null || true; }
 trap cleanup EXIT INT TERM
 
-# image_jitter_threshold_ms is explicit so reproducing this pipeline never
-# requires editing NVIDIA's visual_slam_node.cpp default.
-ros2 launch isaac_ros_examples isaac_ros_examples.launch.py \
-  launch_fragments:=realsense_stereo_rect,visual_slam \
-  interface_specs_file:="${ISAAC_ROS_WS}/isaac_ros_assets/isaac_ros_visual_slam/quickstart_interface_specs.json" \
-  base_frame:=drone_link \
-  enable_imu_fusion:=False \
-  image_jitter_threshold_ms:=60.0 \
-  camera_optical_frames:="['camera_infra1_optical_frame', 'camera_infra2_optical_frame']"
+# This experiment uses a project-owned launch file because NVIDIA's generic
+# visual_slam fragment does not remap the RealSense combined IMU topic.
+ros2 launch "$(dirname "${BASH_SOURCE[0]}")/cuvslam_vio.launch.py"

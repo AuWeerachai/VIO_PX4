@@ -1,7 +1,8 @@
 # Staged RealSense IMU implementation
 
-This is a future implementation plan. The default pipeline remains the proven
-visual-only configuration until this sequence passes bench testing.
+This is an experimental implementation on the `exp-turn-imu-on` branch. The
+`vio-as-gps` branch remains the proven visual-only rollback configuration until
+this sequence passes bench testing.
 
 ## Confirmed cuVSLAM behavior
 
@@ -10,7 +11,7 @@ subscription is not created when it starts false, so fusion cannot be enabled
 later with a ROS parameter change. When it starts true, tracker initialization
 waits for camera calibration and at least one IMU message.
 
-## Planned safe startup
+## Experimental staged startup
 
 ```text
 Start RealSense infrared stereo with accel/gyro disabled
