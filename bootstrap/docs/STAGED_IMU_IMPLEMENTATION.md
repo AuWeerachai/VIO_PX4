@@ -35,7 +35,8 @@ streams atomically when the RealSense node is constructed. Do not use
 - The IMU frame has a valid transform to `drone_link`.
 - The tracker initializes reliably over repeated cold starts.
 - No persistent `Motion Module force pause` occurs.
-- Stereo remains 640x360 at 90 Hz.
+- Stereo remains 640x360 at 30 Hz while IMU fusion is enabled; higher image
+  rates must be treated as a separate USB-bandwidth experiment.
 - Stationary pose/attitude is at least as stable as the visual-only baseline.
 - Hand motion has correct axis signs.
 - The VIO pose-jump continuity gate still keeps global output continuous.

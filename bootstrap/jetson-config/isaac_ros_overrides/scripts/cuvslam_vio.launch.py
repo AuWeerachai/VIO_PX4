@@ -28,6 +28,7 @@ def generate_launch_description():
             parameters=[realsense_config, {
                 'enable_gyro': True,
                 'enable_accel': True,
+                'depth_module.profile': '640x360x30',
                 'gyro_fps': 200,
                 'accel_fps': 200,
                 'unite_imu_method': 2,
