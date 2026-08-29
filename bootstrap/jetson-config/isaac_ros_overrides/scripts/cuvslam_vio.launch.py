@@ -5,19 +5,8 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import ExecuteProcess, TimerAction
 from launch_ros.actions import ComposableNodeContainer
 from launch_ros.descriptions import ComposableNode
-
-
-def set_camera_parameter(name, value, delay):
-    return TimerAction(
-        period=delay,
-        actions=[ExecuteProcess(
-            cmd=['ros2', 'param', 'set', '/realsense2_camera', name, value],
-            output='screen',
-        )],
-    )
 
 
 def generate_launch_description():
@@ -33,7 +22,16 @@ def generate_launch_description():
             plugin='realsense2_camera::RealSenseNodeFactory',
             name='realsense2_camera',
             namespace='',
-            parameters=[realsense_config],
+            # Configure the motion module atomically during node construction.
+            # Runtime enable calls restart the D456 sensors independently and
+            # can overwhelm its USB control endpoint.
+            parameters=[realsense_config, {
+                'enable_gyro': True,
+                'enable_accel': True,
+                'gyro_fps': 200,
+                'accel_fps': 200,
+                'unite_imu_method': 2,
+            }],
             remappings=[
                 ('infra1/image_rect_raw', 'infra1/image_rect_raw_mono'),
                 ('infra1/camera_info', 'left/camera_info_rect'),
@@ -141,14 +139,4 @@ def generate_launch_description():
         output='screen',
     )
 
-    # Keep motion streams off during USB/camera initialization. Configure the
-    # combined IMU first, then start gyro and accelerometer after cuVSLAM has
-    # created its subscription and is waiting for the first sample.
-    return LaunchDescription([
-        container,
-        set_camera_parameter('unite_imu_method', '2', 4.0),
-        set_camera_parameter('gyro_fps', '200', 5.0),
-        set_camera_parameter('accel_fps', '200', 6.0),
-        set_camera_parameter('enable_gyro', 'true', 7.0),
-        set_camera_parameter('enable_accel', 'true', 8.0),
-    ])
+    return LaunchDescription([container])

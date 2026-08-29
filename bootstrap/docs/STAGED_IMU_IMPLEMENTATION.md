@@ -11,22 +11,21 @@ subscription is not created when it starts false, so fusion cannot be enabled
 later with a ROS parameter change. When it starts true, tracker initialization
 waits for camera calibration and at least one IMU message.
 
-## Experimental staged startup
+## Experimental startup
 
 ```text
-Start RealSense infrared stereo with accel/gyro disabled
-  -> launch visual_slam_node with enable_imu_fusion=True
-  -> wait for /realsense2_camera
-  -> set unite_imu_method=2
-  -> set supported gyro and accelerometer rates
-  -> enable gyro and accelerometer
-  -> verify the combined IMU topic and TF to drone_link
-  -> first IMU sample allows cuVSLAM tracker initialization
+Construct RealSense with infrared stereo, accel, gyro, and unite_imu_method=2
+  -> construct visual_slam_node with enable_imu_fusion=True
+  -> route the combined IMU topic to visual_slam/imu
+  -> first synchronized IMU sample allows cuVSLAM tracker initialization
   -> verify body-frame odometry before starting either PX4 path
 ```
 
-Do not use `initial_reset: true` by default. The previous eager-IMU experiment
-produced RealSense USB control-transfer warnings and motion-module force pauses.
+Do not enable the gyro and accelerometer through sequential runtime parameter
+changes. Bench testing on the D456 showed that each change restarts sensors and
+causes a sustained flood of USB control-transfer errors. Configure both motion
+streams atomically when the RealSense node is constructed. Do not use
+`initial_reset: true` by default.
 
 ## Required bench checks
 
