@@ -43,3 +43,21 @@ streams atomically when the RealSense node is constructed. Do not use
 
 Retain a visual-only configuration switch as rollback until flight validation is
 complete.
+
+## 2026-08-29 D456 bench result
+
+The experimental launch correctly constructed cuVSLAM with IMU fusion enabled,
+enabled both D456 motion streams at 200 Hz, selected 640x360x30 stereo, and
+created the remapped `/visual_slam/imu` topic. The camera nevertheless published
+neither IMU nor image data and continuously reported USB control-transfer
+failures. A scoped USB unbind/rebind did not change the result.
+
+The deployed versions are not the vendor-recommended pair:
+
+- RealSense ROS 4.51.1 / librealsense 2.55.1
+- D456 firmware 5.17.0.10
+
+The librealsense 2.55.1 release recommends D400 firmware 5.16.0.1. Do not resume
+the VIO test until either the camera firmware is changed to 5.16.0.1 or the
+Isaac ROS RealSense stack is upgraded and validated against firmware 5.17.0.10.
+Firmware changes require a separate explicit bench procedure and rollback plan.
