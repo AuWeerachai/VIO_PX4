@@ -22,7 +22,7 @@ class LocalPoseContinuity:
                  yaw_residual_limit_rad=math.radians(20.0), max_gap_s=1.0,
                  recovery_samples=10, confirmation_samples=3,
                  max_speed_mps=10.0, max_acceleration_mps2=5.0,
-                 max_yaw_rate_rad_s=math.radians(200.0)):
+                 max_yaw_rate_rad_s=math.radians(360.0)):
         self.position_residual_limit_m = max(0.05, position_residual_limit_m)
         self.yaw_residual_limit_rad = max(math.radians(1.0), yaw_residual_limit_rad)
         self.max_gap_s = max(0.05, max_gap_s)

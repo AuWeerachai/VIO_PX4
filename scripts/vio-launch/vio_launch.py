@@ -90,7 +90,7 @@ class Config:
     gate_confirmation_samples: int = 3
     gate_max_speed_m_s: float = 10.0
     gate_max_acceleration_m_s2: float = 5.0
-    gate_max_yaw_rate_deg_s: float = 200.0
+    gate_max_yaw_rate_deg_s: float = 360.0
     rviz_enabled: bool = False
     state_dir: Path = field(default_factory=lambda: Path.home() / ".local/state/vio-launch")
 
@@ -1634,6 +1634,15 @@ def configure_pose_gate(cfg: Config) -> Config:
     print("Configure VIO continuity / pose-jump gate\n")
     print("A sample is quarantined when any enabled physical or consistency limit is exceeded.")
     print("Quarantined samples do not update the accepted local trajectory.\n")
+    print("Definitions:")
+    print("  Position residual = measured displacement minus displacement predicted")
+    print("                      from the last trusted velocity.")
+    print("  Yaw residual      = measured heading change minus change predicted")
+    print("                      from yaw rate.")
+    print("  Pose epoch        = one continuous cuVSLAM coordinate segment; a confirmed")
+    print("                      reset/jump starts a new epoch aligned to the old one.")
+    print("  Confirmation      = consistent samples required to accept a new epoch.")
+    print("  Recovery          = additional stable samples required before GPS resumes.\n")
     prompts = (
         ("Maximum speed m/s", cfg.gate_max_speed_m_s, float, 0.0),
         ("Maximum acceleration m/s^2", cfg.gate_max_acceleration_m_s2, float, 0.0),
@@ -1777,7 +1786,8 @@ def interactive_main(cfg: Config) -> int:
                     "pose-gate",
                     f"speed={cfg.gate_max_speed_m_s:g} m/s; "
                     f"accel={cfg.gate_max_acceleration_m_s2:g} m/s²; "
-                    f"residual={cfg.gate_position_residual_m:g} m",
+                    f"position residual={cfg.gate_position_residual_m:g} m; "
+                    f"yaw rate={cfg.gate_max_yaw_rate_deg_s:g}°/s",
                 ),
                 MenuItem(
                     "RViz auto-launch (toggle ON/OFF)",

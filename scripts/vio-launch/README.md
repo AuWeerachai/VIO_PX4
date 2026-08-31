@@ -37,6 +37,22 @@ positive pitch points a forward-facing camera downward. Gate changes apply the
 next time Path A starts; camera-extrinsic changes apply the next time either
 path starts cuVSLAM.
 
+## Units and pose-jump gate meanings
+
+Camera `X/Y/Z` are entered in **metres**. Camera `roll/pitch/yaw` are entered
+in **degrees** and converted to radians for ROS. Gate speed is in `m/s`,
+acceleration in `m/s²`, position residual in metres, yaw rate in `deg/s`, yaw
+residual in degrees, and maximum tracking gap in seconds. Confirmation and
+recovery values are numbers of odometry samples.
+
+Position residual is the difference between measured displacement and the
+displacement predicted from the last trusted velocity. Yaw residual is the
+equivalent difference for heading change and yaw rate. A pose **epoch** is one
+continuous cuVSLAM coordinate segment. Consistent suspicious samples confirm
+that cuVSLAM started a new epoch; the bridge aligns it with the last accepted
+pose. It then requires the configured recovery samples to remain stable before
+GPS publication resumes. The default maximum yaw rate is `360 deg/s`.
+
 ## Selecting an option
 
 Type the number shown next to an option and press `Enter`.

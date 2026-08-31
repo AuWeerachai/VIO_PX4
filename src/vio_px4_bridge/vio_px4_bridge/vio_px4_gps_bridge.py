@@ -136,7 +136,7 @@ class VioPx4GpsBridge(Node):
         self.declare_parameter("continuity_confirmation_samples", 3)
         self.declare_parameter("continuity_max_speed_m_s", 10.0)
         self.declare_parameter("continuity_max_acceleration_m_s2", 5.0)
-        self.declare_parameter("continuity_max_yaw_rate_deg_s", 200.0)
+        self.declare_parameter("continuity_max_yaw_rate_deg_s", 360.0)
 
         self.odom_topic = str(self.get_parameter("odom_topic").value)
         self.expected_child_frame = str(self.get_parameter("expected_child_frame").value)
