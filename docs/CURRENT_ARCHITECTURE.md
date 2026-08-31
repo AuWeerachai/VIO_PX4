@@ -44,11 +44,12 @@ source timeout, physical-GNSS selection, dead reckoning, and configured
 failsafes. Short relocalizations are absorbed locally without a global jump.
 The operator can change all continuity thresholds from `vio-launch`; saved
 values are passed explicitly to the bridge at every Path A launch.
-Position and yaw residuals compare measured motion with motion predicted from
-the last trusted velocity and yaw rate. A confirmed discontinuity increments
-the pose epoch, aligns the new raw coordinate segment with the last accepted
-pose, and requires the configured number of stable recovery samples before
-GPS output resumes. The default maximum yaw-rate limit is 360 degrees/second.
+The bridge converts speed and yaw-rate limits into allowed pose changes using
+the measured timestamp interval between each pair of odometry messages. A
+confirmed coordinate reset increments the internal segment counter, aligns the
+new raw segment with the last accepted pose, and requires the configured number
+of stable recovery samples before GPS output resumes. The default maximum
+yaw-rate limit is 360 degrees/second.
 
 ## Path B: external vision through MAVROS
 

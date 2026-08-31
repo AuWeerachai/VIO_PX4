@@ -77,8 +77,6 @@ firmware because message handling and estimator requirements can change.
 - [ ] On cuVSLAM reset/relocalization, stop live GPS and require realignment.
 - [ ] A single innovation failure enters quarantine and stops live GPS; it must
   not immediately move the local-to-global origin.
-- [ ] Accepted-trajectory prediction uses only the last trusted velocity. An
-  incoming/quarantined velocity must not influence that prediction.
 - [ ] Verify an isolated bad pose that returns to the old trajectory is dropped
   without incrementing the continuity epoch.
 - [ ] Require `continuity_confirmation_samples` internally consistent poses
@@ -90,6 +88,8 @@ firmware because message handling and estimator requirements can change.
   `continuity_recovery_samples` additional valid poses.
 - [ ] Validate continuity thresholds against the vehicle's maximum real speed
   and acceleration so genuine motion is not misclassified as relocalization.
+- [ ] Verify position and heading changes are limited using message timestamp
+  intervals (`speed × dt`, `yaw_rate × dt`) at both 30 Hz and 90 Hz.
 - [ ] For this fully actuated platform, do not use body tilt as a horizontal
   motion gate; approximately level attitude does not imply zero translation.
 - [ ] Confirm the configured 10 m/s hard speed limit matches the flight-control
@@ -97,7 +97,7 @@ firmware because message handling and estimator requirements can change.
 - [ ] Confirm the configured 5 m/s² acceleration limit against real flight logs;
   noisy differentiated VIO velocity must not cause false quarantine events.
 - [ ] Connect cuVSLAM's explicit tracking/reset event as the primary re-anchor
-  trigger; residual thresholds are a conservative fallback, not sole evidence.
+  trigger; timestamp-derived physical rate checks remain the fallback.
 
 ## Path B: MAVROS ODOMETRY contract
 

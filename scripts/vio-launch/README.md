@@ -19,7 +19,7 @@ cd ~/workspaces/VIO_PX4/scripts/vio-launch
 | **Home latitude/longitude** | Horizontal spoof/origin position |
 | **Heading alignment** | Configure compass/manual true-heading alignment |
 | **Camera extrinsic** | Configure the full ROS FLU `drone_link → camera_link` XYZ/RPY transform |
-| **Pose-jump gate limits** | Configure speed, acceleration, residual, timing, and recovery limits |
+| **Pose-jump gate limits** | Configure physical rate, timing, and recovery limits |
 | **RViz auto-launch** | Persistently toggle automatic RViz startup; default OFF |
 | **Leave CLI** | Close the menu and keep processes running |
 | **Stop all processes** | Stop bridges, Isaac sessions, and the container |
@@ -41,17 +41,22 @@ path starts cuVSLAM.
 
 Camera `X/Y/Z` are entered in **metres**. Camera `roll/pitch/yaw` are entered
 in **degrees** and converted to radians for ROS. Gate speed is in `m/s`,
-acceleration in `m/s²`, position residual in metres, yaw rate in `deg/s`, yaw
-residual in degrees, and maximum tracking gap in seconds. Confirmation and
-recovery values are numbers of odometry samples.
+acceleration in `m/s²`, yaw rate in `deg/s`, and maximum tracking gap in
+seconds. Confirmation and recovery values are numbers of odometry samples.
 
-Position residual is the difference between measured displacement and the
-displacement predicted from the last trusted velocity. Yaw residual is the
-equivalent difference for heading change and yaw rate. A pose **epoch** is one
-continuous cuVSLAM coordinate segment. Consistent suspicious samples confirm
-that cuVSLAM started a new epoch; the bridge aligns it with the last accepted
-pose. It then requires the configured recovery samples to remain stable before
-GPS publication resumes. The default maximum yaw rate is `360 deg/s`.
+For every pair of messages, the bridge derives the allowed position and
+heading change from the configured rate and the measured timestamp interval:
+`distance = speed × dt` and `angle = yaw_rate × dt`. This keeps the physical
+gate consistent when the effective odometry frequency changes.
+
+A coordinate reset means cuVSLAM has started reporting the same physical scene
+from a different raw origin or heading. After the first suspicious sample, the
+bridge pauses GPS. If subsequent samples return to the old trajectory, the
+first sample is discarded as an outlier. If the configured number of samples
+are mutually consistent in the new coordinates, the reset is confirmed and
+the new segment is aligned with the last accepted pose. GPS remains paused for
+the configured additional recovery samples. The default maximum yaw rate is
+`360 deg/s`.
 
 ## Selecting an option
 

@@ -8,7 +8,7 @@ def update(tracker, x, y=0.0, yaw=0.0, t=0.0, vx=0.0, frame="odom|base"):
 
 
 def test_normal_motion_passes_through():
-    tracker = LocalPoseContinuity(position_residual_limit_m=1.0)
+    tracker = LocalPoseContinuity()
     first = update(tracker, 0.0, t=1.0, vx=1.0)
     second = update(tracker, 1.0, t=2.0, vx=1.0)
     assert first.position == (0.0, 0.0, 0.0)
@@ -17,8 +17,7 @@ def test_normal_motion_passes_through():
 
 
 def test_confirmed_position_jump_preserves_continuity():
-    tracker = LocalPoseContinuity(position_residual_limit_m=0.5,
-                                  confirmation_samples=3, recovery_samples=2)
+    tracker = LocalPoseContinuity(confirmation_samples=3, recovery_samples=2)
     update(tracker, 10.0, t=1.0, vx=1.0)
     before = update(tracker, 11.0, t=2.0, vx=1.0)
     suspect = update(tracker, 100.0, t=3.0, vx=1.0)
@@ -36,7 +35,7 @@ def test_confirmed_position_jump_preserves_continuity():
 
 
 def test_isolated_outlier_is_discarded_without_reanchor():
-    tracker = LocalPoseContinuity(position_residual_limit_m=0.5)
+    tracker = LocalPoseContinuity()
     update(tracker, 0.0, t=1.0, vx=1.0)
     before = update(tracker, 1.0, t=2.0, vx=1.0)
     bad = update(tracker, 50.0, t=3.0, vx=1.0)
@@ -50,8 +49,7 @@ def test_isolated_outlier_is_discarded_without_reanchor():
 
 def test_yaw_jump_preserves_position_and_heading():
     tracker = LocalPoseContinuity(
-        position_residual_limit_m=1.0,
-        yaw_residual_limit_rad=math.radians(10),
+        max_yaw_rate_rad_s=math.radians(10),
         confirmation_samples=2,
     )
     before = update(tracker, 2.0, y=3.0, yaw=0.1, t=1.0)
@@ -72,13 +70,13 @@ def test_frame_change_reanchors():
 
 
 def test_recovery_gate_clears_after_stable_samples():
-    tracker = LocalPoseContinuity(position_residual_limit_m=0.5,
+    tracker = LocalPoseContinuity(max_speed_mps=5.0,
                                   confirmation_samples=2, recovery_samples=2)
     update(tracker, 0.0, t=1.0)
-    assert update(tracker, 10.0, t=2.0).recovering
-    assert update(tracker, 10.0, t=3.0).recovering
-    assert update(tracker, 10.0, t=4.0).recovering
-    assert not update(tracker, 10.0, t=5.0).recovering
+    assert update(tracker, 10.0, t=1.1).recovering
+    assert update(tracker, 10.0, t=1.2).recovering
+    assert update(tracker, 10.0, t=1.3).recovering
+    assert not update(tracker, 10.0, t=1.4).recovering
 
 
 def test_physical_speed_gate_quarantines_sample():
@@ -92,18 +90,35 @@ def test_physical_speed_gate_quarantines_sample():
     assert "limit_m_s=5.000" in result.detail
 
 
-def test_untrusted_velocity_cannot_hide_position_jump():
+def test_pose_derived_speed_detects_jump_with_low_reported_velocity():
     tracker = LocalPoseContinuity(
-        position_residual_limit_m=0.5,
-        max_speed_mps=1000.0,
+        max_speed_mps=5.0,
         max_acceleration_mps2=1000.0,
     )
     update(tracker, 0.0, t=1.0, vx=0.0)
-    # Averaging the corrupt 20 m/s incoming velocity with the trusted 0 m/s
-    # velocity would predict this 10 m jump and incorrectly accept it.
-    result = update(tracker, 10.0, t=2.0, vx=20.0)
+    # The pose implies 10 m/s even though cuVSLAM reports zero velocity.
+    result = update(tracker, 10.0, t=2.0, vx=0.0)
     assert result.recovering
     assert result.reason == "position_jump"
     assert result.position == (0.0, 0.0, 0.0)
     assert result.event == "quarantine_started"
-    assert "position_residual_m=10.000" in result.detail
+    assert "pose_implied_speed_m_s=10.000" in result.detail
+
+
+def test_pose_rate_gate_is_independent_of_message_frequency():
+    for hz in (30.0, 90.0):
+        dt = 1.0 / hz
+        tracker = LocalPoseContinuity(
+            max_speed_mps=10.0, max_acceleration_mps2=1000.0
+        )
+        update(tracker, 0.0, t=1.0, vx=9.0)
+        accepted = update(tracker, 9.0 * dt, t=1.0 + dt, vx=9.0)
+        assert not accepted.recovering
+
+        tracker = LocalPoseContinuity(
+            max_speed_mps=10.0, max_acceleration_mps2=1000.0
+        )
+        update(tracker, 0.0, t=1.0, vx=0.0)
+        rejected = update(tracker, 11.0 * dt, t=1.0 + dt, vx=0.0)
+        assert rejected.recovering
+        assert rejected.reason == "position_jump"

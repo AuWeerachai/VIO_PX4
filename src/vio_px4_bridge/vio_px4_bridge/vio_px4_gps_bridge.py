@@ -129,8 +129,6 @@ class VioPx4GpsBridge(Node):
         self.declare_parameter("alignment_max_std_deg", 5.0)
         self.declare_parameter("alignment_max_speed_m_s", 0.25)
         self.declare_parameter("alignment_sensor_max_age_s", 0.5)
-        self.declare_parameter("continuity_position_residual_m", 0.75)
-        self.declare_parameter("continuity_yaw_residual_deg", 20.0)
         self.declare_parameter("continuity_max_gap_s", 1.0)
         self.declare_parameter("continuity_recovery_samples", 10)
         self.declare_parameter("continuity_confirmation_samples", 3)
@@ -269,12 +267,6 @@ class VioPx4GpsBridge(Node):
             0.05, float(self.get_parameter("alignment_sensor_max_age_s").value)
         )
         self.continuity = LocalPoseContinuity(
-            position_residual_limit_m=float(
-                self.get_parameter("continuity_position_residual_m").value
-            ),
-            yaw_residual_limit_rad=math.radians(
-                float(self.get_parameter("continuity_yaw_residual_deg").value)
-            ),
             max_gap_s=float(self.get_parameter("continuity_max_gap_s").value),
             recovery_samples=int(self.get_parameter("continuity_recovery_samples").value),
             confirmation_samples=int(

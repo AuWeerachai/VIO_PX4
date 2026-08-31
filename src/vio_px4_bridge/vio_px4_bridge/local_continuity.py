@@ -18,13 +18,10 @@ class ContinuityResult:
 
 class LocalPoseContinuity:
     """Map reset-prone VIO into a continuous frame using a quarantine gate."""
-    def __init__(self, position_residual_limit_m=0.75,
-                 yaw_residual_limit_rad=math.radians(20.0), max_gap_s=1.0,
+    def __init__(self, max_gap_s=1.0,
                  recovery_samples=10, confirmation_samples=3,
                  max_speed_mps=10.0, max_acceleration_mps2=5.0,
                  max_yaw_rate_rad_s=math.radians(360.0)):
-        self.position_residual_limit_m = max(0.05, position_residual_limit_m)
-        self.yaw_residual_limit_rad = max(math.radians(1.0), yaw_residual_limit_rad)
         self.max_gap_s = max(0.05, max_gap_s)
         self.recovery_samples = max(1, recovery_samples)
         self.confirmation_samples = max(2, confirmation_samples)
@@ -65,8 +62,7 @@ class LocalPoseContinuity:
         x, y = self._rotate_xy(v[0], v[1], self.rotation)
         return x, y, v[2]
 
-    def _motion_reason(self, old, new, enforce_gap=True,
-                       trust_new_velocity=True):
+    def _motion_reason(self, old, new, enforce_gap=True):
         p0, yaw0, v0, rate0, t0, frame0 = old
         p1, yaw1, v1, rate1, t1, frame1 = new
         dt = t1-t0
@@ -77,20 +73,17 @@ class LocalPoseContinuity:
         if self._norm(tuple((v1[i]-v0[i])/dt for i in range(3))) > self.max_acceleration_mps2:
             return "acceleration_limit"
         if abs(rate1) > self.max_yaw_rate_rad_s: return "yaw_rate_limit"
+        # Derive pose-change limits from the operator's physical rate limits
+        # and the actual time between samples. This independently catches a
+        # pose jump even when the velocity/rate fields remain plausible.
         delta = tuple(p1[i]-p0[i] for i in range(3))
-        # Never let an untrusted incoming velocity influence the prediction
-        # used at the accepted/quarantine boundary. Averaging both velocities
-        # is only valid when checking consistency *within* a candidate epoch.
-        predicted_v = (tuple(0.5*(v1[i]+v0[i]) for i in range(3))
-                       if trust_new_velocity else v0)
-        if self._norm(tuple(delta[i]-predicted_v[i]*dt for i in range(3))) > self.position_residual_limit_m:
+        if self._norm(delta) / dt > self.max_speed_mps:
             return "position_jump"
-        predicted_dyaw = 0.5*(rate1+rate0)*dt
-        if abs(wrap_pi(wrap_pi(yaw1-yaw0)-predicted_dyaw)) > self.yaw_residual_limit_rad:
+        if abs(wrap_pi(yaw1-yaw0)) / dt > self.max_yaw_rate_rad_s:
             return "yaw_jump"
         return None
 
-    def _gate_detail(self, old, new, reason, trust_new_velocity=True):
+    def _gate_detail(self, old, new, reason):
         p0, yaw0, v0, rate0, t0, frame0 = old
         p1, yaw1, v1, rate1, t1, frame1 = new
         dt = t1-t0
@@ -110,16 +103,14 @@ class LocalPoseContinuity:
                     f"limit_deg_s={math.degrees(self.max_yaw_rate_rad_s):.3f}")
         if reason == "position_jump":
             delta = tuple(p1[i]-p0[i] for i in range(3))
-            predicted_v = (tuple(0.5*(v1[i]+v0[i]) for i in range(3))
-                           if trust_new_velocity else v0)
-            residual = self._norm(tuple(delta[i]-predicted_v[i]*dt for i in range(3)))
-            return (f"position_residual_m={residual:.3f} "
-                    f"limit_m={self.position_residual_limit_m:.3f} dt_s={dt:.3f}")
+            implied_speed = self._norm(delta) / dt
+            return (f"pose_implied_speed_m_s={implied_speed:.3f} "
+                    f"limit_m_s={self.max_speed_mps:.3f} dt_s={dt:.3f}")
         if reason == "yaw_jump":
-            predicted = 0.5*(rate1+rate0)*dt
-            residual = abs(wrap_pi(wrap_pi(yaw1-yaw0)-predicted))
-            return (f"yaw_residual_deg={math.degrees(residual):.3f} "
-                    f"limit_deg={math.degrees(self.yaw_residual_limit_rad):.3f}")
+            implied_rate = abs(wrap_pi(yaw1-yaw0)) / dt
+            return (f"pose_implied_yaw_rate_deg_s={math.degrees(implied_rate):.3f} "
+                    f"limit_deg_s={math.degrees(self.max_yaw_rate_rad_s):.3f} "
+                    f"dt_s={dt:.3f}")
         return "explicit_source_event=true"
 
     def _accepted_sample(self):
@@ -157,21 +148,15 @@ class LocalPoseContinuity:
                 return self._held(force_reanchor_reason, "quarantine_started",
                                   self.suspect_detail)
         elif not self.suspect_samples:
-            reason = self._motion_reason(
-                accepted, sample, trust_new_velocity=False
-            )
+            reason = self._motion_reason(accepted, sample)
             if reason is None: return self._accept(sample)
             self.suspect_reason, self.suspect_samples = reason, [sample]
-            self.suspect_detail = self._gate_detail(
-                accepted, sample, reason, trust_new_velocity=False
-            )
+            self.suspect_detail = self._gate_detail(accepted, sample, reason)
             return self._held(reason, "quarantine_started", self.suspect_detail)
         else:
             # Returning to the accepted trajectory means the prior point was
             # an isolated outlier; discard it without moving the origin.
-            if self._motion_reason(
-                accepted, sample, enforce_gap=False, trust_new_velocity=False
-            ) is None:
+            if self._motion_reason(accepted, sample, enforce_gap=False) is None:
                 old_reason, old_detail = self.suspect_reason, self.suspect_detail
                 self._clear_suspect()
                 return self._accept(sample, reason=old_reason,

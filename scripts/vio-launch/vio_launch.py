@@ -83,8 +83,6 @@ class Config:
     camera_pitch_deg: float = 0.0
     camera_yaw_deg: float = 0.0
     # Local-continuity safety gate. These defaults match the bridge defaults.
-    gate_position_residual_m: float = 0.75
-    gate_yaw_residual_deg: float = 20.0
     gate_max_gap_s: float = 1.0
     gate_recovery_samples: int = 10
     gate_confirmation_samples: int = 3
@@ -160,8 +158,6 @@ def save_config(cfg: Config) -> None:
         "camera_roll_deg": cfg.camera_roll_deg,
         "camera_pitch_deg": cfg.camera_pitch_deg,
         "camera_yaw_deg": cfg.camera_yaw_deg,
-        "gate_position_residual_m": cfg.gate_position_residual_m,
-        "gate_yaw_residual_deg": cfg.gate_yaw_residual_deg,
         "gate_max_gap_s": cfg.gate_max_gap_s,
         "gate_recovery_samples": cfg.gate_recovery_samples,
         "gate_confirmation_samples": cfg.gate_confirmation_samples,
@@ -241,8 +237,6 @@ def apply_dict(cfg: Config, data: dict) -> Config:
         "camera_roll_deg",
         "camera_pitch_deg",
         "camera_yaw_deg",
-        "gate_position_residual_m",
-        "gate_yaw_residual_deg",
         "gate_max_gap_s",
         "gate_recovery_samples",
         "gate_confirmation_samples",
@@ -1226,8 +1220,6 @@ def cmd_gps(cfg: Config) -> None:
         "mag_declination_deg": cfg.mag_declination_deg,
         "child_to_body_yaw_deg": cfg.child_to_body_yaw_deg,
         "expected_child_frame": "drone_link",
-        "continuity_position_residual_m": cfg.gate_position_residual_m,
-        "continuity_yaw_residual_deg": cfg.gate_yaw_residual_deg,
         "continuity_max_gap_s": cfg.gate_max_gap_s,
         "continuity_recovery_samples": cfg.gate_recovery_samples,
         "continuity_confirmation_samples": cfg.gate_confirmation_samples,
@@ -1632,56 +1624,63 @@ def configure_camera_extrinsic(cfg: Config) -> Config:
 def configure_pose_gate(cfg: Config) -> Config:
     _clear()
     print("Configure VIO continuity / pose-jump gate\n")
-    print("A sample is quarantined when any enabled physical or consistency limit is exceeded.")
+    print("A sample is quarantined when a physical or timing limit is exceeded.")
     print("Quarantined samples do not update the accepted local trajectory.\n")
-    print("Definitions:")
-    print("  Position residual = measured displacement minus displacement predicted")
-    print("                      from the last trusted velocity.")
-    print("  Yaw residual      = measured heading change minus change predicted")
-    print("                      from yaw rate.")
-    print("  Pose epoch        = one continuous cuVSLAM coordinate segment; a confirmed")
-    print("                      reset/jump starts a new epoch aligned to the old one.")
-    print("  Confirmation      = consistent samples required to accept a new epoch.")
-    print("  Recovery          = additional stable samples required before GPS resumes.\n")
-    prompts = (
-        ("Maximum speed m/s", cfg.gate_max_speed_m_s, float, 0.0),
-        ("Maximum acceleration m/s^2", cfg.gate_max_acceleration_m_s2, float, 0.0),
-        ("Position prediction residual m", cfg.gate_position_residual_m, float, 0.0),
-        ("Maximum yaw rate deg/s", cfg.gate_max_yaw_rate_deg_s, float, 0.0),
-        ("Yaw prediction residual deg", cfg.gate_yaw_residual_deg, float, 0.0),
-        ("Maximum tracking gap s", cfg.gate_max_gap_s, float, 0.0),
-        ("Samples to confirm a new pose epoch", cfg.gate_confirmation_samples, int, 1),
-        ("Stable samples before output resumes", cfg.gate_recovery_samples, int, 0),
+    groups = (
+        ("Physical rate limits", (
+            ("speed", "Maximum speed m/s", cfg.gate_max_speed_m_s, float, 0.0),
+            ("acceleration", "Maximum acceleration m/s^2",
+             cfg.gate_max_acceleration_m_s2, float, 0.0),
+            ("yaw_rate", "Maximum yaw rate deg/s",
+             cfg.gate_max_yaw_rate_deg_s, float, 0.0),
+        )),
+        ("Timing", (
+            ("gap", "Maximum tracking gap s", cfg.gate_max_gap_s, float, 0.0),
+        )),
+        ("Coordinate-reset recovery", (
+            ("confirmation", "Samples to confirm a coordinate reset",
+             cfg.gate_confirmation_samples, int, 1),
+            ("recovery", "Stable samples before output resumes",
+             cfg.gate_recovery_samples, int, 0),
+        )),
     )
-    values: list[float | int] = []
+    values: dict[str, float | int] = {}
     try:
-        for label, current, kind, minimum in prompts:
-            raw = prompt_line(label, str(current))
-            if raw is None:
-                return cfg
-            value = kind(raw)
-            if isinstance(value, float) and not math.isfinite(value):
-                raise ValueError(f"{label} must be finite")
-            if value <= minimum:
-                raise ValueError(f"{label} must be greater than {minimum:g}")
-            values.append(value)
+        for group_index, (heading, prompts) in enumerate(groups):
+            if group_index:
+                print("------------------------------------------------------------")
+            print(f"{heading}\n")
+            for key, label, current, kind, minimum in prompts:
+                raw = prompt_line(label, str(current))
+                if raw is None:
+                    return cfg
+                value = kind(raw)
+                if isinstance(value, float) and not math.isfinite(value):
+                    raise ValueError(f"{label} must be finite")
+                if value <= minimum:
+                    raise ValueError(f"{label} must be greater than {minimum:g}")
+                values[key] = value
     except ValueError as exc:
         print(f"Invalid gate configuration: {exc}")
         pause()
         return cfg
     cfg = replace(
         cfg,
-        gate_max_speed_m_s=float(values[0]),
-        gate_max_acceleration_m_s2=float(values[1]),
-        gate_position_residual_m=float(values[2]),
-        gate_max_yaw_rate_deg_s=float(values[3]),
-        gate_yaw_residual_deg=float(values[4]),
-        gate_max_gap_s=float(values[5]),
-        gate_confirmation_samples=int(values[6]),
-        gate_recovery_samples=int(values[7]),
+        gate_max_speed_m_s=float(values["speed"]),
+        gate_max_acceleration_m_s2=float(values["acceleration"]),
+        gate_max_yaw_rate_deg_s=float(values["yaw_rate"]),
+        gate_max_gap_s=float(values["gap"]),
+        gate_confirmation_samples=int(values["confirmation"]),
+        gate_recovery_samples=int(values["recovery"]),
     )
     save_config(cfg)
-    print("Saved pose-jump gate limits. They take effect the next time Path A starts.")
+    print("\nSaved pose-jump gate limits.")
+    print(
+        "Note: speed and yaw-rate limits are automatically converted into "
+        "allowed position and heading changes using the measured time between "
+        "arriving odometry messages."
+    )
+    print("The new limits take effect the next time Path A starts.")
     pause()
     return cfg
 
@@ -1786,7 +1785,6 @@ def interactive_main(cfg: Config) -> int:
                     "pose-gate",
                     f"speed={cfg.gate_max_speed_m_s:g} m/s; "
                     f"accel={cfg.gate_max_acceleration_m_s2:g} m/s²; "
-                    f"position residual={cfg.gate_position_residual_m:g} m; "
                     f"yaw rate={cfg.gate_max_yaw_rate_deg_s:g}°/s",
                 ),
                 MenuItem(

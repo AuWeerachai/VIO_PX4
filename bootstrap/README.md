@@ -156,18 +156,19 @@ continuous_pose_after_jump = continuous_pose_before_jump
 ```
 
 GPS output pauses for a short stable-sample recovery window. Subsequent motion
-is accumulated relative to the new cuVSLAM epoch. The bridge does not read
+is accumulated relative to the new cuVSLAM coordinate segment. The bridge does not read
 PX4's fused global position for this, avoiding feedback/self-reference. Default
-fallback gates are configurable with `continuity_position_residual_m`,
-`continuity_yaw_residual_deg`, `continuity_max_gap_s`,
+fallback gates are configurable with `continuity_max_gap_s`,
 `continuity_confirmation_samples`, `continuity_recovery_samples`,
 `continuity_max_speed_m_s`, `continuity_max_acceleration_m_s2`, and
-`continuity_max_yaw_rate_deg_s`. The explicit cuVSLAM tracking/reset signal
+`continuity_max_yaw_rate_deg_s`. Allowed position and heading change are
+derived from those rate limits and the measured interval between messages, so
+the behavior remains consistent when odometry frequency changes. The explicit cuVSLAM tracking/reset signal
 should be connected as the primary detector once verified on the Jetson.
 
 Continuity transitions are written to the `gps-bridge` log with the prefix
 `VIO_CONTINUITY`. Each gate event includes its reason, measured value, configured
-limit, epoch, and outcome (`quarantine_started`, `isolated_outlier_rejected`,
+limit, internal segment number, and outcome (`quarantine_started`, `isolated_outlier_rejected`,
 `candidate_window_restarted`, or `reset_confirmed`). This is transition logging,
 not per-frame logging, so it remains useful without rapidly growing the log.
 
