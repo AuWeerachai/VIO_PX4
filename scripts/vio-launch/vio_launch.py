@@ -75,8 +75,22 @@ class Config:
     mag_declination_source: str = "table"
     mag_declination_deg: float = 0.0
     child_to_body_yaw_deg: float = 0.0
-    # ROS FLU rotation about body +Y: positive points the camera downward.
-    camera_tilt_deg: float = 0.0
+    # drone_link -> camera_link extrinsic in ROS FLU coordinates.
+    camera_x_m: float = 0.0
+    camera_y_m: float = 0.0
+    camera_z_m: float = 0.0
+    camera_roll_deg: float = 0.0
+    camera_pitch_deg: float = 0.0
+    camera_yaw_deg: float = 0.0
+    # Local-continuity safety gate. These defaults match the bridge defaults.
+    gate_position_residual_m: float = 0.75
+    gate_yaw_residual_deg: float = 20.0
+    gate_max_gap_s: float = 1.0
+    gate_recovery_samples: int = 10
+    gate_confirmation_samples: int = 3
+    gate_max_speed_m_s: float = 10.0
+    gate_max_acceleration_m_s2: float = 5.0
+    gate_max_yaw_rate_deg_s: float = 200.0
     rviz_enabled: bool = False
     state_dir: Path = field(default_factory=lambda: Path.home() / ".local/state/vio-launch")
 
@@ -140,7 +154,20 @@ def save_config(cfg: Config) -> None:
         "mag_declination_source": cfg.mag_declination_source,
         "mag_declination_deg": cfg.mag_declination_deg,
         "child_to_body_yaw_deg": cfg.child_to_body_yaw_deg,
-        "camera_tilt_deg": cfg.camera_tilt_deg,
+        "camera_x_m": cfg.camera_x_m,
+        "camera_y_m": cfg.camera_y_m,
+        "camera_z_m": cfg.camera_z_m,
+        "camera_roll_deg": cfg.camera_roll_deg,
+        "camera_pitch_deg": cfg.camera_pitch_deg,
+        "camera_yaw_deg": cfg.camera_yaw_deg,
+        "gate_position_residual_m": cfg.gate_position_residual_m,
+        "gate_yaw_residual_deg": cfg.gate_yaw_residual_deg,
+        "gate_max_gap_s": cfg.gate_max_gap_s,
+        "gate_recovery_samples": cfg.gate_recovery_samples,
+        "gate_confirmation_samples": cfg.gate_confirmation_samples,
+        "gate_max_speed_m_s": cfg.gate_max_speed_m_s,
+        "gate_max_acceleration_m_s2": cfg.gate_max_acceleration_m_s2,
+        "gate_max_yaw_rate_deg_s": cfg.gate_max_yaw_rate_deg_s,
         "rviz_enabled": cfg.rviz_enabled,
         "vio_px4_dir": str(cfg.vio_px4_dir),
         "ros_setup": str(cfg.ros_setup),
@@ -208,7 +235,20 @@ def apply_dict(cfg: Config, data: dict) -> Config:
         "mag_declination_source",
         "mag_declination_deg",
         "child_to_body_yaw_deg",
-        "camera_tilt_deg",
+        "camera_x_m",
+        "camera_y_m",
+        "camera_z_m",
+        "camera_roll_deg",
+        "camera_pitch_deg",
+        "camera_yaw_deg",
+        "gate_position_residual_m",
+        "gate_yaw_residual_deg",
+        "gate_max_gap_s",
+        "gate_recovery_samples",
+        "gate_confirmation_samples",
+        "gate_max_speed_m_s",
+        "gate_max_acceleration_m_s2",
+        "gate_max_yaw_rate_deg_s",
         "rviz_enabled",
     ):
         if key in data and data[key] is not None:
@@ -221,8 +261,14 @@ def apply_dict(cfg: Config, data: dict) -> Config:
 
 def load_config(ns: argparse.Namespace | None = None) -> Config:
     cfg = default_config()
-    cfg = apply_dict(cfg, load_saved_overrides())
     saved = load_saved_overrides()
+    cfg = apply_dict(cfg, saved)
+    # Backward compatibility with the former pitch-only menu setting.
+    if "camera_pitch_deg" not in saved and "camera_tilt_deg" in saved:
+        try:
+            cfg = replace(cfg, camera_pitch_deg=float(saved["camera_tilt_deg"]))
+        except (TypeError, ValueError):
+            pass
     if "mavlink_url" not in saved:
         cfg = replace(cfg, mavlink_url="/dev/ttyUSB0:921600")
     # Migrate configurations created before camera-to-body odometry became a
@@ -1079,7 +1125,12 @@ def cmd_vio(cfg: Config) -> None:
         "source ${ISAAC_ROS_WS}/install/setup.bash; fi && "
         "echo \"=== Using: $(ros2 pkg prefix isaac_ros_visual_slam) ===\" && "
         "cd ${ISAAC_ROS_WS}/src/isaac_ros_common && "
-        f"CAMERA_PITCH_RAD={math.radians(cfg.camera_tilt_deg):.17g} "
+        f"CAMERA_X_M={cfg.camera_x_m:.17g} "
+        f"CAMERA_Y_M={cfg.camera_y_m:.17g} "
+        f"CAMERA_Z_M={cfg.camera_z_m:.17g} "
+        f"CAMERA_ROLL_RAD={math.radians(cfg.camera_roll_deg):.17g} "
+        f"CAMERA_PITCH_RAD={math.radians(cfg.camera_pitch_deg):.17g} "
+        f"CAMERA_YAW_RAD={math.radians(cfg.camera_yaw_deg):.17g} "
         "./scripts/start_vio.sh",
     )
     print("- Terminal 1 is rebuilding changed VSLAM files, then starting cuVSLAM...")
@@ -1175,6 +1226,14 @@ def cmd_gps(cfg: Config) -> None:
         "mag_declination_deg": cfg.mag_declination_deg,
         "child_to_body_yaw_deg": cfg.child_to_body_yaw_deg,
         "expected_child_frame": "drone_link",
+        "continuity_position_residual_m": cfg.gate_position_residual_m,
+        "continuity_yaw_residual_deg": cfg.gate_yaw_residual_deg,
+        "continuity_max_gap_s": cfg.gate_max_gap_s,
+        "continuity_recovery_samples": cfg.gate_recovery_samples,
+        "continuity_confirmation_samples": cfg.gate_confirmation_samples,
+        "continuity_max_speed_m_s": cfg.gate_max_speed_m_s,
+        "continuity_max_acceleration_m_s2": cfg.gate_max_acceleration_m_s2,
+        "continuity_max_yaw_rate_deg_s": cfg.gate_max_yaw_rate_deg_s,
         "status_file": str(cfg.state_dir / "navigation-status.json"),
     }
     param_args = " ".join(
@@ -1520,30 +1579,100 @@ def configure_heading(cfg: Config) -> Config:
     return cfg
 
 
-def configure_camera_tilt(cfg: Config) -> Config:
+def configure_camera_extrinsic(cfg: Config) -> Config:
     _clear()
-    print("Configure camera tilt from the vehicle horizon\n")
-    print("ROS FLU sign convention:")
-    print("  + angle = camera points downward")
-    print("  - angle = camera points upward")
-    print("    0 deg = camera points along the vehicle horizon\n")
-    value = prompt_line("Camera tilt deg", str(cfg.camera_tilt_deg))
-    if value is None:
-        return cfg
+    print("Configure drone_link → camera_link extrinsic\n")
+    print("ROS FLU convention (camera position measured from the vehicle origin):")
+    print("  +X forward / -X backward")
+    print("  +Y left    / -Y right")
+    print("  +Z up      / -Z down")
+    print("Positive rotations follow the right-hand rule:")
+    print("  +roll about +X: right side down")
+    print("  +pitch about +Y: camera points down")
+    print("  +yaw about +Z: camera points left\n")
+    prompts = (
+        ("X translation m", cfg.camera_x_m),
+        ("Y translation m", cfg.camera_y_m),
+        ("Z translation m", cfg.camera_z_m),
+        ("Roll deg", cfg.camera_roll_deg),
+        ("Pitch deg", cfg.camera_pitch_deg),
+        ("Yaw deg", cfg.camera_yaw_deg),
+    )
+    entered = []
     try:
-        tilt = float(value)
-        if not math.isfinite(tilt):
-            raise ValueError("angle must be finite")
-        if not -90.0 <= tilt <= 90.0:
-            raise ValueError("angle must be between -90 and +90 degrees")
+        for label, current in prompts:
+            value = prompt_line(label, str(current))
+            if value is None:
+                return cfg
+            number = float(value)
+            if not math.isfinite(number):
+                raise ValueError(f"{label} must be finite")
+            entered.append(number)
     except ValueError as exc:
-        print(f"Invalid camera tilt: {exc}")
+        print(f"Invalid camera extrinsic: {exc}")
         pause()
         return cfg
-    cfg = replace(cfg, camera_tilt_deg=tilt)
+    cfg = replace(
+        cfg,
+        camera_x_m=entered[0], camera_y_m=entered[1], camera_z_m=entered[2],
+        camera_roll_deg=entered[3], camera_pitch_deg=entered[4],
+        camera_yaw_deg=entered[5],
+    )
     save_config(cfg)
-    print(f"Saved camera tilt: {tilt:+g}° ({math.radians(tilt):+.6f} rad).")
+    print(
+        "Saved camera extrinsic: "
+        f"xyz=({entered[0]:+g}, {entered[1]:+g}, {entered[2]:+g}) m, "
+        f"rpy=({entered[3]:+g}, {entered[4]:+g}, {entered[5]:+g})°."
+    )
     print("The new extrinsic takes effect the next time Path A or Path B starts cuVSLAM.")
+    pause()
+    return cfg
+
+
+def configure_pose_gate(cfg: Config) -> Config:
+    _clear()
+    print("Configure VIO continuity / pose-jump gate\n")
+    print("A sample is quarantined when any enabled physical or consistency limit is exceeded.")
+    print("Quarantined samples do not update the accepted local trajectory.\n")
+    prompts = (
+        ("Maximum speed m/s", cfg.gate_max_speed_m_s, float, 0.0),
+        ("Maximum acceleration m/s^2", cfg.gate_max_acceleration_m_s2, float, 0.0),
+        ("Position prediction residual m", cfg.gate_position_residual_m, float, 0.0),
+        ("Maximum yaw rate deg/s", cfg.gate_max_yaw_rate_deg_s, float, 0.0),
+        ("Yaw prediction residual deg", cfg.gate_yaw_residual_deg, float, 0.0),
+        ("Maximum tracking gap s", cfg.gate_max_gap_s, float, 0.0),
+        ("Samples to confirm a new pose epoch", cfg.gate_confirmation_samples, int, 1),
+        ("Stable samples before output resumes", cfg.gate_recovery_samples, int, 0),
+    )
+    values: list[float | int] = []
+    try:
+        for label, current, kind, minimum in prompts:
+            raw = prompt_line(label, str(current))
+            if raw is None:
+                return cfg
+            value = kind(raw)
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError(f"{label} must be finite")
+            if value <= minimum:
+                raise ValueError(f"{label} must be greater than {minimum:g}")
+            values.append(value)
+    except ValueError as exc:
+        print(f"Invalid gate configuration: {exc}")
+        pause()
+        return cfg
+    cfg = replace(
+        cfg,
+        gate_max_speed_m_s=float(values[0]),
+        gate_max_acceleration_m_s2=float(values[1]),
+        gate_position_residual_m=float(values[2]),
+        gate_max_yaw_rate_deg_s=float(values[3]),
+        gate_yaw_residual_deg=float(values[4]),
+        gate_max_gap_s=float(values[5]),
+        gate_confirmation_samples=int(values[6]),
+        gate_recovery_samples=int(values[7]),
+    )
+    save_config(cfg)
+    print("Saved pose-jump gate limits. They take effect the next time Path A starts.")
     pause()
     return cfg
 
@@ -1637,9 +1766,18 @@ def interactive_main(cfg: Config) -> int:
                     f"child→body={cfg.child_to_body_yaw_deg}°",
                 ),
                 MenuItem(
-                    "Camera tilt from horizon (+down / -up)",
-                    "camera-tilt",
-                    f"{cfg.camera_tilt_deg:+g}°",
+                    "Camera extrinsic (ROS FLU XYZ/RPY)",
+                    "camera-extrinsic",
+                    f"xyz=({cfg.camera_x_m:+g},{cfg.camera_y_m:+g},{cfg.camera_z_m:+g}) m; "
+                    f"rpy=({cfg.camera_roll_deg:+g},{cfg.camera_pitch_deg:+g},"
+                    f"{cfg.camera_yaw_deg:+g})°",
+                ),
+                MenuItem(
+                    "Pose-jump gate limits",
+                    "pose-gate",
+                    f"speed={cfg.gate_max_speed_m_s:g} m/s; "
+                    f"accel={cfg.gate_max_acceleration_m_s2:g} m/s²; "
+                    f"residual={cfg.gate_position_residual_m:g} m",
                 ),
                 MenuItem(
                     "RViz auto-launch (toggle ON/OFF)",
@@ -1689,8 +1827,10 @@ def interactive_main(cfg: Config) -> int:
                 cfg = configure_home(cfg)
             elif choice == "heading":
                 cfg = configure_heading(cfg)
-            elif choice == "camera-tilt":
-                cfg = configure_camera_tilt(cfg)
+            elif choice == "camera-extrinsic":
+                cfg = configure_camera_extrinsic(cfg)
+            elif choice == "pose-gate":
+                cfg = configure_pose_gate(cfg)
             elif choice == "rviz-toggle":
                 cfg = toggle_rviz(cfg)
             elif choice == "nav-status":

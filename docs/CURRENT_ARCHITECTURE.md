@@ -18,8 +18,10 @@ The physical camera mount is represented once by a static ROS FLU transform:
 drone_link -> camera_link
 ```
 
-The launcher supplies camera pitch through `CAMERA_PITCH_RAD`. There is no
-downstream 30-degree correction of completed odometry.
+The launcher supplies the full translation and rotation through
+`CAMERA_{X,Y,Z}_M` and `CAMERA_{ROLL,PITCH,YAW}_RAD`. There is no downstream
+correction of completed odometry. Translation uses ROS FLU axes (+X forward,
++Y left, +Z up), and rotation follows the right-hand rule.
 
 ## Path A: horizontal VIO as GPS
 
@@ -40,6 +42,8 @@ The protocol-required altitude is fixed and velocity is zero. PX4 uses
 When VIO is stale or quarantined, the bridge stops sending HIL_GPS. PX4 handles
 source timeout, physical-GNSS selection, dead reckoning, and configured
 failsafes. Short relocalizations are absorbed locally without a global jump.
+The operator can change all continuity thresholds from `vio-launch`; saved
+values are passed explicitly to the bridge at every Path A launch.
 
 ## Path B: external vision through MAVROS
 

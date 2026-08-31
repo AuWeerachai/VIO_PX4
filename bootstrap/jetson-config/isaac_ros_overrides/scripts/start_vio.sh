@@ -9,11 +9,13 @@ cd "${ISAAC_ROS_WS}/src/isaac_ros_common"
 CAMERA_X_M="${CAMERA_X_M:-0.0}"
 CAMERA_Y_M="${CAMERA_Y_M:-0.0}"
 CAMERA_Z_M="${CAMERA_Z_M:-0.0}"
+CAMERA_ROLL_RAD="${CAMERA_ROLL_RAD:-0.0}"
 CAMERA_PITCH_RAD="${CAMERA_PITCH_RAD:-0.0}"
+CAMERA_YAW_RAD="${CAMERA_YAW_RAD:-0.0}"
 
 ros2 run tf2_ros static_transform_publisher \
   --x "$CAMERA_X_M" --y "$CAMERA_Y_M" --z "$CAMERA_Z_M" \
-  --yaw 0 --pitch "$CAMERA_PITCH_RAD" --roll 0 \
+  --yaw "$CAMERA_YAW_RAD" --pitch "$CAMERA_PITCH_RAD" --roll "$CAMERA_ROLL_RAD" \
   --frame-id drone_link --child-frame-id camera_link &
 extrinsic_pid=$!
 cleanup() { kill "$extrinsic_pid" 2>/dev/null || true; }

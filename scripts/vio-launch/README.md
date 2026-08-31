@@ -18,7 +18,8 @@ cd ~/workspaces/VIO_PX4/scripts/vio-launch
 | **FC link** | Pick direct UART/USB serial, UDP networking, or keep the current setting |
 | **Home latitude/longitude** | Horizontal spoof/origin position |
 | **Heading alignment** | Configure compass/manual true-heading alignment |
-| **Camera tilt** | Configure the `drone_link → camera_link` pitch extrinsic |
+| **Camera extrinsic** | Configure the full ROS FLU `drone_link → camera_link` XYZ/RPY transform |
+| **Pose-jump gate limits** | Configure speed, acceleration, residual, timing, and recovery limits |
 | **RViz auto-launch** | Persistently toggle automatic RViz startup; default OFF |
 | **Leave CLI** | Close the menu and keep processes running |
 | **Stop all processes** | Stop bridges, Isaac sessions, and the container |
@@ -29,6 +30,12 @@ the installed MAVROS workspace on that serial link. The paths are mutually
 exclusive; Micro XRCE-DDS is not used.
 
 Settings persist in `~/.config/vio-launch/config.json`.
+
+Camera translation uses ROS FLU axes: +X forward, +Y left, and +Z up.
+Positive roll, pitch, and yaw follow the right-hand rule. In particular,
+positive pitch points a forward-facing camera downward. Gate changes apply the
+next time Path A starts; camera-extrinsic changes apply the next time either
+path starts cuVSLAM.
 
 ## Selecting an option
 
