@@ -1201,8 +1201,8 @@ def cmd_gps(cfg: Config) -> None:
         # Keep the stationary bootstrap active for the full configured duration.
         # PX4/QGroundControl receives STATUSTEXT when spoof starts and when VIO takes over.
         "spoof_until_vio": "false",
-        "boot_accuracy_m": 0.2,
-        "cruise_eph_m": 0.2,
+        "boot_accuracy_m": 0.1,
+        "cruise_eph_m": 0.1,
         # Maximum numeric MAVLink value; 255 is reserved for "unknown".
         "satellites": 254,
         "horizontal_only_output": "true",

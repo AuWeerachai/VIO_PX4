@@ -84,9 +84,9 @@ class VioPx4GpsBridge(Node):
         self.declare_parameter("spoof_epv_m", 1.0)
 
         # Live / cruise accuracy (BasaltGpsBridge boot -> cruise analogue)
-        self.declare_parameter("boot_accuracy_m", 0.2)
+        self.declare_parameter("boot_accuracy_m", 0.1)
         self.declare_parameter("boot_duration_s", 60.0)
-        self.declare_parameter("cruise_eph_m", 0.2)
+        self.declare_parameter("cruise_eph_m", 0.1)
         self.declare_parameter("cruise_epv_m", 1.5)
         self.declare_parameter("speed_accuracy_m_s", 0.25)
         # HIL_GPS requires altitude and velocity fields even when PX4 is

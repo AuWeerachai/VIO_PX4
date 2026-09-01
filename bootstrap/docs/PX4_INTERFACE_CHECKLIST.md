@@ -37,7 +37,7 @@ firmware because message handling and estimator requirements can change.
 - [ ] Send at 10 Hz without long gaps. PX4 timestamps receipt locally.
 - [ ] `fix_type=3`, synthetic satellites=254 (255 means unknown), speed accuracy
   below `EKF2_REQ_SACC`, and EPH/EPV below their configured gates.
-- [ ] Set `EKF2_GPS_P_NOISE=0.2 m` to match the bridge's healthy horizontal
+- [ ] Set `EKF2_GPS_P_NOISE=0.1 m` to match the bridge's healthy horizontal
   EPH. Do not claim RTK fix types to influence source selection.
 - [ ] Hold valid, stationary spoof data for at least `EKF2_REQ_GPS_H` (10 s by
   default). The configured 15 s window provides only 5 s margin.
