@@ -83,9 +83,16 @@ firmware because message handling and estimator requirements can change.
   without incrementing the continuity epoch.
 - [ ] Require `continuity_confirmation_samples` internally consistent poses
   before declaring a new cuVSLAM coordinate epoch.
-- [ ] Verify the reconstructed first pose of a confirmed new epoch equals the
-  last accepted pose of the old epoch. Motion within the confirmation window
-  should be retained when output resumes.
+- [ ] Verify candidate and recovery VIO samples cannot modify the last trusted
+  output anchor.
+- [ ] While HIL_GPS is silent, integrate only PX4 horizontal velocity and yaw
+  delta; never copy PX4 absolute/local/global position into the GPS output.
+- [ ] Verify a stationary disturbance resumes exactly at the trusted anchor.
+- [ ] Verify real motion during quarantine resumes at the trusted anchor plus
+  the guarded PX4 inertial displacement.
+- [ ] Verify stale, non-finite, timestamp-regressed, excessive-gap, over-speed,
+  over-acceleration, over-yaw-rate, and over-duration motion data latches
+  recovery unsafe and keeps HIL_GPS stopped.
 - [ ] After re-anchoring, keep GPS stopped for
   `continuity_recovery_samples` additional valid poses.
 - [ ] Validate continuity thresholds against the vehicle's maximum real speed

@@ -38,6 +38,7 @@ class LocalPoseContinuity:
         self.last_timestamp = self.last_frame_key = None
         self.last_output_position = self.last_output_yaw = None
         self.stable_samples = self.epoch = 0
+        self.recovery_anchor_position = self.recovery_anchor_yaw = None
         self._clear_suspect()
 
     def _clear_suspect(self):
@@ -119,16 +120,58 @@ class LocalPoseContinuity:
                 self.last_yaw_rate, self.last_timestamp, self.last_frame_key)
 
     def _held(self, reason, event=None, detail=None):
-        return ContinuityResult(self.last_output_position, self.last_output_yaw,
+        position = self.recovery_anchor_position or self.last_output_position
+        yaw = (self.recovery_anchor_yaw if self.recovery_anchor_yaw is not None
+               else self.last_output_yaw)
+        return ContinuityResult(position, yaw,
                                 (0.0, 0.0, 0.0), True, False, reason, self.epoch,
                                 event, detail)
 
-    def _accept(self, sample, reanchored=False, reason=None, event=None,
-                detail=None):
+    def _start_recovery(self):
+        if self.recovery_anchor_position is None:
+            self.recovery_anchor_position = self.last_output_position
+            self.recovery_anchor_yaw = self.last_output_yaw
+
+    def _set_raw_state(self, sample):
         p, yaw, v, rate, timestamp, frame = sample
-        out_p, out_yaw, out_v = self._transform_position(p), wrap_pi(yaw+self.rotation), self._transform_velocity(v)
         self.last_raw_position, self.last_raw_yaw, self.last_raw_velocity = p, yaw, v
         self.last_yaw_rate, self.last_timestamp, self.last_frame_key = rate, timestamp, frame
+
+    def _finish_recovery(self, sample, displacement, yaw_delta):
+        """Align the recovered raw epoch to the independently propagated target."""
+        p, yaw, v, rate, timestamp, frame = sample
+        target = tuple(self.recovery_anchor_position[i] + displacement[i]
+                       for i in range(3))
+        target_yaw = wrap_pi(self.recovery_anchor_yaw + yaw_delta)
+        self.rotation = wrap_pi(target_yaw - yaw)
+        rx, ry = self._rotate_xy(p[0], p[1], self.rotation)
+        self.translation = (target[0] - rx, target[1] - ry, target[2] - p[2])
+        self._set_raw_state(sample)
+        self.last_output_position, self.last_output_yaw = target, target_yaw
+        self.recovery_anchor_position = self.recovery_anchor_yaw = None
+        out_v = self._transform_velocity(v)
+        return ContinuityResult(target, target_yaw, out_v, False, True, None,
+                                self.epoch, "recovery_completed",
+                                "anchor=independent_px4_inertial_delta")
+
+    def _accept(self, sample, reanchored=False, reason=None, event=None,
+                detail=None, recovery_displacement=None, recovery_yaw_delta=0.0):
+        p, yaw, v, rate, timestamp, frame = sample
+        out_p, out_yaw, out_v = self._transform_position(p), wrap_pi(yaw+self.rotation), self._transform_velocity(v)
+        self._set_raw_state(sample)
+        if self.recovery_anchor_position is not None:
+            if not reanchored:
+                self.stable_samples += 1
+            if (self.stable_samples >= self.recovery_samples
+                    and recovery_displacement is not None):
+                return self._finish_recovery(
+                    sample, recovery_displacement, recovery_yaw_delta
+                )
+            return ContinuityResult(
+                self.recovery_anchor_position, self.recovery_anchor_yaw,
+                (0.0, 0.0, 0.0), True, reanchored, reason, self.epoch,
+                event, detail,
+            )
         self.last_output_position, self.last_output_yaw = out_p, out_yaw
         if self.epoch and not reanchored: self.stable_samples += 1
         recovering = bool(self.epoch and self.stable_samples < self.recovery_samples)
@@ -136,12 +179,14 @@ class LocalPoseContinuity:
                                 reason, self.epoch, event, detail)
 
     def update(self, position, yaw, velocity, yaw_rate, timestamp, frame_key,
-               force_reanchor_reason=None):
+               force_reanchor_reason=None, recovery_displacement=None,
+               recovery_yaw_delta=0.0):
         sample = (position, yaw, velocity, yaw_rate, timestamp, frame_key)
         accepted = self._accepted_sample()
         if accepted is None: return self._accept(sample)
 
         if force_reanchor_reason:
+            self._start_recovery()
             self.suspect_reason, self.suspect_samples = force_reanchor_reason, [sample]
             self.suspect_detail = "explicit_source_event=true"
             if self.confirmation_samples > 1:
@@ -149,7 +194,12 @@ class LocalPoseContinuity:
                                   self.suspect_detail)
         elif not self.suspect_samples:
             reason = self._motion_reason(accepted, sample)
-            if reason is None: return self._accept(sample)
+            if reason is None:
+                return self._accept(
+                    sample, recovery_displacement=recovery_displacement,
+                    recovery_yaw_delta=recovery_yaw_delta,
+                )
+            self._start_recovery()
             self.suspect_reason, self.suspect_samples = reason, [sample]
             self.suspect_detail = self._gate_detail(accepted, sample, reason)
             return self._held(reason, "quarantine_started", self.suspect_detail)
@@ -159,6 +209,7 @@ class LocalPoseContinuity:
             if self._motion_reason(accepted, sample, enforce_gap=False) is None:
                 old_reason, old_detail = self.suspect_reason, self.suspect_detail
                 self._clear_suspect()
+                self.recovery_anchor_position = self.recovery_anchor_yaw = None
                 return self._accept(sample, reason=old_reason,
                                     event="isolated_outlier_rejected",
                                     detail=old_detail)
@@ -177,16 +228,20 @@ class LocalPoseContinuity:
         if len(self.suspect_samples) < self.confirmation_samples:
             return self._held(self.suspect_reason or "suspect")
 
-        # Anchor the first sample of the confirmed new epoch to the last good
-        # output. Motion accumulated during confirmation is then retained.
+        # Establish a provisional transform for consistency checks only. The
+        # public output remains frozen until an independent recovery
+        # displacement is supplied and applied by _finish_recovery().
         anchor_p, anchor_yaw = self.suspect_samples[0][0:2]
-        self.rotation = wrap_pi(self.last_output_yaw-anchor_yaw)
+        self.rotation = wrap_pi(self.recovery_anchor_yaw-anchor_yaw)
         rx, ry = self._rotate_xy(anchor_p[0], anchor_p[1], self.rotation)
-        self.translation = (self.last_output_position[0]-rx,
-                            self.last_output_position[1]-ry,
-                            self.last_output_position[2]-anchor_p[2])
+        self.translation = (self.recovery_anchor_position[0]-rx,
+                            self.recovery_anchor_position[1]-ry,
+                            self.recovery_anchor_position[2]-anchor_p[2])
         reason, detail = self.suspect_reason, self.suspect_detail
         self._clear_suspect()
         self.epoch += 1
         self.stable_samples = 0
-        return self._accept(sample, True, reason, "reset_confirmed", detail)
+        return self._accept(
+            sample, True, reason, "reset_confirmed", detail,
+            recovery_displacement, recovery_yaw_delta,
+        )

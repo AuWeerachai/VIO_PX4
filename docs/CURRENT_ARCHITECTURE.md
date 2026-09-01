@@ -46,10 +46,14 @@ The operator can change all continuity thresholds from `vio-launch`; saved
 values are passed explicitly to the bridge at every Path A launch.
 The bridge converts speed and yaw-rate limits into allowed pose changes using
 the measured timestamp interval between each pair of odometry messages. A
-confirmed coordinate reset increments the internal segment counter, aligns the
-new raw segment with the last accepted pose, and requires the configured number
-of stable recovery samples before GPS output resumes. The default maximum
-yaw-rate limit is 360 degrees/second.
+confirmed coordinate reset increments the internal segment counter. While
+HIL_GPS is silent, the bridge integrates guarded PX4 horizontal velocity and
+yaw change for at most two seconds. The recovered raw VIO segment is aligned to
+the last trusted pose plus only that independent short-term displacement. VIO
+candidate/recovery samples never move the trusted anchor. Stale, discontinuous,
+non-finite, over-speed, over-acceleration, over-yaw-rate, or over-duration PX4
+motion data keeps HIL_GPS stopped. All numeric limits are configured in
+`vio-launch`.
 
 ## Path B: external vision through MAVROS
 

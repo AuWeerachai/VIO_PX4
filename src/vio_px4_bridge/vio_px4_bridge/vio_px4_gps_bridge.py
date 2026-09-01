@@ -136,6 +136,9 @@ class VioPx4GpsBridge(Node):
         self.declare_parameter("continuity_max_speed_m_s", 10.0)
         self.declare_parameter("continuity_max_acceleration_m_s2", 5.0)
         self.declare_parameter("continuity_max_yaw_rate_deg_s", 360.0)
+        self.declare_parameter("inertial_max_duration_s", 2.0)
+        self.declare_parameter("inertial_max_message_age_s", 0.25)
+        self.declare_parameter("inertial_max_message_gap_s", 0.25)
 
         self.odom_topic = str(self.get_parameter("odom_topic").value)
         self.expected_child_frame = str(self.get_parameter("expected_child_frame").value)
@@ -285,6 +288,15 @@ class VioPx4GpsBridge(Node):
                 float(self.get_parameter("continuity_max_yaw_rate_deg_s").value)
             ),
         )
+        self.inertial_max_duration_s = max(
+            0.1, float(self.get_parameter("inertial_max_duration_s").value)
+        )
+        self.inertial_max_message_age_s = max(
+            0.05, float(self.get_parameter("inertial_max_message_age_s").value)
+        )
+        self.inertial_max_message_gap_s = max(
+            0.02, float(self.get_parameter("inertial_max_message_gap_s").value)
+        )
 
         self.phase = Phase.WAITING if self.rc_trigger_enabled else Phase.SPOOF
         self.start_time = None if self.rc_trigger_enabled else time.monotonic()
@@ -312,6 +324,17 @@ class VioPx4GpsBridge(Node):
         self.heading_samples = []
         self.latest_attitude = None
         self.latest_mag = None
+        self.latest_px4_velocity = None
+        self.latest_px4_yaw = None
+        self.inertial_active = False
+        self.inertial_safe = False
+        self.inertial_failure_reason = None
+        self.inertial_start_time = None
+        self.inertial_displacement_ned = [0.0, 0.0, 0.0]
+        self.inertial_integrated_duration_s = 0.0
+        self.inertial_yaw_delta = 0.0
+        self.inertial_last_velocity = None
+        self.inertial_last_yaw = None
         self.last_alignment_mag_id = None
         self.logged_odom_frames = False
         self.continuity_recovering = False
@@ -392,6 +415,11 @@ class VioPx4GpsBridge(Node):
             ),
             "heading_aligned": self.heading_offset_rad is not None,
             "pose_gate_quarantine": self.continuity_recovering,
+            "inertial_recovery_active": self.inertial_active,
+            "inertial_recovery_safe": self.inertial_safe,
+            "inertial_recovery_failure": self.inertial_failure_reason,
+            "inertial_displacement_n_m": self.inertial_displacement_ned[0],
+            "inertial_displacement_e_m": self.inertial_displacement_ned[1],
             "hil_gps_output_active": self.live_output_active,
             "output_block_reason": self.live_output_block_reason,
             "px4_fallback": (
@@ -463,12 +491,15 @@ class VioPx4GpsBridge(Node):
             )
             use_hil_gps = self._read_px4_param(heartbeat, "MAV_USEHILGPS")
             gps_ctrl = self._read_px4_param(heartbeat, "EKF2_GPS_CTRL")
+            noaid_tout_us = self._read_px4_param(heartbeat, "EKF2_NOAID_TOUT")
             if use_hil_gps is None:
                 raise RuntimeError("PX4 did not return required parameter MAV_USEHILGPS")
             if int(round(use_hil_gps)) != 1:
                 raise RuntimeError("PX4 MAV_USEHILGPS must be 1 before starting Path A")
             if gps_ctrl is None:
                 raise RuntimeError("PX4 did not return required parameter EKF2_GPS_CTRL")
+            if noaid_tout_us is None:
+                raise RuntimeError("PX4 did not return required parameter EKF2_NOAID_TOUT")
             gps_ctrl_bits = int(round(gps_ctrl))
             if gps_ctrl_bits != 0b0001:
                 raise RuntimeError(
@@ -476,8 +507,16 @@ class VioPx4GpsBridge(Node):
                     "uses the configured height source, velocity is not fused, "
                     f"and heading stays on compass (current={gps_ctrl_bits})"
                 )
+            noaid_tout_s = float(noaid_tout_us) * 1e-6
+            if self.inertial_max_duration_s >= noaid_tout_s:
+                raise RuntimeError(
+                    "inertial_max_duration_s must be shorter than PX4 "
+                    f"EKF2_NOAID_TOUT ({noaid_tout_s:.3f}s); current="
+                    f"{self.inertial_max_duration_s:.3f}s"
+                )
             self.get_logger().info(
-                f"PX4 parameter gates passed: MAV_USEHILGPS=1 EKF2_GPS_CTRL={gps_ctrl_bits}"
+                "PX4 parameter gates passed: MAV_USEHILGPS=1 "
+                f"EKF2_GPS_CTRL={gps_ctrl_bits} EKF2_NOAID_TOUT={noaid_tout_s:.3f}s"
             )
             if self.validate_dual_gps_selection:
                 self._validate_dual_gps_selection(heartbeat)
@@ -489,14 +528,21 @@ class VioPx4GpsBridge(Node):
                 self.get_logger().info(
                     f"Requested RC_CHANNELS at {self.rc_request_rate_hz:.1f} Hz"
                 )
+            self._request_mavlink_stream(
+                heartbeat, mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE, 20.0
+            )
+            self._request_mavlink_stream(
+                heartbeat, mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED, 20.0
+            )
+            self.get_logger().info(
+                "Requested ATTITUDE and LOCAL_POSITION_NED at 20 Hz for guarded "
+                "GPS-silent inertial recovery"
+            )
             if self.heading_source == "compass":
-                self._request_mavlink_stream(
-                    heartbeat, mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE, 20.0
-                )
                 self._request_mavlink_stream(
                     heartbeat, mavutil.mavlink.MAVLINK_MSG_ID_HIGHRES_IMU, 20.0
                 )
-                self.get_logger().info("Requested ATTITUDE and HIGHRES_IMU at 20 Hz")
+                self.get_logger().info("Requested HIGHRES_IMU at 20 Hz")
             self._send_status_text("VIO GPS: PX4 link ready", 6)
         elif self.transport == "ros2":
             if SensorGps is None:
@@ -627,6 +673,182 @@ class VioPx4GpsBridge(Node):
                 text = f"VIO GPS stopped: {reason}"
             self._send_status_text(text, 3)
 
+    def _fail_inertial_propagation(self, reason: str):
+        if self.inertial_failure_reason is not None:
+            return
+        self.inertial_safe = False
+        self.inertial_failure_reason = reason
+        self.get_logger().error(
+            f"VIO_INERTIAL_RECOVERY_UNSAFE reason={reason}; HIL_GPS remains stopped"
+        )
+        self._send_status_text("VIO GPS: inertial recovery unsafe", 3)
+
+    def _start_inertial_propagation(self):
+        now = time.monotonic()
+        self.inertial_active = True
+        self.inertial_safe = True
+        self.inertial_failure_reason = None
+        self.inertial_start_time = now
+        self.inertial_displacement_ned = [0.0, 0.0, 0.0]
+        self.inertial_integrated_duration_s = 0.0
+        self.inertial_yaw_delta = 0.0
+        self.inertial_last_velocity = None
+        self.inertial_last_yaw = None
+        if self.latest_px4_velocity is None or self.latest_px4_yaw is None:
+            self._fail_inertial_propagation("px4_motion_stream_unavailable_at_quarantine")
+        elif (now - self.latest_px4_velocity[0] > self.inertial_max_message_age_s
+              or now - self.latest_px4_yaw[0] > self.inertial_max_message_age_s):
+            self._fail_inertial_propagation("px4_motion_stream_stale_at_quarantine")
+        else:
+            # Interpolate the cached sample timestamp to quarantine entry so
+            # motion from before GPS became silent is not integrated again.
+            vel_arrival, vel_boot, vn, ve = self.latest_px4_velocity
+            yaw_arrival, yaw_boot, yaw = self.latest_px4_yaw
+            self.inertial_last_velocity = (
+                now, vel_boot + (now - vel_arrival), vn, ve
+            )
+            self.inertial_last_yaw = (
+                now, yaw_boot + (now - yaw_arrival), yaw
+            )
+        self.get_logger().warn(
+            "VIO_INERTIAL_RECOVERY_STARTED source=PX4_LOCAL_POSITION_NED_velocity+"
+            "ATTITUDE_yaw gps_output=silent"
+        )
+
+    def _integrate_px4_velocity(self, sample):
+        self.latest_px4_velocity = sample
+        if not self.inertial_active or not self.inertial_safe:
+            return
+        if self.inertial_last_velocity is None:
+            self.inertial_last_velocity = sample
+            return
+        _, old_t, old_vn, old_ve = self.inertial_last_velocity
+        _, new_t, vn, ve = sample
+        dt = new_t - old_t
+        if dt <= 0.0:
+            self._fail_inertial_propagation(f"velocity_timestamp_regression dt_s={dt:.6f}")
+            return
+        if dt > self.inertial_max_message_gap_s:
+            self._fail_inertial_propagation(
+                f"velocity_message_gap gap_s={dt:.3f} "
+                f"limit_s={self.inertial_max_message_gap_s:.3f}"
+            )
+            return
+        speed = math.hypot(vn, ve)
+        if speed > self.continuity.max_speed_mps:
+            self._fail_inertial_propagation(
+                f"velocity_limit speed_m_s={speed:.3f} "
+                f"limit_m_s={self.continuity.max_speed_mps:.3f}"
+            )
+            return
+        acceleration = math.hypot(vn - old_vn, ve - old_ve) / dt
+        if acceleration > self.continuity.max_acceleration_mps2:
+            self._fail_inertial_propagation(
+                f"acceleration_limit acceleration_m_s2={acceleration:.3f} "
+                f"limit_m_s2={self.continuity.max_acceleration_mps2:.3f}"
+            )
+            return
+        self.inertial_displacement_ned[0] += 0.5 * (old_vn + vn) * dt
+        self.inertial_displacement_ned[1] += 0.5 * (old_ve + ve) * dt
+        self.inertial_integrated_duration_s += dt
+        self.inertial_last_velocity = sample
+
+    def _integrate_px4_yaw(self, sample):
+        self.latest_px4_yaw = sample
+        if not self.inertial_active or not self.inertial_safe:
+            return
+        if self.inertial_last_yaw is None:
+            self.inertial_last_yaw = sample
+            return
+        _, old_t, old_yaw = self.inertial_last_yaw
+        _, new_t, yaw = sample
+        dt = new_t - old_t
+        if dt <= 0.0:
+            self._fail_inertial_propagation(f"yaw_timestamp_regression dt_s={dt:.6f}")
+            return
+        if dt > self.inertial_max_message_gap_s:
+            self._fail_inertial_propagation(
+                f"yaw_message_gap gap_s={dt:.3f} "
+                f"limit_s={self.inertial_max_message_gap_s:.3f}"
+            )
+            return
+        delta = wrap_pi(yaw - old_yaw)
+        yaw_rate = abs(delta) / dt
+        if yaw_rate > self.continuity.max_yaw_rate_rad_s:
+            self._fail_inertial_propagation(
+                f"yaw_rate_limit yaw_rate_deg_s={math.degrees(yaw_rate):.3f} "
+                f"limit_deg_s={math.degrees(self.continuity.max_yaw_rate_rad_s):.3f}"
+            )
+            return
+        self.inertial_yaw_delta = wrap_pi(self.inertial_yaw_delta + delta)
+        self.inertial_last_yaw = sample
+
+    def _inertial_recovery_target(self):
+        if not self.inertial_active or not self.inertial_safe:
+            return None
+        now = time.monotonic()
+        elapsed = now - self.inertial_start_time
+        if elapsed > self.inertial_max_duration_s:
+            self._fail_inertial_propagation(
+                f"duration_limit elapsed_s={elapsed:.3f} "
+                f"limit_s={self.inertial_max_duration_s:.3f}"
+            )
+            return None
+        if (self.latest_px4_velocity is None
+                or now - self.latest_px4_velocity[0] > self.inertial_max_message_age_s):
+            self._fail_inertial_propagation("velocity_message_stale")
+            return None
+        if (self.latest_px4_yaw is None
+                or now - self.latest_px4_yaw[0] > self.inertial_max_message_age_s):
+            self._fail_inertial_propagation("attitude_message_stale")
+            return None
+        horizontal_distance = math.hypot(
+            self.inertial_displacement_ned[0], self.inertial_displacement_ned[1]
+        )
+        physical_bound = (
+            self.continuity.max_speed_mps * self.inertial_integrated_duration_s
+        )
+        if horizontal_distance > physical_bound + 1e-6:
+            self._fail_inertial_propagation(
+                f"displacement_limit displacement_m={horizontal_distance:.3f} "
+                f"physical_bound_m={physical_bound:.3f}"
+            )
+            return None
+        # Continuity operates before the fixed local-world-to-true-NED heading
+        # rotation. Convert the independently propagated NED displacement back
+        # into that local frame before establishing the recovered epoch.
+        if self.heading_offset_rad is None:
+            self._fail_inertial_propagation("heading_alignment_unavailable")
+            return None
+        local_delta = rotate_ned_heading(
+            self.inertial_displacement_ned[0],
+            self.inertial_displacement_ned[1],
+            0.0,
+            -self.heading_offset_rad,
+        )
+        return local_delta, self.inertial_yaw_delta
+
+    def _finish_inertial_propagation(self):
+        displacement = tuple(self.inertial_displacement_ned)
+        elapsed = time.monotonic() - self.inertial_start_time
+        self.get_logger().info(
+            "VIO_INERTIAL_RECOVERY_APPLIED "
+            f"north_m={displacement[0]:.3f} east_m={displacement[1]:.3f} "
+            f"yaw_deg={math.degrees(self.inertial_yaw_delta):.3f} "
+            f"elapsed_s={elapsed:.3f}"
+        )
+        self.inertial_active = False
+
+    def _cancel_inertial_propagation(self, reason: str):
+        if not self.inertial_active:
+            return
+        self.get_logger().info(
+            f"VIO_INERTIAL_RECOVERY_CANCELLED reason={reason}; "
+            "no propagated displacement applied"
+        )
+        self.inertial_active = False
+        self.inertial_safe = False
+
     def _odom_callback(self, msg: Odometry):
         if msg.child_frame_id != self.expected_child_frame:
             if msg.child_frame_id != self.rejected_odom_frame:
@@ -704,10 +926,26 @@ class VioPx4GpsBridge(Node):
         if sample_time <= 0.0:
             sample_time = time.monotonic()
         frame_key = f"{msg.header.frame_id}|{msg.child_frame_id}"
+        inertial_target = (
+            self._inertial_recovery_target() if self.inertial_active else None
+        )
+        recovery_displacement = None if inertial_target is None else inertial_target[0]
+        recovery_yaw_delta = 0.0 if inertial_target is None else inertial_target[1]
         continuity = self.continuity.update(
             (north, east, down), raw_body_yaw_ned, (vn, ve, vd),
             raw_yaw_rate_ned, sample_time, frame_key,
+            recovery_displacement=recovery_displacement,
+            recovery_yaw_delta=recovery_yaw_delta,
         )
+        # Before live handoff there is no VIO GPS trajectory to preserve. A
+        # startup relocalization should establish a fresh local origin rather
+        # than invoke PX4-aided in-flight recovery.
+        if continuity.recovering and self.phase != Phase.LIVE:
+            self.continuity.reset()
+            continuity = self.continuity.update(
+                (north, east, down), raw_body_yaw_ned, (vn, ve, vd),
+                raw_yaw_rate_ned, sample_time, frame_key,
+            )
         north, east, down = continuity.position
         vn, ve, vd = continuity.velocity
         if continuity.event:
@@ -721,6 +959,12 @@ class VioPx4GpsBridge(Node):
                 self.get_logger().warn(message)
             else:
                 self.get_logger().info(message)
+            if continuity.event == "quarantine_started" and self.phase == Phase.LIVE:
+                self._start_inertial_propagation()
+            elif continuity.event == "recovery_completed":
+                self._finish_inertial_propagation()
+            elif continuity.event == "isolated_outlier_rejected":
+                self._cancel_inertial_propagation("isolated_outlier")
         if continuity.recovering:
             self.continuity_recovering = True
             return
@@ -801,7 +1045,7 @@ class VioPx4GpsBridge(Node):
         now = time.monotonic()
         if self.latest_attitude is None or self.latest_mag is None:
             return
-        att_time, roll, pitch = self.latest_attitude
+        att_time, roll, pitch, _yaw = self.latest_attitude
         mag_time, mag_id, mx, my, mz = self.latest_mag
         if now - att_time > self.alignment_sensor_max_age_s:
             return
@@ -894,6 +1138,9 @@ class VioPx4GpsBridge(Node):
                 return
             message_type = msg.get_type()
             now = time.monotonic()
+            if (self.px4_target_sysid is not None
+                    and int(msg.get_srcSystem()) != self.px4_target_sysid):
+                continue
             if (
                 message_type == "HEARTBEAT"
                 and self.px4_target_sysid is not None
@@ -902,11 +1149,24 @@ class VioPx4GpsBridge(Node):
                 self.last_px4_heartbeat_time = now
                 continue
             if message_type == "ATTITUDE":
-                roll, pitch = float(msg.roll), float(msg.pitch)
-                if math.isfinite(roll) and math.isfinite(pitch):
-                    # Deliberately exclude msg.yaw: injected GPS must never feed
-                    # back into the reference used to align injected GPS.
-                    self.latest_attitude = (now, roll, pitch)
+                roll, pitch, yaw = float(msg.roll), float(msg.pitch), float(msg.yaw)
+                boot_time = float(msg.time_boot_ms) * 1e-3
+                if all(math.isfinite(value) for value in (roll, pitch, yaw, boot_time)):
+                    # PX4 yaw is excluded from initial earth-heading alignment.
+                    # Its delta is used only while HIL_GPS is silent in quarantine.
+                    self.latest_attitude = (now, roll, pitch, yaw)
+                    self._integrate_px4_yaw((now, boot_time, yaw))
+                continue
+            if message_type == "LOCAL_POSITION_NED":
+                boot_time = float(msg.time_boot_ms) * 1e-3
+                vn, ve = float(msg.vx), float(msg.vy)
+                if not all(math.isfinite(value) for value in (boot_time, vn, ve)):
+                    if self.inertial_active:
+                        self._fail_inertial_propagation(
+                            "nonfinite_local_position_velocity"
+                        )
+                else:
+                    self._integrate_px4_velocity((now, boot_time, vn, ve))
                 continue
             if message_type == "HIGHRES_IMU":
                 fields = int(getattr(msg, "fields_updated", 0))
@@ -977,6 +1237,10 @@ class VioPx4GpsBridge(Node):
 
     def _tick(self):
         self._poll_mavlink()
+        if self.inertial_active:
+            # Enforce duration and stream-freshness guards even if cuVSLAM has
+            # stopped producing callbacks during quarantine.
+            self._inertial_recovery_target()
         if self.phase == Phase.WAITING:
             self._set_live_output_state(False, "waiting_for_activation")
             return

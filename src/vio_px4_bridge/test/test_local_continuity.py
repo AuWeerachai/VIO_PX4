@@ -3,8 +3,13 @@ import math
 from vio_px4_bridge.local_continuity import LocalPoseContinuity
 
 
-def update(tracker, x, y=0.0, yaw=0.0, t=0.0, vx=0.0, frame="odom|base"):
-    return tracker.update((x, y, 0.0), yaw, (vx, 0.0, 0.0), 0.0, t, frame)
+def update(tracker, x, y=0.0, yaw=0.0, t=0.0, vx=0.0, frame="odom|base",
+           recovery_displacement=None, recovery_yaw_delta=0.0):
+    return tracker.update(
+        (x, y, 0.0), yaw, (vx, 0.0, 0.0), 0.0, t, frame,
+        recovery_displacement=recovery_displacement,
+        recovery_yaw_delta=recovery_yaw_delta,
+    )
 
 
 def test_normal_motion_passes_through():
@@ -16,7 +21,7 @@ def test_normal_motion_passes_through():
     assert not second.reanchored
 
 
-def test_confirmed_position_jump_preserves_continuity():
+def test_confirmed_position_jump_uses_independent_motion_only():
     tracker = LocalPoseContinuity(confirmation_samples=3, recovery_samples=2)
     update(tracker, 10.0, t=1.0, vx=1.0)
     before = update(tracker, 11.0, t=2.0, vx=1.0)
@@ -27,11 +32,22 @@ def test_confirmed_position_jump_preserves_continuity():
     jumped = update(tracker, 102.0, t=5.0, vx=1.0)
     assert jumped.reanchored
     assert jumped.reason == "position_jump"
-    assert jumped.position == (13.0, 0.0, 0.0)
+    assert jumped.position == before.position
     assert jumped.recovering
-    # New-frame movement accumulated during confirmation is retained.
-    next_pose = update(tracker, 103.0, t=6.0, vx=1.0)
-    assert next_pose.position == (14.0, 0.0, 0.0)
+    # Candidate VIO movement remains quarantined. Only independently measured
+    # PX4 inertial displacement establishes the recovered position.
+    assert update(
+        tracker, 103.0, t=6.0, vx=1.0,
+        recovery_displacement=(2.0, 0.0, 0.0),
+    ).recovering
+    recovered = update(
+        tracker, 104.0, t=7.0, vx=1.0,
+        recovery_displacement=(2.0, 0.0, 0.0),
+    )
+    assert not recovered.recovering
+    assert recovered.event == "recovery_completed"
+    assert recovered.position == (13.0, 0.0, 0.0)
+    assert update(tracker, 105.0, t=8.0, vx=1.0).position == (14.0, 0.0, 0.0)
 
 
 def test_isolated_outlier_is_discarded_without_reanchor():
@@ -75,8 +91,60 @@ def test_recovery_gate_clears_after_stable_samples():
     update(tracker, 0.0, t=1.0)
     assert update(tracker, 10.0, t=1.1).recovering
     assert update(tracker, 10.0, t=1.2).recovering
+    assert update(
+        tracker, 10.0, t=1.3, recovery_displacement=(0.0, 0.0, 0.0)
+    ).recovering
+    assert not update(
+        tracker, 10.0, t=1.4, recovery_displacement=(0.0, 0.0, 0.0)
+    ).recovering
+
+
+def test_recovery_stays_gated_without_independent_motion():
+    tracker = LocalPoseContinuity(confirmation_samples=2, recovery_samples=1)
+    update(tracker, 0.0, t=1.0)
+    assert update(tracker, 10.0, t=1.1).recovering
+    assert update(tracker, 10.0, t=1.2).recovering
     assert update(tracker, 10.0, t=1.3).recovering
-    assert not update(tracker, 10.0, t=1.4).recovering
+
+
+def test_transient_false_epoch_does_not_move_stationary_output():
+    tracker = LocalPoseContinuity(
+        max_speed_mps=10.0, max_acceleration_mps2=1000.0,
+        confirmation_samples=3, recovery_samples=3,
+    )
+    update(tracker, 0.0, t=1.0)
+    assert update(tracker, 100.0, t=1.1).recovering
+    assert update(tracker, 100.05, t=1.2).recovering
+    assert update(tracker, 100.10, t=1.3).position == (0.0, 0.0, 0.0)
+    for index, raw in enumerate((100.15, 100.20), start=4):
+        result = update(
+            tracker, raw, t=1.0 + index * 0.1,
+            recovery_displacement=(0.0, 0.0, 0.0),
+        )
+        assert result.recovering and result.position == (0.0, 0.0, 0.0)
+    recovered_false = update(
+        tracker, 100.25, t=1.6,
+        recovery_displacement=(0.0, 0.0, 0.0),
+    )
+    assert not recovered_false.recovering
+    assert recovered_false.position == (0.0, 0.0, 0.0)
+
+    # When vision returns to its original raw frame, it is another epoch, but
+    # the independently stationary anchor remains exactly unchanged.
+    assert update(tracker, 0.0, t=1.7).recovering
+    assert update(tracker, 0.0, t=1.8).recovering
+    assert update(tracker, 0.0, t=1.9).recovering
+    assert update(
+        tracker, 0.0, t=2.0, recovery_displacement=(0.0, 0.0, 0.0)
+    ).recovering
+    assert update(
+        tracker, 0.0, t=2.1, recovery_displacement=(0.0, 0.0, 0.0)
+    ).recovering
+    final = update(
+        tracker, 0.0, t=2.2, recovery_displacement=(0.0, 0.0, 0.0)
+    )
+    assert not final.recovering
+    assert final.position == (0.0, 0.0, 0.0)
 
 
 def test_physical_speed_gate_quarantines_sample():

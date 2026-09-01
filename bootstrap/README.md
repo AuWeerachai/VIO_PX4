@@ -154,15 +154,20 @@ raw-VIO-to-continuous transform so that:
 
 ```text
 continuous_pose_after_jump = continuous_pose_before_jump
+                             + guarded_PX4_inertial_displacement
 ```
 
-GPS output pauses for a short stable-sample recovery window. Subsequent motion
-is accumulated relative to the new cuVSLAM coordinate segment. The bridge does not read
-PX4's fused global position for this, avoiding feedback/self-reference. Default
+GPS output pauses for a short stable-sample recovery window. Candidate VIO
+motion cannot modify the trusted anchor. During this GPS-silent interval only,
+the bridge integrates PX4 `LOCAL_POSITION_NED` horizontal velocity and
+`ATTITUDE` yaw change. It never copies PX4's absolute/global position, and it
+stops using PX4 motion as soon as VIO GPS resumes, avoiding a closed position
+feedback loop. Default
 fallback gates are configurable with `continuity_max_gap_s`,
 `continuity_confirmation_samples`, `continuity_recovery_samples`,
 `continuity_max_speed_m_s`, `continuity_max_acceleration_m_s2`, and
-`continuity_max_yaw_rate_deg_s`. Allowed position and heading change are
+`continuity_max_yaw_rate_deg_s`, `inertial_max_duration_s`,
+`inertial_max_message_age_s`, and `inertial_max_message_gap_s`. Allowed position and heading change are
 derived from those rate limits and the measured interval between messages, so
 the behavior remains consistent when odometry frequency changes. The explicit cuVSLAM tracking/reset signal
 should be connected as the primary detector once verified on the Jetson.
@@ -170,7 +175,8 @@ should be connected as the primary detector once verified on the Jetson.
 Continuity transitions are written to the `gps-bridge` log with the prefix
 `VIO_CONTINUITY`. Each gate event includes its reason, measured value, configured
 limit, internal segment number, and outcome (`quarantine_started`, `isolated_outlier_rejected`,
-`candidate_window_restarted`, or `reset_confirmed`). This is transition logging,
+`candidate_window_restarted`, `reset_confirmed`, or `recovery_completed`).
+Guarded propagation uses `VIO_INERTIAL_RECOVERY_*` events. This is transition logging,
 not per-frame logging, so it remains useful without rapidly growing the log.
 
 The current vehicle profile sets hard limits of 10 m/s speed and 5 m/s²

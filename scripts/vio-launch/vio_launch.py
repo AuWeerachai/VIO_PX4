@@ -89,6 +89,9 @@ class Config:
     gate_max_speed_m_s: float = 10.0
     gate_max_acceleration_m_s2: float = 5.0
     gate_max_yaw_rate_deg_s: float = 360.0
+    inertial_max_duration_s: float = 2.0
+    inertial_max_message_age_s: float = 0.25
+    inertial_max_message_gap_s: float = 0.25
     rviz_enabled: bool = False
     state_dir: Path = field(default_factory=lambda: Path.home() / ".local/state/vio-launch")
 
@@ -164,6 +167,9 @@ def save_config(cfg: Config) -> None:
         "gate_max_speed_m_s": cfg.gate_max_speed_m_s,
         "gate_max_acceleration_m_s2": cfg.gate_max_acceleration_m_s2,
         "gate_max_yaw_rate_deg_s": cfg.gate_max_yaw_rate_deg_s,
+        "inertial_max_duration_s": cfg.inertial_max_duration_s,
+        "inertial_max_message_age_s": cfg.inertial_max_message_age_s,
+        "inertial_max_message_gap_s": cfg.inertial_max_message_gap_s,
         "rviz_enabled": cfg.rviz_enabled,
         "vio_px4_dir": str(cfg.vio_px4_dir),
         "ros_setup": str(cfg.ros_setup),
@@ -243,6 +249,9 @@ def apply_dict(cfg: Config, data: dict) -> Config:
         "gate_max_speed_m_s",
         "gate_max_acceleration_m_s2",
         "gate_max_yaw_rate_deg_s",
+        "inertial_max_duration_s",
+        "inertial_max_message_age_s",
+        "inertial_max_message_gap_s",
         "rviz_enabled",
     ):
         if key in data and data[key] is not None:
@@ -1228,6 +1237,9 @@ def cmd_gps(cfg: Config) -> None:
         "continuity_max_speed_m_s": cfg.gate_max_speed_m_s,
         "continuity_max_acceleration_m_s2": cfg.gate_max_acceleration_m_s2,
         "continuity_max_yaw_rate_deg_s": cfg.gate_max_yaw_rate_deg_s,
+        "inertial_max_duration_s": cfg.inertial_max_duration_s,
+        "inertial_max_message_age_s": cfg.inertial_max_message_age_s,
+        "inertial_max_message_gap_s": cfg.inertial_max_message_gap_s,
         "status_file": str(cfg.state_dir / "navigation-status.json"),
     }
     param_args = " ".join(
@@ -1305,6 +1317,18 @@ def show_navigation_status(cfg: Config) -> None:
     print(f"- Connection status: {connection}")
     print(f"- VIO status: {vio_status}")
     print(f"- Pose-jump gate status: {gate_status}")
+    if status.get("inertial_recovery_active"):
+        if status.get("inertial_recovery_safe"):
+            print(
+                "- Inertial recovery: active and guarded "
+                f"(N={float(status.get('inertial_displacement_n_m', 0.0)):+.2f} m, "
+                f"E={float(status.get('inertial_displacement_e_m', 0.0)):+.2f} m)"
+            )
+        else:
+            print(
+                "- Inertial recovery: unsafe; GPS remains stopped "
+                f"({status.get('inertial_recovery_failure') or 'unknown reason'})"
+            )
     print(f"- Latency: {latency}")
     remaining = status.get("spoof_remaining_s")
     if remaining is not None:
@@ -1645,6 +1669,14 @@ def configure_pose_gate(cfg: Config) -> Config:
             ("recovery", "Stable samples before output resumes",
              cfg.gate_recovery_samples, int, 0),
         )),
+        ("GPS-silent PX4 inertial propagation", (
+            ("inertial_duration", "Maximum propagation duration s",
+             cfg.inertial_max_duration_s, float, 0.0),
+            ("inertial_age", "Maximum PX4 motion-message age s",
+             cfg.inertial_max_message_age_s, float, 0.0),
+            ("inertial_gap", "Maximum PX4 motion-message gap s",
+             cfg.inertial_max_message_gap_s, float, 0.0),
+        )),
     )
     values: dict[str, float | int] = {}
     try:
@@ -1674,6 +1706,9 @@ def configure_pose_gate(cfg: Config) -> Config:
         gate_max_gap_s=float(values["gap"]),
         gate_confirmation_samples=int(values["confirmation"]),
         gate_recovery_samples=int(values["recovery"]),
+        inertial_max_duration_s=float(values["inertial_duration"]),
+        inertial_max_message_age_s=float(values["inertial_age"]),
+        inertial_max_message_gap_s=float(values["inertial_gap"]),
     )
     save_config(cfg)
     print("\nSaved pose-jump gate limits.")
@@ -1681,6 +1716,10 @@ def configure_pose_gate(cfg: Config) -> Config:
         "Note: speed and yaw-rate limits are automatically converted into "
         "allowed position and heading changes using the measured time between "
         "arriving odometry messages."
+    )
+    print(
+        "During quarantine, PX4 horizontal velocity and yaw are used only while "
+        "HIL_GPS is silent. Non-finite data or any limit violation keeps GPS stopped."
     )
     print("The new limits take effect the next time Path A starts.")
     pause()
