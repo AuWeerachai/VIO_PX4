@@ -92,6 +92,10 @@ class Config:
     inertial_max_duration_s: float = 2.0
     inertial_max_message_age_s: float = 0.25
     inertial_max_message_gap_s: float = 0.25
+    inertial_max_position_uncertainty_m: float = 3.0
+    recovery_velocity_agreement_m_s: float = 2.0
+    recovery_velocity_agreement_samples: int = 3
+    recovery_accuracy_tighten_s: float = 5.0
     rviz_enabled: bool = False
     state_dir: Path = field(default_factory=lambda: Path.home() / ".local/state/vio-launch")
 
@@ -170,6 +174,10 @@ def save_config(cfg: Config) -> None:
         "inertial_max_duration_s": cfg.inertial_max_duration_s,
         "inertial_max_message_age_s": cfg.inertial_max_message_age_s,
         "inertial_max_message_gap_s": cfg.inertial_max_message_gap_s,
+        "inertial_max_position_uncertainty_m": cfg.inertial_max_position_uncertainty_m,
+        "recovery_velocity_agreement_m_s": cfg.recovery_velocity_agreement_m_s,
+        "recovery_velocity_agreement_samples": cfg.recovery_velocity_agreement_samples,
+        "recovery_accuracy_tighten_s": cfg.recovery_accuracy_tighten_s,
         "rviz_enabled": cfg.rviz_enabled,
         "vio_px4_dir": str(cfg.vio_px4_dir),
         "ros_setup": str(cfg.ros_setup),
@@ -252,6 +260,10 @@ def apply_dict(cfg: Config, data: dict) -> Config:
         "inertial_max_duration_s",
         "inertial_max_message_age_s",
         "inertial_max_message_gap_s",
+        "inertial_max_position_uncertainty_m",
+        "recovery_velocity_agreement_m_s",
+        "recovery_velocity_agreement_samples",
+        "recovery_accuracy_tighten_s",
         "rviz_enabled",
     ):
         if key in data and data[key] is not None:
@@ -1240,6 +1252,10 @@ def cmd_gps(cfg: Config) -> None:
         "inertial_max_duration_s": cfg.inertial_max_duration_s,
         "inertial_max_message_age_s": cfg.inertial_max_message_age_s,
         "inertial_max_message_gap_s": cfg.inertial_max_message_gap_s,
+        "inertial_max_position_uncertainty_m": cfg.inertial_max_position_uncertainty_m,
+        "recovery_velocity_agreement_m_s": cfg.recovery_velocity_agreement_m_s,
+        "recovery_velocity_agreement_samples": cfg.recovery_velocity_agreement_samples,
+        "recovery_accuracy_tighten_s": cfg.recovery_accuracy_tighten_s,
         "status_file": str(cfg.state_dir / "navigation-status.json"),
     }
     param_args = " ".join(
@@ -1326,7 +1342,8 @@ def show_navigation_status(cfg: Config) -> None:
             )
         else:
             print(
-                "- Inertial recovery: unsafe; GPS remains stopped "
+                "- PX4 propagation: rejected; recovered VIO will continue from "
+                "the frozen pose "
                 f"({status.get('inertial_recovery_failure') or 'unknown reason'})"
             )
     print(f"- Latency: {latency}")
@@ -1676,6 +1693,16 @@ def configure_pose_gate(cfg: Config) -> Config:
              cfg.inertial_max_message_age_s, float, 0.0),
             ("inertial_gap", "Maximum PX4 motion-message gap s",
              cfg.inertial_max_message_gap_s, float, 0.0),
+            ("inertial_uncertainty", "Maximum PX4 horizontal uncertainty m",
+             cfg.inertial_max_position_uncertainty_m, float, 0.0),
+        )),
+        ("VIO handoff", (
+            ("velocity_agreement", "Maximum VIO/PX4 velocity disagreement m/s",
+             cfg.recovery_velocity_agreement_m_s, float, 0.0),
+            ("velocity_samples", "Consecutive velocity-agreement samples",
+             cfg.recovery_velocity_agreement_samples, int, 0),
+            ("accuracy_tighten", "Seconds to tighten GPS accuracy back to 0.1 m",
+             cfg.recovery_accuracy_tighten_s, float, -1.0),
         )),
     )
     values: dict[str, float | int] = {}
@@ -1709,6 +1736,10 @@ def configure_pose_gate(cfg: Config) -> Config:
         inertial_max_duration_s=float(values["inertial_duration"]),
         inertial_max_message_age_s=float(values["inertial_age"]),
         inertial_max_message_gap_s=float(values["inertial_gap"]),
+        inertial_max_position_uncertainty_m=float(values["inertial_uncertainty"]),
+        recovery_velocity_agreement_m_s=float(values["velocity_agreement"]),
+        recovery_velocity_agreement_samples=int(values["velocity_samples"]),
+        recovery_accuracy_tighten_s=float(values["accuracy_tighten"]),
     )
     save_config(cfg)
     print("\nSaved pose-jump gate limits.")
@@ -1718,8 +1749,9 @@ def configure_pose_gate(cfg: Config) -> Config:
         "arriving odometry messages."
     )
     print(
-        "During quarantine, PX4 horizontal velocity and yaw are used only while "
-        "HIL_GPS is silent. Non-finite data or any limit violation keeps GPS stopped."
+        "During quarantine, PX4 odometry is used only while HIL_GPS is silent. "
+        "If it fails a guard, its movement is discarded and VIO recovers from "
+        "the last trusted frozen pose."
     )
     print("The new limits take effect the next time Path A starts.")
     pause()

@@ -47,12 +47,15 @@ values are passed explicitly to the bridge at every Path A launch.
 The bridge converts speed and yaw-rate limits into allowed pose changes using
 the measured timestamp interval between each pair of odometry messages. A
 confirmed coordinate reset increments the internal segment counter. While
-HIL_GPS is silent, the bridge integrates guarded PX4 horizontal velocity and
-yaw change for at most two seconds. The recovered raw VIO segment is aligned to
-the last trusted pose plus only that independent short-term displacement. VIO
-candidate/recovery samples never move the trusted anchor. Stale, discontinuous,
-non-finite, over-speed, over-acceleration, over-yaw-rate, or over-duration PX4
-motion data keeps HIL_GPS stopped. All numeric limits are configured in
+HIL_GPS is silent, the bridge measures guarded PX4 `ODOMETRY` horizontal
+displacement and yaw change for at most two seconds. PX4 position variance and
+the estimator reset counter are checked before that displacement is accepted.
+The recovered raw VIO segment is aligned to the last trusted pose plus only that
+short-term displacement, after VIO/PX4 velocities agree. Candidate/recovery VIO
+samples never move the trusted anchor. A failed propagation is discarded and
+recovery continues from the frozen pose. On a successful handoff, reported GPS
+accuracy starts at PX4's accumulated horizontal uncertainty and tightens back
+to 0.1 m. All numeric limits are configured in
 `vio-launch`.
 
 ## Path B: external vision through MAVROS

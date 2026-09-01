@@ -85,14 +85,20 @@ firmware because message handling and estimator requirements can change.
   before declaring a new cuVSLAM coordinate epoch.
 - [ ] Verify candidate and recovery VIO samples cannot modify the last trusted
   output anchor.
-- [ ] While HIL_GPS is silent, integrate only PX4 horizontal velocity and yaw
-  delta; never copy PX4 absolute/local/global position into the GPS output.
+- [ ] While HIL_GPS is silent, use only the change in PX4 `ODOMETRY` local
+  position and ATTITUDE yaw; never copy PX4's absolute/global position.
+- [ ] Reject non-autopilot/non-NED odometry, excessive position variance, and
+  any estimator reset-counter change.
 - [ ] Verify a stationary disturbance resumes exactly at the trusted anchor.
 - [ ] Verify real motion during quarantine resumes at the trusted anchor plus
   the guarded PX4 inertial displacement.
 - [ ] Verify stale, non-finite, timestamp-regressed, excessive-gap, over-speed,
-  over-acceleration, over-yaw-rate, and over-duration motion data latches
-  recovery unsafe and keeps HIL_GPS stopped.
+  over-acceleration, over-yaw-rate, and over-duration PX4 data discards the
+  propagated displacement and recovers the new VIO segment from the frozen pose.
+- [ ] Require consecutive VIO/PX4 velocity agreement before accepting a
+  successful propagated handoff.
+- [ ] Resume with EPH no tighter than PX4's horizontal uncertainty, then tighten
+  gradually to the configured 0.1 m VIO accuracy.
 - [ ] After re-anchoring, keep GPS stopped for
   `continuity_recovery_samples` additional valid poses.
 - [ ] Validate continuity thresholds against the vehicle's maximum real speed

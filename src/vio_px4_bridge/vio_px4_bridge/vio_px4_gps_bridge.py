@@ -139,6 +139,10 @@ class VioPx4GpsBridge(Node):
         self.declare_parameter("inertial_max_duration_s", 2.0)
         self.declare_parameter("inertial_max_message_age_s", 0.25)
         self.declare_parameter("inertial_max_message_gap_s", 0.25)
+        self.declare_parameter("inertial_max_position_uncertainty_m", 3.0)
+        self.declare_parameter("recovery_velocity_agreement_m_s", 2.0)
+        self.declare_parameter("recovery_velocity_agreement_samples", 3)
+        self.declare_parameter("recovery_accuracy_tighten_s", 5.0)
 
         self.odom_topic = str(self.get_parameter("odom_topic").value)
         self.expected_child_frame = str(self.get_parameter("expected_child_frame").value)
@@ -297,6 +301,19 @@ class VioPx4GpsBridge(Node):
         self.inertial_max_message_gap_s = max(
             0.02, float(self.get_parameter("inertial_max_message_gap_s").value)
         )
+        self.inertial_max_position_uncertainty_m = max(
+            self.cruise_eph_m,
+            float(self.get_parameter("inertial_max_position_uncertainty_m").value),
+        )
+        self.recovery_velocity_agreement_m_s = max(
+            0.0, float(self.get_parameter("recovery_velocity_agreement_m_s").value)
+        )
+        self.recovery_velocity_agreement_samples = max(
+            1, int(self.get_parameter("recovery_velocity_agreement_samples").value)
+        )
+        self.recovery_accuracy_tighten_s = max(
+            0.0, float(self.get_parameter("recovery_accuracy_tighten_s").value)
+        )
 
         self.phase = Phase.WAITING if self.rc_trigger_enabled else Phase.SPOOF
         self.start_time = None if self.rc_trigger_enabled else time.monotonic()
@@ -326,6 +343,7 @@ class VioPx4GpsBridge(Node):
         self.latest_mag = None
         self.latest_px4_velocity = None
         self.latest_px4_yaw = None
+        self.latest_px4_odometry = None
         self.inertial_active = False
         self.inertial_safe = False
         self.inertial_failure_reason = None
@@ -333,8 +351,13 @@ class VioPx4GpsBridge(Node):
         self.inertial_displacement_ned = [0.0, 0.0, 0.0]
         self.inertial_integrated_duration_s = 0.0
         self.inertial_yaw_delta = 0.0
-        self.inertial_last_velocity = None
         self.inertial_last_yaw = None
+        self.inertial_start_odometry = None
+        self.inertial_last_odometry = None
+        self.inertial_fallback_to_frozen_pose = False
+        self.recovery_velocity_agreement_count = 0
+        self.recovery_resume_eph_m = None
+        self.recovery_resume_time = None
         self.last_alignment_mag_id = None
         self.logged_odom_frames = False
         self.continuity_recovering = False
@@ -417,9 +440,15 @@ class VioPx4GpsBridge(Node):
             "pose_gate_quarantine": self.continuity_recovering,
             "inertial_recovery_active": self.inertial_active,
             "inertial_recovery_safe": self.inertial_safe,
+            "inertial_fallback_to_frozen_pose": self.inertial_fallback_to_frozen_pose,
             "inertial_recovery_failure": self.inertial_failure_reason,
             "inertial_displacement_n_m": self.inertial_displacement_ned[0],
             "inertial_displacement_e_m": self.inertial_displacement_ned[1],
+            "px4_position_uncertainty_m": (
+                None if self.latest_px4_odometry is None else
+                math.sqrt(max(0.0, self.latest_px4_odometry[6], self.latest_px4_odometry[7]))
+            ),
+            "recovery_velocity_agreement_count": self.recovery_velocity_agreement_count,
             "hil_gps_output_active": self.live_output_active,
             "output_block_reason": self.live_output_block_reason,
             "px4_fallback": (
@@ -532,11 +561,11 @@ class VioPx4GpsBridge(Node):
                 heartbeat, mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE, 20.0
             )
             self._request_mavlink_stream(
-                heartbeat, mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED, 20.0
+                heartbeat, mavutil.mavlink.MAVLINK_MSG_ID_ODOMETRY, 20.0
             )
             self.get_logger().info(
-                "Requested ATTITUDE and LOCAL_POSITION_NED at 20 Hz for guarded "
-                "GPS-silent inertial recovery"
+                "Requested ATTITUDE and ODOMETRY at 20 Hz for guarded GPS-silent "
+                "recovery (PX4 position/velocity variance and reset counter included)"
             )
             if self.heading_source == "compass":
                 self._request_mavlink_stream(
@@ -678,10 +707,14 @@ class VioPx4GpsBridge(Node):
             return
         self.inertial_safe = False
         self.inertial_failure_reason = reason
+        self.inertial_fallback_to_frozen_pose = True
+        self.inertial_displacement_ned = [0.0, 0.0, 0.0]
+        self.inertial_yaw_delta = 0.0
         self.get_logger().error(
-            f"VIO_INERTIAL_RECOVERY_UNSAFE reason={reason}; HIL_GPS remains stopped"
+            f"VIO_INERTIAL_RECOVERY_REJECTED reason={reason}; propagated movement "
+            "discarded; recovery target=last trusted frozen VIO pose"
         )
-        self._send_status_text("VIO GPS: inertial recovery unsafe", 3)
+        self._send_status_text("VIO GPS: PX4 propagation rejected; pose frozen", 3)
 
     def _start_inertial_propagation(self):
         now = time.monotonic()
@@ -692,46 +725,74 @@ class VioPx4GpsBridge(Node):
         self.inertial_displacement_ned = [0.0, 0.0, 0.0]
         self.inertial_integrated_duration_s = 0.0
         self.inertial_yaw_delta = 0.0
-        self.inertial_last_velocity = None
         self.inertial_last_yaw = None
-        if self.latest_px4_velocity is None or self.latest_px4_yaw is None:
+        self.inertial_start_odometry = None
+        self.inertial_last_odometry = None
+        self.inertial_fallback_to_frozen_pose = False
+        self.recovery_velocity_agreement_count = 0
+        if self.latest_px4_odometry is None or self.latest_px4_yaw is None:
             self._fail_inertial_propagation("px4_motion_stream_unavailable_at_quarantine")
-        elif (now - self.latest_px4_velocity[0] > self.inertial_max_message_age_s
+        elif (now - self.latest_px4_odometry[0] > self.inertial_max_message_age_s
               or now - self.latest_px4_yaw[0] > self.inertial_max_message_age_s):
             self._fail_inertial_propagation("px4_motion_stream_stale_at_quarantine")
         else:
-            # Interpolate the cached sample timestamp to quarantine entry so
-            # motion from before GPS became silent is not integrated again.
-            vel_arrival, vel_boot, vn, ve = self.latest_px4_velocity
-            yaw_arrival, yaw_boot, yaw = self.latest_px4_yaw
-            self.inertial_last_velocity = (
-                now, vel_boot + (now - vel_arrival), vn, ve
+            (odom_arrival, odom_time, north, east, vn, ve,
+             var_n, var_e, reset_counter) = self.latest_px4_odometry
+            # Move the cached sample to the quarantine boundary using its
+            # velocity. This prevents motion just before GPS was stopped from
+            # being counted a second time.
+            age = max(0.0, now - odom_arrival)
+            boundary = (
+                now, odom_time + age, north + vn * age, east + ve * age,
+                vn, ve, var_n, var_e, reset_counter,
             )
+            self.inertial_start_odometry = boundary
+            self.inertial_last_odometry = boundary
+            self.latest_px4_velocity = (now, odom_time + age, vn, ve)
+            yaw_arrival, yaw_boot, yaw = self.latest_px4_yaw
             self.inertial_last_yaw = (
                 now, yaw_boot + (now - yaw_arrival), yaw
             )
         self.get_logger().warn(
-            "VIO_INERTIAL_RECOVERY_STARTED source=PX4_LOCAL_POSITION_NED_velocity+"
-            "ATTITUDE_yaw gps_output=silent"
+            "VIO_INERTIAL_RECOVERY_STARTED source=PX4_ODOMETRY_position+variance+"
+            "reset_counter+ATTITUDE_yaw gps_output=silent"
         )
 
-    def _integrate_px4_velocity(self, sample):
-        self.latest_px4_velocity = sample
+    def _update_px4_odometry(self, sample):
+        """Track PX4 EKF displacement while synthetic GPS output is silent."""
+        self.latest_px4_odometry = sample
+        _, odom_time, north, east, vn, ve, var_n, var_e, reset_counter = sample
+        self.latest_px4_velocity = (sample[0], odom_time, vn, ve)
         if not self.inertial_active or not self.inertial_safe:
             return
-        if self.inertial_last_velocity is None:
-            self.inertial_last_velocity = sample
+        if self.inertial_start_odometry is None:
+            self.inertial_start_odometry = sample
+            self.inertial_last_odometry = sample
             return
-        _, old_t, old_vn, old_ve = self.inertial_last_velocity
-        _, new_t, vn, ve = sample
-        dt = new_t - old_t
+        previous = self.inertial_last_odometry
+        dt = odom_time - previous[1]
         if dt <= 0.0:
-            self._fail_inertial_propagation(f"velocity_timestamp_regression dt_s={dt:.6f}")
+            self._fail_inertial_propagation(
+                f"odometry_timestamp_regression dt_s={dt:.6f}"
+            )
             return
         if dt > self.inertial_max_message_gap_s:
             self._fail_inertial_propagation(
-                f"velocity_message_gap gap_s={dt:.3f} "
+                f"odometry_message_gap gap_s={dt:.3f} "
                 f"limit_s={self.inertial_max_message_gap_s:.3f}"
+            )
+            return
+        if reset_counter != self.inertial_start_odometry[8]:
+            self._fail_inertial_propagation(
+                f"px4_estimator_reset old={self.inertial_start_odometry[8]} "
+                f"new={reset_counter}"
+            )
+            return
+        uncertainty = math.sqrt(max(0.0, var_n, var_e))
+        if uncertainty > self.inertial_max_position_uncertainty_m:
+            self._fail_inertial_propagation(
+                f"position_uncertainty uncertainty_m={uncertainty:.3f} "
+                f"limit_m={self.inertial_max_position_uncertainty_m:.3f}"
             )
             return
         speed = math.hypot(vn, ve)
@@ -741,6 +802,7 @@ class VioPx4GpsBridge(Node):
                 f"limit_m_s={self.continuity.max_speed_mps:.3f}"
             )
             return
+        old_vn, old_ve = previous[4], previous[5]
         acceleration = math.hypot(vn - old_vn, ve - old_ve) / dt
         if acceleration > self.continuity.max_acceleration_mps2:
             self._fail_inertial_propagation(
@@ -748,10 +810,13 @@ class VioPx4GpsBridge(Node):
                 f"limit_m_s2={self.continuity.max_acceleration_mps2:.3f}"
             )
             return
+        # Integrate PX4 EKF velocity rather than copying its absolute local
+        # position. This preserves real motion without importing small PX4
+        # position corrections into the recovered VIO trajectory.
         self.inertial_displacement_ned[0] += 0.5 * (old_vn + vn) * dt
         self.inertial_displacement_ned[1] += 0.5 * (old_ve + ve) * dt
         self.inertial_integrated_duration_s += dt
-        self.inertial_last_velocity = sample
+        self.inertial_last_odometry = sample
 
     def _integrate_px4_yaw(self, sample):
         self.latest_px4_yaw = sample
@@ -784,8 +849,10 @@ class VioPx4GpsBridge(Node):
         self.inertial_last_yaw = sample
 
     def _inertial_recovery_target(self):
-        if not self.inertial_active or not self.inertial_safe:
+        if not self.inertial_active:
             return None
+        if self.inertial_fallback_to_frozen_pose:
+            return (0.0, 0.0, 0.0), 0.0
         now = time.monotonic()
         elapsed = now - self.inertial_start_time
         if elapsed > self.inertial_max_duration_s:
@@ -793,15 +860,15 @@ class VioPx4GpsBridge(Node):
                 f"duration_limit elapsed_s={elapsed:.3f} "
                 f"limit_s={self.inertial_max_duration_s:.3f}"
             )
-            return None
-        if (self.latest_px4_velocity is None
-                or now - self.latest_px4_velocity[0] > self.inertial_max_message_age_s):
-            self._fail_inertial_propagation("velocity_message_stale")
-            return None
+            return (0.0, 0.0, 0.0), 0.0
+        if (self.latest_px4_odometry is None
+                or now - self.latest_px4_odometry[0] > self.inertial_max_message_age_s):
+            self._fail_inertial_propagation("odometry_message_stale")
+            return (0.0, 0.0, 0.0), 0.0
         if (self.latest_px4_yaw is None
                 or now - self.latest_px4_yaw[0] > self.inertial_max_message_age_s):
             self._fail_inertial_propagation("attitude_message_stale")
-            return None
+            return (0.0, 0.0, 0.0), 0.0
         horizontal_distance = math.hypot(
             self.inertial_displacement_ned[0], self.inertial_displacement_ned[1]
         )
@@ -813,13 +880,13 @@ class VioPx4GpsBridge(Node):
                 f"displacement_limit displacement_m={horizontal_distance:.3f} "
                 f"physical_bound_m={physical_bound:.3f}"
             )
-            return None
+            return (0.0, 0.0, 0.0), 0.0
         # Continuity operates before the fixed local-world-to-true-NED heading
         # rotation. Convert the independently propagated NED displacement back
         # into that local frame before establishing the recovered epoch.
         if self.heading_offset_rad is None:
             self._fail_inertial_propagation("heading_alignment_unavailable")
-            return None
+            return (0.0, 0.0, 0.0), 0.0
         local_delta = rotate_ned_heading(
             self.inertial_displacement_ned[0],
             self.inertial_displacement_ned[1],
@@ -831,11 +898,22 @@ class VioPx4GpsBridge(Node):
     def _finish_inertial_propagation(self):
         displacement = tuple(self.inertial_displacement_ned)
         elapsed = time.monotonic() - self.inertial_start_time
+        if self.inertial_fallback_to_frozen_pose:
+            resume_eph = self.cruise_eph_m
+            source = "frozen_pose"
+        else:
+            variance = 0.0 if self.latest_px4_odometry is None else max(
+                0.0, self.latest_px4_odometry[6], self.latest_px4_odometry[7]
+            )
+            resume_eph = max(self.cruise_eph_m, math.sqrt(variance))
+            source = "px4_odometry"
+        self.recovery_resume_eph_m = resume_eph
+        self.recovery_resume_time = time.monotonic()
         self.get_logger().info(
             "VIO_INERTIAL_RECOVERY_APPLIED "
             f"north_m={displacement[0]:.3f} east_m={displacement[1]:.3f} "
             f"yaw_deg={math.degrees(self.inertial_yaw_delta):.3f} "
-            f"elapsed_s={elapsed:.3f}"
+            f"elapsed_s={elapsed:.3f} source={source} resume_eph_m={resume_eph:.3f}"
         )
         self.inertial_active = False
 
@@ -848,6 +926,38 @@ class VioPx4GpsBridge(Node):
         )
         self.inertial_active = False
         self.inertial_safe = False
+
+    def _recovery_velocity_agrees(self, local_velocity) -> bool:
+        """Require recovered VIO motion to agree with PX4 before handoff."""
+        if self.inertial_fallback_to_frozen_pose:
+            # PX4 propagation was rejected, so it is not a trusted comparison
+            # source. Stable VIO samples still gate recovery in LocalPoseContinuity.
+            return True
+        if self.latest_px4_odometry is None or self.heading_offset_rad is None:
+            self.recovery_velocity_agreement_count = 0
+            return False
+        vx, vy = self.continuity._rotate_xy(
+            local_velocity[0], local_velocity[1], self.continuity.rotation
+        )
+        vio_n, vio_e, _ = rotate_ned_heading(
+            vx, vy, 0.0, self.heading_offset_rad
+        )
+        px4_n, px4_e = self.latest_px4_odometry[4:6]
+        residual = math.hypot(vio_n - px4_n, vio_e - px4_e)
+        if residual <= self.recovery_velocity_agreement_m_s:
+            self.recovery_velocity_agreement_count += 1
+        else:
+            if self.recovery_velocity_agreement_count:
+                self.get_logger().warn(
+                    "VIO_RECOVERY_VELOCITY_AGREEMENT_RESET "
+                    f"residual_m_s={residual:.3f} "
+                    f"limit_m_s={self.recovery_velocity_agreement_m_s:.3f}"
+                )
+            self.recovery_velocity_agreement_count = 0
+        return (
+            self.recovery_velocity_agreement_count
+            >= self.recovery_velocity_agreement_samples
+        )
 
     def _odom_callback(self, msg: Odometry):
         if msg.child_frame_id != self.expected_child_frame:
@@ -926,8 +1036,13 @@ class VioPx4GpsBridge(Node):
         if sample_time <= 0.0:
             sample_time = time.monotonic()
         frame_key = f"{msg.header.frame_id}|{msg.child_frame_id}"
+        recovery_agrees = (
+            self._recovery_velocity_agrees((vn, ve, vd))
+            if self.inertial_active else False
+        )
         inertial_target = (
-            self._inertial_recovery_target() if self.inertial_active else None
+            self._inertial_recovery_target()
+            if self.inertial_active and recovery_agrees else None
         )
         recovery_displacement = None if inertial_target is None else inertial_target[0]
         recovery_yaw_delta = 0.0 if inertial_target is None else inertial_target[1]
@@ -1101,6 +1216,24 @@ class VioPx4GpsBridge(Node):
     def _select_accuracy(self) -> tuple[float, float]:
         if self.phase == Phase.SPOOF:
             return self.spoof_eph_m, self.spoof_epv_m
+        if self.recovery_resume_eph_m is not None and self.recovery_resume_time is not None:
+            if self.recovery_accuracy_tighten_s <= 0.0:
+                self.recovery_resume_eph_m = None
+                self.recovery_resume_time = None
+            else:
+                fraction = min(
+                    1.0,
+                    (time.monotonic() - self.recovery_resume_time)
+                    / self.recovery_accuracy_tighten_s,
+                )
+                eph = (
+                    self.recovery_resume_eph_m
+                    + (self.cruise_eph_m - self.recovery_resume_eph_m) * fraction
+                )
+                if fraction >= 1.0:
+                    self.recovery_resume_eph_m = None
+                    self.recovery_resume_time = None
+                return max(self.cruise_eph_m, eph), self.cruise_epv_m
         if self.live_start_time is None:
             return self.boot_accuracy_m, self.spoof_epv_m
         if (time.monotonic() - self.live_start_time) < self.boot_duration_s:
@@ -1157,16 +1290,32 @@ class VioPx4GpsBridge(Node):
                     self.latest_attitude = (now, roll, pitch, yaw)
                     self._integrate_px4_yaw((now, boot_time, yaw))
                 continue
-            if message_type == "LOCAL_POSITION_NED":
-                boot_time = float(msg.time_boot_ms) * 1e-3
+            if message_type == "ODOMETRY":
+                sample_time = float(msg.time_usec) * 1e-6
+                north, east = float(msg.x), float(msg.y)
                 vn, ve = float(msg.vx), float(msg.vy)
-                if not all(math.isfinite(value) for value in (boot_time, vn, ve)):
+                pose_covariance = list(msg.pose_covariance)
+                var_n = float(pose_covariance[0])
+                var_e = float(pose_covariance[6])
+                reset_counter = int(msg.reset_counter)
+                # This PX4 stream publishes estimator output in LOCAL_NED and
+                # marks it as MAV_ESTIMATOR_TYPE_AUTOPILOT. Reject any other
+                # producer/frame instead of silently mixing conventions.
+                valid_source = (
+                    int(msg.frame_id) == 1
+                    and int(msg.estimator_type) == 8
+                )
+                values = (sample_time, north, east, vn, ve, var_n, var_e)
+                if not valid_source or not all(math.isfinite(value) for value in values):
                     if self.inertial_active:
                         self._fail_inertial_propagation(
-                            "nonfinite_local_position_velocity"
+                            "invalid_px4_odometry_source_frame_or_covariance"
                         )
                 else:
-                    self._integrate_px4_velocity((now, boot_time, vn, ve))
+                    self._update_px4_odometry(
+                        (now, sample_time, north, east, vn, ve,
+                         var_n, var_e, reset_counter)
+                    )
                 continue
             if message_type == "HIGHRES_IMU":
                 fields = int(getattr(msg, "fields_updated", 0))
