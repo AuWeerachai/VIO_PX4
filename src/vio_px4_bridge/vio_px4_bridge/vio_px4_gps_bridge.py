@@ -84,9 +84,9 @@ class VioPx4GpsBridge(Node):
         self.declare_parameter("spoof_epv_m", 1.0)
 
         # Live / cruise accuracy (BasaltGpsBridge boot -> cruise analogue)
-        self.declare_parameter("boot_accuracy_m", 0.5)
+        self.declare_parameter("boot_accuracy_m", 0.2)
         self.declare_parameter("boot_duration_s", 60.0)
-        self.declare_parameter("cruise_eph_m", 5.0)
+        self.declare_parameter("cruise_eph_m", 0.2)
         self.declare_parameter("cruise_epv_m", 1.5)
         self.declare_parameter("speed_accuracy_m_s", 0.25)
         # HIL_GPS requires altitude and velocity fields even when PX4 is
@@ -95,7 +95,8 @@ class VioPx4GpsBridge(Node):
         self.declare_parameter("horizontal_only_output", True)
 
         self.declare_parameter("fix_type", 3)
-        self.declare_parameter("satellites", 10)
+        # 254 is the largest numeric MAVLink count; 255 means "unknown".
+        self.declare_parameter("satellites", 254)
         # Keep the injected receiver distinct from the physical Here GNSS
         # (GPS1 / instance 0). HIL_GPS.id is carried into PX4's GPS device id.
         self.declare_parameter("gps_id", 1)
@@ -171,7 +172,9 @@ class VioPx4GpsBridge(Node):
         )
 
         self.fix_type = int(self.get_parameter("fix_type").value)
-        self.satellites = int(self.get_parameter("satellites").value)
+        self.satellites = clamp_int(
+            int(self.get_parameter("satellites").value), 0, 254
+        )
         self.gps_id = int(self.get_parameter("gps_id").value)
         self.validate_dual_gps_selection = bool(
             self.get_parameter("validate_dual_gps_selection").value
@@ -1082,7 +1085,7 @@ class VioPx4GpsBridge(Node):
             clamp_int(ve * 100.0, -32768, 32767),
             clamp_int(vd * 100.0, -32768, 32767),
             int(cog),
-            clamp_int(self.satellites, 0, 255),
+            clamp_int(self.satellites, 0, 254),
         )
         if self._hil_gps_extensions_supported is not False:
             try:
