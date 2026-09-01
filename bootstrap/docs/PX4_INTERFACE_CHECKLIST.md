@@ -94,7 +94,8 @@ firmware because message handling and estimator requirements can change.
   the guarded PX4 inertial displacement.
 - [ ] Verify stale, non-finite, timestamp-regressed, excessive-gap, over-speed,
   over-acceleration, over-yaw-rate, and over-duration PX4 data discards the
-  propagated displacement and recovers the new VIO segment from the frozen pose.
+  propagated displacement, freezes position, and keeps HIL_GPS stopped because
+  heading is no longer independently verified.
 - [ ] Require consecutive VIO/PX4 velocity agreement before accepting a
   successful propagated handoff.
 - [ ] Require consecutive unique PX4 attitude samples where post-reset VIO yaw
@@ -102,6 +103,10 @@ firmware because message handling and estimator requirements can change.
   origin of the recovered VIO epoch.
 - [ ] Verify a yaw disagreement resets the recovery window without allowing
   rejected samples to contribute to the next agreement window.
+- [ ] Verify small out-of-order PX4 motion packets are dropped and counted,
+  while regressions beyond `inertial_reorder_tolerance_s` reject propagation.
+- [ ] Verify rejected PX4 propagation freezes position but never bypasses
+  heading validation or automatically resumes HIL_GPS.
 - [ ] Resume with EPH no tighter than PX4's horizontal uncertainty, then tighten
   gradually to the configured 0.1 m VIO accuracy.
 - [ ] After re-anchoring, keep GPS stopped for

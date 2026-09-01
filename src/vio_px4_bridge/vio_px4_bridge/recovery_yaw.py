@@ -8,6 +8,19 @@ import math
 from vio_px4_bridge.geo_utils import wrap_pi
 
 
+def timestamp_order(dt_s: float, reorder_tolerance_s: float) -> str:
+    """Classify time movement as forward, harmless reorder, or reset."""
+    dt_s = float(dt_s)
+    tolerance = max(0.0, float(reorder_tolerance_s))
+    if not math.isfinite(dt_s):
+        return "regressed"
+    if dt_s > 0.0:
+        return "forward"
+    if dt_s >= -tolerance:
+        return "reordered"
+    return "regressed"
+
+
 @dataclass(frozen=True)
 class RecoveryYawResult:
     agreed: bool

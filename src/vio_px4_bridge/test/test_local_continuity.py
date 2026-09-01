@@ -76,6 +76,23 @@ def test_yaw_jump_preserves_position_and_heading():
     assert all(math.isclose(a, b) for a, b in zip(jumped.position, before.position))
 
 
+def test_yaw_jump_cannot_recover_without_independent_heading_delta():
+    tracker = LocalPoseContinuity(
+        max_yaw_rate_rad_s=math.radians(10),
+        confirmation_samples=2,
+        recovery_samples=2,
+    )
+    update(tracker, 0.0, yaw=math.radians(90), t=1.0)
+    assert update(tracker, 0.0, yaw=math.radians(-40), t=2.0).recovering
+    assert update(tracker, 0.0, yaw=math.radians(-40), t=3.0).recovering
+    # Stable post-reset samples alone are insufficient. Recovery remains held
+    # until the bridge supplies an independently validated yaw delta/target.
+    for timestamp in (4.0, 5.0, 6.0):
+        result = update(tracker, 0.0, yaw=math.radians(-40), t=timestamp)
+        assert result.recovering
+        assert math.isclose(result.yaw, math.radians(90), abs_tol=1e-9)
+
+
 def test_recovered_epoch_yaw_is_anchored_to_trusted_yaw_plus_px4_delta():
     tracker = LocalPoseContinuity(
         max_yaw_rate_rad_s=math.radians(10),

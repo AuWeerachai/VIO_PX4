@@ -1,6 +1,7 @@
 import math
 
 from vio_px4_bridge.recovery_yaw import RecoveryYawAgreement
+from vio_px4_bridge.recovery_yaw import timestamp_order
 
 
 def deg(value):
@@ -47,3 +48,10 @@ def test_wrapped_yaw_changes_agree_across_pi_boundary():
     result = gate.update(deg(-179), deg(12), 2.0)
     assert result.agreed
     assert math.isclose(result.residual_rad, 0.0, abs_tol=1e-9)
+
+
+def test_small_timestamp_reorder_is_dropped_but_large_regression_is_fatal():
+    assert timestamp_order(0.01, 0.05) == "forward"
+    assert timestamp_order(0.0, 0.05) == "reordered"
+    assert timestamp_order(-0.037, 0.05) == "reordered"
+    assert timestamp_order(-0.051, 0.05) == "regressed"

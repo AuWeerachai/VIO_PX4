@@ -164,15 +164,18 @@ position variance and estimator reset counter as safety gates. `ATTITUDE` suppli
 only the short-term yaw change. The bridge uses a difference between two PX4
 local positions, never PX4's absolute/global position, and stops using PX4
 motion as soon as VIO GPS resumes. This avoids a closed position feedback loop.
-If any PX4 propagation guard fails, its displacement is discarded and the new
-VIO segment continues from the original frozen pose. Default
+If any PX4 propagation guard fails, its displacement is discarded and position
+remains frozen. Heading validation fails closed, so HIL_GPS remains stopped
+until the operator restarts/re-aligns the pipeline. Default
 fallback gates are configurable with `continuity_max_gap_s`,
 `continuity_confirmation_samples`, `continuity_recovery_samples`,
 `continuity_max_speed_m_s`, `continuity_max_acceleration_m_s2`, and
 `continuity_max_yaw_rate_deg_s`, `inertial_max_duration_s`,
 `inertial_max_message_age_s`, `inertial_max_message_gap_s`,
+`inertial_reorder_tolerance_s`,
 `inertial_max_position_uncertainty_m`, `recovery_velocity_agreement_m_s`,
-`recovery_velocity_agreement_samples`, and `recovery_accuracy_tighten_s`.
+`recovery_velocity_agreement_samples`, `recovery_yaw_agreement_deg`,
+`recovery_yaw_agreement_samples`, and `recovery_accuracy_tighten_s`.
 Allowed position and heading change are
 derived from those rate limits and the measured interval between messages, so
 the behavior remains consistent when odometry frequency changes. The explicit cuVSLAM tracking/reset signal
