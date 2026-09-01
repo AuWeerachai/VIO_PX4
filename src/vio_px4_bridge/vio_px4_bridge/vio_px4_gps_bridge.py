@@ -467,7 +467,18 @@ class VioPx4GpsBridge(Node):
 
     def _init_transport(self):
         if self.transport == "mavlink":
+            # ODOMETRY is MAVLink message 331 and therefore requires MAVLink 2.
+            # pymavlink otherwise defaults to its v1 dialect on this Jetson.
+            os.environ["MAVLINK20"] = "1"
             from pymavlink import mavutil
+            mavutil.set_dialect("ardupilotmega")
+            odometry_message_id = getattr(
+                mavutil.mavlink, "MAVLINK_MSG_ID_ODOMETRY", 331
+            )
+            if str(mavutil.mavlink.WIRE_PROTOCOL_VERSION) != "2.0":
+                raise RuntimeError(
+                    "Path A recovery requires MAVLink 2 for PX4 ODOMETRY (message 331)"
+                )
 
             # The CLI stores serial links as /dev/ttyTHS1:921600 for a compact,
             # human-readable setting. pymavlink expects the device and baud as
@@ -561,7 +572,7 @@ class VioPx4GpsBridge(Node):
                 heartbeat, mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE, 20.0
             )
             self._request_mavlink_stream(
-                heartbeat, mavutil.mavlink.MAVLINK_MSG_ID_ODOMETRY, 20.0
+                heartbeat, odometry_message_id, 20.0
             )
             self.get_logger().info(
                 "Requested ATTITUDE and ODOMETRY at 20 Hz for guarded GPS-silent "
