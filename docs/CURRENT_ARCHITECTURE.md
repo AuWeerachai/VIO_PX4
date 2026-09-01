@@ -44,6 +44,12 @@ source timeout, physical-GNSS selection, dead reckoning, and configured
 failsafes. Short relocalizations are absorbed locally without a global jump.
 The operator can change all continuity thresholds from `vio-launch`; saved
 values are passed explicitly to the bridge at every Path A launch.
+
+The bridge also compares its independently aligned stereo-VIO body heading
+against PX4's fused yaw. PX4 yaw is monitor-only and is never fed back into the
+VIO transform. A sustained configurable disagreement enters heading quarantine,
+stops HIL_GPS, reports the signed error in Status option 3 and through PX4
+STATUSTEXT, and requires a configurable stable agreement window before resuming.
 The bridge converts speed and yaw-rate limits into allowed pose changes using
 the measured timestamp interval between each pair of odometry messages. A
 confirmed coordinate reset increments the internal segment counter. While

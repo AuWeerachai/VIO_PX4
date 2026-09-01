@@ -75,6 +75,9 @@ class Config:
     mag_declination_source: str = "table"
     mag_declination_deg: float = 0.0
     child_to_body_yaw_deg: float = 0.0
+    heading_disagreement_limit_deg: float = 20.0
+    heading_disagreement_confirmation_samples: int = 5
+    heading_disagreement_recovery_samples: int = 20
     # drone_link -> camera_link extrinsic in ROS FLU coordinates.
     camera_x_m: float = 0.0
     camera_y_m: float = 0.0
@@ -159,6 +162,9 @@ def save_config(cfg: Config) -> None:
         "mag_declination_source": cfg.mag_declination_source,
         "mag_declination_deg": cfg.mag_declination_deg,
         "child_to_body_yaw_deg": cfg.child_to_body_yaw_deg,
+        "heading_disagreement_limit_deg": cfg.heading_disagreement_limit_deg,
+        "heading_disagreement_confirmation_samples": cfg.heading_disagreement_confirmation_samples,
+        "heading_disagreement_recovery_samples": cfg.heading_disagreement_recovery_samples,
         "camera_x_m": cfg.camera_x_m,
         "camera_y_m": cfg.camera_y_m,
         "camera_z_m": cfg.camera_z_m,
@@ -245,6 +251,9 @@ def apply_dict(cfg: Config, data: dict) -> Config:
         "mag_declination_source",
         "mag_declination_deg",
         "child_to_body_yaw_deg",
+        "heading_disagreement_limit_deg",
+        "heading_disagreement_confirmation_samples",
+        "heading_disagreement_recovery_samples",
         "camera_x_m",
         "camera_y_m",
         "camera_z_m",
@@ -1242,6 +1251,9 @@ def cmd_gps(cfg: Config) -> None:
         "mag_declination_source": cfg.mag_declination_source,
         "mag_declination_deg": cfg.mag_declination_deg,
         "child_to_body_yaw_deg": cfg.child_to_body_yaw_deg,
+        "heading_disagreement_limit_deg": cfg.heading_disagreement_limit_deg,
+        "heading_disagreement_confirmation_samples": cfg.heading_disagreement_confirmation_samples,
+        "heading_disagreement_recovery_samples": cfg.heading_disagreement_recovery_samples,
         "expected_child_frame": "drone_link",
         "continuity_max_gap_s": cfg.gate_max_gap_s,
         "continuity_recovery_samples": cfg.gate_recovery_samples,
@@ -1333,6 +1345,22 @@ def show_navigation_status(cfg: Config) -> None:
     print(f"- Connection status: {connection}")
     print(f"- VIO status: {vio_status}")
     print(f"- Pose-jump gate status: {gate_status}")
+    heading_error = status.get("heading_disagreement_deg")
+    heading_limit = status.get("heading_disagreement_limit_deg")
+    if heading_error is None:
+        print("- Heading agreement: unavailable")
+    elif status.get("heading_quarantine"):
+        print(
+            "- Heading agreement: QUARANTINED "
+            f"(PX4−VIO={float(heading_error):+.1f}°, "
+            f"limit={float(heading_limit):.1f}°); HIL_GPS stopped"
+        )
+    else:
+        print(
+            "- Heading agreement: healthy "
+            f"(PX4−VIO={float(heading_error):+.1f}°, "
+            f"limit={float(heading_limit):.1f}°)"
+        )
     if status.get("inertial_recovery_active"):
         if status.get("inertial_recovery_safe"):
             print(
@@ -1592,10 +1620,31 @@ def configure_heading(cfg: Config) -> Config:
     manual = str(cfg.manual_heading_deg)
     if source == "manual":
         manual = prompt_line("Body true heading at alignment", manual)
+    disagreement = prompt_line(
+        "PX4/VIO heading disagreement limit deg",
+        str(cfg.heading_disagreement_limit_deg),
+    )
+    confirmation = prompt_line(
+        "Samples to enter heading quarantine",
+        str(cfg.heading_disagreement_confirmation_samples),
+    )
+    recovery = prompt_line(
+        "Stable samples to leave heading quarantine",
+        str(cfg.heading_disagreement_recovery_samples),
+    )
+    if disagreement is None or confirmation is None or recovery is None:
+        return cfg
     try:
         values = tuple(float(x) for x in (declination, mounting, manual))
         if not all(math.isfinite(x) for x in values):
             raise ValueError("angles must be finite")
+        disagreement_value = float(disagreement)
+        confirmation_value = int(confirmation)
+        recovery_value = int(recovery)
+        if not math.isfinite(disagreement_value) or disagreement_value <= 0.0:
+            raise ValueError("heading disagreement limit must be positive")
+        if confirmation_value < 1 or recovery_value < 1:
+            raise ValueError("heading quarantine sample counts must be at least 1")
         cfg = replace(
             cfg,
             heading_source=source,
@@ -1603,6 +1652,9 @@ def configure_heading(cfg: Config) -> Config:
             mag_declination_deg=values[0],
             child_to_body_yaw_deg=values[1],
             manual_heading_deg=values[2],
+            heading_disagreement_limit_deg=disagreement_value,
+            heading_disagreement_confirmation_samples=confirmation_value,
+            heading_disagreement_recovery_samples=recovery_value,
         )
     except (TypeError, ValueError) as exc:
         print(f"Invalid heading configuration: {exc}")

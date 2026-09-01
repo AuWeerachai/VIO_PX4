@@ -76,6 +76,12 @@ firmware because message handling and estimator requirements can change.
 - [ ] Freeze the accepted yaw offset. Never continuously update it from PX4
   fused yaw after injected GPS begins.
 - [ ] Rotate both VIO displacement and world velocity by the same offset.
+- [ ] Compare frozen-alignment VIO global yaw with PX4 fused yaw continuously;
+  never use PX4 yaw to correct the VIO transform.
+- [ ] Verify sustained heading disagreement stops HIL_GPS and is shown in
+  `vio-launch` Status option 3 and PX4/QGC STATUSTEXT.
+- [ ] Require the configured stable heading-agreement sample count before GPS
+  resumes after heading quarantine.
 - [ ] On cuVSLAM reset/relocalization, stop live GPS and require realignment.
 - [ ] A single innovation failure enters quarantine and stops live GPS; it must
   not immediately move the local-to-global origin.

@@ -130,6 +130,9 @@ class VioPx4GpsBridge(Node):
         self.declare_parameter("alignment_max_std_deg", 5.0)
         self.declare_parameter("alignment_max_speed_m_s", 0.25)
         self.declare_parameter("alignment_sensor_max_age_s", 0.5)
+        self.declare_parameter("heading_disagreement_limit_deg", 20.0)
+        self.declare_parameter("heading_disagreement_confirmation_samples", 5)
+        self.declare_parameter("heading_disagreement_recovery_samples", 20)
         self.declare_parameter("continuity_max_gap_s", 1.0)
         self.declare_parameter("continuity_recovery_samples", 10)
         self.declare_parameter("continuity_confirmation_samples", 3)
@@ -276,6 +279,15 @@ class VioPx4GpsBridge(Node):
         self.alignment_sensor_max_age_s = max(
             0.05, float(self.get_parameter("alignment_sensor_max_age_s").value)
         )
+        self.heading_disagreement_limit_rad = math.radians(max(
+            1.0, float(self.get_parameter("heading_disagreement_limit_deg").value)
+        ))
+        self.heading_disagreement_confirmation_samples = max(
+            1, int(self.get_parameter("heading_disagreement_confirmation_samples").value)
+        )
+        self.heading_disagreement_recovery_samples = max(
+            1, int(self.get_parameter("heading_disagreement_recovery_samples").value)
+        )
         self.continuity = LocalPoseContinuity(
             max_gap_s=float(self.get_parameter("continuity_max_gap_s").value),
             recovery_samples=int(self.get_parameter("continuity_recovery_samples").value),
@@ -339,6 +351,10 @@ class VioPx4GpsBridge(Node):
         self.messages_sent = 0
         self.heading_offset_rad = None
         self.heading_samples = []
+        self.heading_disagreement_rad = None
+        self.heading_disagreement_bad_count = 0
+        self.heading_disagreement_good_count = 0
+        self.heading_quarantine = False
         self.latest_attitude = None
         self.latest_mag = None
         self.latest_px4_velocity = None
@@ -437,6 +453,14 @@ class VioPx4GpsBridge(Node):
                 and (now - self.last_px4_heartbeat_time) <= self.heartbeat_timeout_s
             ),
             "heading_aligned": self.heading_offset_rad is not None,
+            "heading_quarantine": self.heading_quarantine,
+            "heading_disagreement_deg": (
+                None if self.heading_disagreement_rad is None else
+                math.degrees(self.heading_disagreement_rad)
+            ),
+            "heading_disagreement_limit_deg": math.degrees(
+                self.heading_disagreement_limit_rad
+            ),
             "pose_gate_quarantine": self.continuity_recovering,
             "inertial_recovery_active": self.inertial_active,
             "inertial_recovery_safe": self.inertial_safe,
@@ -938,6 +962,44 @@ class VioPx4GpsBridge(Node):
         self.inertial_active = False
         self.inertial_safe = False
 
+    def _update_heading_consistency(self, vio_body_yaw_ned: float):
+        """Compare independent VIO-global yaw with PX4 yaw; never feed PX4 yaw back."""
+        if self.heading_offset_rad is None or self.latest_attitude is None:
+            return
+        attitude_arrival, _, _, px4_yaw = self.latest_attitude
+        if time.monotonic() - attitude_arrival > self.alignment_sensor_max_age_s:
+            return
+        vio_global_yaw = wrap_pi(vio_body_yaw_ned + self.heading_offset_rad)
+        disagreement = wrap_pi(px4_yaw - vio_global_yaw)
+        self.heading_disagreement_rad = disagreement
+        bad = abs(disagreement) > self.heading_disagreement_limit_rad
+        if bad:
+            self.heading_disagreement_bad_count += 1
+            self.heading_disagreement_good_count = 0
+            if (not self.heading_quarantine
+                    and self.heading_disagreement_bad_count
+                    >= self.heading_disagreement_confirmation_samples):
+                self.heading_quarantine = True
+                self.get_logger().error(
+                    "VIO_HEADING_QUARANTINE_STARTED "
+                    f"disagreement_deg={math.degrees(disagreement):.2f} "
+                    f"limit_deg={math.degrees(self.heading_disagreement_limit_rad):.2f}"
+                )
+                self._send_status_text("VIO GPS stopped: PX4/VIO heading disagree", 3)
+        else:
+            self.heading_disagreement_bad_count = 0
+            if self.heading_quarantine:
+                self.heading_disagreement_good_count += 1
+                if (self.heading_disagreement_good_count
+                        >= self.heading_disagreement_recovery_samples):
+                    self.heading_quarantine = False
+                    self.heading_disagreement_good_count = 0
+                    self.get_logger().info(
+                        "VIO_HEADING_QUARANTINE_CLEARED "
+                        f"disagreement_deg={math.degrees(disagreement):.2f}"
+                    )
+                    self._send_status_text("VIO GPS: heading agreement restored", 6)
+
     def _recovery_velocity_agrees(self, local_velocity) -> bool:
         """Require recovered VIO motion to agree with PX4 before handoff."""
         if self.inertial_fallback_to_frozen_pose:
@@ -1116,6 +1178,7 @@ class VioPx4GpsBridge(Node):
         # rotation to displacement and world velocity.
         horizontal_speed = math.hypot(vn, ve)
         self._update_heading_alignment(continuity.yaw, horizontal_speed)
+        self._update_heading_consistency(continuity.yaw)
         if self.heading_offset_rad is not None:
             north, east, down = rotate_ned_heading(
                 north, east, down, self.heading_offset_rad
@@ -1414,6 +1477,10 @@ class VioPx4GpsBridge(Node):
             and self.continuity_recovering
         ):
             self._set_live_output_state(False, "continuity_quarantine")
+            return
+
+        if self.phase == Phase.LIVE and self.heading_quarantine:
+            self._set_live_output_state(False, "heading_disagreement")
             return
 
         if (
