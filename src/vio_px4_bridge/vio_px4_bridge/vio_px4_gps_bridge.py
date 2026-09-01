@@ -355,6 +355,7 @@ class VioPx4GpsBridge(Node):
         self.heading_disagreement_bad_count = 0
         self.heading_disagreement_good_count = 0
         self.heading_quarantine = False
+        self.heading_last_attitude_arrival = None
         self.latest_attitude = None
         self.latest_mag = None
         self.latest_px4_velocity = None
@@ -969,6 +970,9 @@ class VioPx4GpsBridge(Node):
         attitude_arrival, _, _, px4_yaw = self.latest_attitude
         if time.monotonic() - attitude_arrival > self.alignment_sensor_max_age_s:
             return
+        if attitude_arrival == self.heading_last_attitude_arrival:
+            return
+        self.heading_last_attitude_arrival = attitude_arrival
         vio_global_yaw = wrap_pi(vio_body_yaw_ned + self.heading_offset_rad)
         disagreement = wrap_pi(px4_yaw - vio_global_yaw)
         self.heading_disagreement_rad = disagreement
