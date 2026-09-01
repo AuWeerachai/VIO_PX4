@@ -76,6 +76,29 @@ def test_yaw_jump_preserves_position_and_heading():
     assert all(math.isclose(a, b) for a, b in zip(jumped.position, before.position))
 
 
+def test_recovered_epoch_yaw_is_anchored_to_trusted_yaw_plus_px4_delta():
+    tracker = LocalPoseContinuity(
+        max_yaw_rate_rad_s=math.radians(10),
+        confirmation_samples=2,
+        recovery_samples=1,
+    )
+    before = update(tracker, 0.0, yaw=math.radians(90), t=1.0)
+    assert update(tracker, 0.0, yaw=math.radians(-40), t=2.0).recovering
+    assert update(tracker, 0.0, yaw=math.radians(-40), t=3.0).recovering
+    recovered = update(
+        tracker,
+        0.0,
+        yaw=math.radians(-35),
+        t=4.0,
+        recovery_displacement=(0.0, 0.0, 0.0),
+        recovery_yaw_delta=math.radians(20),
+    )
+    assert recovered.event == "recovery_completed"
+    assert math.isclose(recovered.yaw, math.radians(110), abs_tol=1e-9)
+    next_sample = update(tracker, 0.0, yaw=math.radians(-30), t=5.0)
+    assert math.isclose(next_sample.yaw, math.radians(115), abs_tol=1e-9)
+
+
 def test_frame_change_reanchors():
     tracker = LocalPoseContinuity(confirmation_samples=2)
     before = update(tracker, 4.0, t=1.0)

@@ -95,6 +95,8 @@ class Config:
     inertial_max_position_uncertainty_m: float = 3.0
     recovery_velocity_agreement_m_s: float = 2.0
     recovery_velocity_agreement_samples: int = 3
+    recovery_yaw_agreement_deg: float = 20.0
+    recovery_yaw_agreement_samples: int = 5
     recovery_accuracy_tighten_s: float = 5.0
     rviz_enabled: bool = False
     state_dir: Path = field(default_factory=lambda: Path.home() / ".local/state/vio-launch")
@@ -177,6 +179,8 @@ def save_config(cfg: Config) -> None:
         "inertial_max_position_uncertainty_m": cfg.inertial_max_position_uncertainty_m,
         "recovery_velocity_agreement_m_s": cfg.recovery_velocity_agreement_m_s,
         "recovery_velocity_agreement_samples": cfg.recovery_velocity_agreement_samples,
+        "recovery_yaw_agreement_deg": cfg.recovery_yaw_agreement_deg,
+        "recovery_yaw_agreement_samples": cfg.recovery_yaw_agreement_samples,
         "recovery_accuracy_tighten_s": cfg.recovery_accuracy_tighten_s,
         "rviz_enabled": cfg.rviz_enabled,
         "vio_px4_dir": str(cfg.vio_px4_dir),
@@ -263,6 +267,8 @@ def apply_dict(cfg: Config, data: dict) -> Config:
         "inertial_max_position_uncertainty_m",
         "recovery_velocity_agreement_m_s",
         "recovery_velocity_agreement_samples",
+        "recovery_yaw_agreement_deg",
+        "recovery_yaw_agreement_samples",
         "recovery_accuracy_tighten_s",
         "rviz_enabled",
     ):
@@ -1255,6 +1261,8 @@ def cmd_gps(cfg: Config) -> None:
         "inertial_max_position_uncertainty_m": cfg.inertial_max_position_uncertainty_m,
         "recovery_velocity_agreement_m_s": cfg.recovery_velocity_agreement_m_s,
         "recovery_velocity_agreement_samples": cfg.recovery_velocity_agreement_samples,
+        "recovery_yaw_agreement_deg": cfg.recovery_yaw_agreement_deg,
+        "recovery_yaw_agreement_samples": cfg.recovery_yaw_agreement_samples,
         "recovery_accuracy_tighten_s": cfg.recovery_accuracy_tighten_s,
         "status_file": str(cfg.state_dir / "navigation-status.json"),
     }
@@ -1346,6 +1354,18 @@ def show_navigation_status(cfg: Config) -> None:
                 "the frozen pose "
                 f"({status.get('inertial_recovery_failure') or 'unknown reason'})"
             )
+        yaw_state = status.get("recovery_yaw_agreement_state", "unknown")
+        yaw_count = int(status.get("recovery_yaw_agreement_count", 0))
+        yaw_residual = status.get("recovery_yaw_residual_deg")
+        residual_text = (
+            "not evaluated" if yaw_residual is None
+            else f"{float(yaw_residual):+.1f} deg"
+        )
+        print(
+            f"- Recovery yaw-change agreement: {yaw_state} "
+            f"({yaw_count}/{cfg.recovery_yaw_agreement_samples}, "
+            f"residual={residual_text})"
+        )
     print(f"- Latency: {latency}")
     remaining = status.get("spoof_remaining_s")
     if remaining is not None:
@@ -1701,6 +1721,10 @@ def configure_pose_gate(cfg: Config) -> Config:
              cfg.recovery_velocity_agreement_m_s, float, 0.0),
             ("velocity_samples", "Consecutive velocity-agreement samples",
              cfg.recovery_velocity_agreement_samples, int, 0),
+            ("yaw_agreement", "Maximum VIO/PX4 yaw-change disagreement deg",
+             cfg.recovery_yaw_agreement_deg, float, 0.0),
+            ("yaw_samples", "Consecutive unique PX4 yaw-agreement samples",
+             cfg.recovery_yaw_agreement_samples, int, 0),
             ("accuracy_tighten", "Seconds to tighten GPS accuracy back to 0.1 m",
              cfg.recovery_accuracy_tighten_s, float, -1.0),
         )),
@@ -1739,6 +1763,8 @@ def configure_pose_gate(cfg: Config) -> Config:
         inertial_max_position_uncertainty_m=float(values["inertial_uncertainty"]),
         recovery_velocity_agreement_m_s=float(values["velocity_agreement"]),
         recovery_velocity_agreement_samples=int(values["velocity_samples"]),
+        recovery_yaw_agreement_deg=float(values["yaw_agreement"]),
+        recovery_yaw_agreement_samples=int(values["yaw_samples"]),
         recovery_accuracy_tighten_s=float(values["accuracy_tighten"]),
     )
     save_config(cfg)

@@ -51,9 +51,14 @@ HIL_GPS is silent, the bridge measures guarded PX4 `ODOMETRY` horizontal
 displacement and yaw change for at most two seconds. PX4 position variance and
 the estimator reset counter are checked before that displacement is accepted.
 The recovered raw VIO segment is aligned to the last trusted pose plus only that
-short-term displacement, after VIO/PX4 velocities agree. Candidate/recovery VIO
-samples never move the trusted anchor. A failed propagation is discarded and
-recovery continues from the frozen pose. On a successful handoff, reported GPS
+short-term displacement. Before handoff, consecutive VIO/PX4 velocities must
+agree and consecutive relative yaw changes must agree. Absolute post-reset VIO
+yaw is intentionally ignored because a new coordinate epoch may start at any
+angle; its stable relative rotation is mapped onto the last trusted yaw plus
+the guarded PX4 yaw change. Duplicate PX4 attitude samples are not counted.
+Candidate/recovery VIO samples never move the trusted anchor. A failed
+propagation is discarded and recovery continues from the frozen pose. On a
+successful handoff, reported GPS
 accuracy starts at PX4's accumulated horizontal uncertainty and tightens back
 to 0.1 m. All numeric limits are configured in
 `vio-launch`.

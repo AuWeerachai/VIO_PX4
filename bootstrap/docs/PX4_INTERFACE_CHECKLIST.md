@@ -97,6 +97,11 @@ firmware because message handling and estimator requirements can change.
   propagated displacement and recovers the new VIO segment from the frozen pose.
 - [ ] Require consecutive VIO/PX4 velocity agreement before accepting a
   successful propagated handoff.
+- [ ] Require consecutive unique PX4 attitude samples where post-reset VIO yaw
+  change agrees with PX4 yaw change. Never compare the arbitrary absolute yaw
+  origin of the recovered VIO epoch.
+- [ ] Verify a yaw disagreement resets the recovery window without allowing
+  rejected samples to contribute to the next agreement window.
 - [ ] Resume with EPH no tighter than PX4's horizontal uncertainty, then tighten
   gradually to the configured 0.1 m VIO accuracy.
 - [ ] After re-anchoring, keep GPS stopped for
