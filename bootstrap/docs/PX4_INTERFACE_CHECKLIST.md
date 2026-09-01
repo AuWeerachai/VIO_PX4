@@ -35,7 +35,7 @@ firmware because message handling and estimator requirements can change.
   Altitude remains on the configured height source, velocity is not fused, and
   heading remains on the compass.
 - [ ] Send at 10 Hz without long gaps. PX4 timestamps receipt locally.
-- [ ] `fix_type=3`, synthetic satellites=254 (255 means unknown), speed accuracy
+- [ ] `fix_type=3`, synthetic satellites=40, speed accuracy
   below `EKF2_REQ_SACC`, and EPH/EPV below their configured gates.
 - [ ] Set `EKF2_GPS_P_NOISE=0.1 m` to match the bridge's healthy horizontal
   EPH. Do not claim RTK fix types to influence source selection.

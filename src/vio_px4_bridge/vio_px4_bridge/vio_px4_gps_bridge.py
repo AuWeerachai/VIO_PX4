@@ -95,8 +95,8 @@ class VioPx4GpsBridge(Node):
         self.declare_parameter("horizontal_only_output", True)
 
         self.declare_parameter("fix_type", 3)
-        # 254 is the largest numeric MAVLink count; 255 means "unknown".
-        self.declare_parameter("satellites", 254)
+        # Strong but realistic open-sky multi-constellation receiver count.
+        self.declare_parameter("satellites", 40)
         # Keep the injected receiver distinct from the physical Here GNSS
         # (GPS1 / instance 0). HIL_GPS.id is carried into PX4's GPS device id.
         self.declare_parameter("gps_id", 1)

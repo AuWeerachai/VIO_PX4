@@ -1204,7 +1204,7 @@ def cmd_gps(cfg: Config) -> None:
         "boot_accuracy_m": 0.1,
         "cruise_eph_m": 0.1,
         # Maximum numeric MAVLink value; 255 is reserved for "unknown".
-        "satellites": 254,
+        "satellites": 40,
         "horizontal_only_output": "true",
         "gps_id": 1,
         "validate_dual_gps_selection": "true",
