@@ -58,6 +58,19 @@ the new segment is aligned with the last accepted pose. GPS remains paused for
 the configured additional recovery samples. The default maximum yaw rate is
 `360 deg/s`.
 
+If only the PX4 displacement duration budget expires, recovery freezes the
+last trusted position while continuing guarded PX4 yaw tracking. Stable VIO
+and velocity/yaw agreement are still required. Stale telemetry, estimator
+resets or other propagation failures keep GPS stopped; restart only after
+checking the vehicle state and origin. The duration setting already in the CLI
+controls this behavior.
+
+Freezing cannot account for movement during the outage. Recovery therefore
+retains a conservative global uncertainty floor (maximum configured speed
+times outage duration), rather than automatically claiming 0.1 m accuracy.
+PX4 may reject the resulting degraded GPS. A verified origin and new bridge
+session are needed to clear that uncertainty.
+
 ## Selecting an option
 
 Type the number shown next to an option and press `Enter`.

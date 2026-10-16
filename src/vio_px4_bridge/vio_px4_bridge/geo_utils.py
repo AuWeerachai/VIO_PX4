@@ -97,6 +97,26 @@ def wrap_pi(angle_rad: float) -> float:
     return (angle_rad + math.pi) % (2.0 * math.pi) - math.pi
 
 
+def mavlink_velocity_to_ned(frame_id, child_frame_id, quaternion_wxyz, velocity):
+    """Convert ODOMETRY velocity to NED; never infer its frame from position.
+
+    Accept LOCAL_NED (1) or BODY_FRD (12) velocity with LOCAL_NED pose.
+    MAVLink q rotates body FRD into the pose frame and is ordered w,x,y,z.
+    """
+    if frame_id != 1:
+        raise ValueError(f"unsupported pose frame {frame_id}; expected LOCAL_NED")
+    if len(velocity) != 3 or not all(math.isfinite(v) for v in velocity):
+        raise ValueError("nonfinite or malformed PX4 velocity")
+    if child_frame_id == 1:
+        return tuple(velocity)
+    if child_frame_id != 12:
+        raise ValueError(f"unsupported velocity frame {child_frame_id}")
+    if len(quaternion_wxyz) != 4 or not all(math.isfinite(v) for v in quaternion_wxyz):
+        raise ValueError("nonfinite or malformed PX4 orientation")
+    w, x, y, z = quaternion_wxyz
+    return rotate_vector_by_quaternion_xyzw(*velocity, x, y, z, w)
+
+
 def yaw_from_quaternion_xyzw(qx: float, qy: float, qz: float, qw: float) -> float:
     """Return the Z-axis yaw of a body->world quaternion."""
     norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)

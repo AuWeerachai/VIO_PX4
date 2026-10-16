@@ -1345,8 +1345,15 @@ def show_navigation_status(cfg: Config) -> None:
     print(f"- Connection status: {connection}")
     print(f"- VIO status: {vio_status}")
     print(f"- Pose-jump gate status: {gate_status}")
+    if float(status.get("frozen_position_uncertainty_m", 0.0)) > 0:
+        print("- Global position uncertainty: movement was discarded during recovery; "
+              "verify/reset origin before relying on tight GPS accuracy")
     if status.get("inertial_recovery_active"):
-        if status.get("inertial_recovery_safe"):
+        if (status.get("inertial_recovery_safe")
+                and status.get("inertial_fallback_to_frozen_pose")):
+            print("- Recovery: displacement timed out; position frozen; "
+                  "checking fresh PX4 yaw and stable VIO before resuming")
+        elif status.get("inertial_recovery_safe"):
             print(
                 "- Inertial recovery: active and guarded "
                 f"(N={float(status.get('inertial_displacement_n_m', 0.0)):+.2f} m, "

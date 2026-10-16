@@ -85,17 +85,26 @@ firmware because message handling and estimator requirements can change.
   before declaring a new cuVSLAM coordinate epoch.
 - [ ] Verify candidate and recovery VIO samples cannot modify the last trusted
   output anchor.
-- [ ] While HIL_GPS is silent, use only the change in PX4 `ODOMETRY` local
-  position and ATTITUDE yaw; never copy PX4's absolute/global position.
+- [ ] While HIL_GPS is silent, integrate PX4 `ODOMETRY` horizontal velocity
+  and track ATTITUDE yaw change; never copy PX4's absolute/global position.
+- [ ] Validate the separate velocity `child_frame_id`: accept LOCAL_NED,
+  rotate BODY_FRD using the message's wxyz quaternion, reject other frames.
 - [ ] Reject non-autopilot/non-NED odometry, excessive position variance, and
   any estimator reset-counter change.
 - [ ] Verify a stationary disturbance resumes exactly at the trusted anchor.
 - [ ] Verify real motion during quarantine resumes at the trusted anchor plus
   the guarded PX4 inertial displacement.
 - [ ] Verify stale, non-finite, timestamp-regressed, excessive-gap, over-speed,
-  over-acceleration, over-yaw-rate, and over-duration PX4 data discards the
+  over-acceleration and over-yaw-rate PX4 data discards the
   propagated displacement, freezes position, and keeps HIL_GPS stopped because
   heading is no longer independently verified.
+- [ ] Duration expiry alone freezes position but keeps fresh, continuous yaw
+  tracking. Require the existing VIO stability, velocity and relative-yaw
+  agreement windows before resuming. Reset/freshness guards remain active.
+- [ ] Frozen-position recovery loses real movement. Advertise an uncertainty
+  floor based on configured maximum speed times quarantine duration; never
+  tighten it just because relative vision is stable. Verify a new global
+  origin before restarting to clear this floor. PX4 may reject this degraded GPS.
 - [ ] Require consecutive VIO/PX4 velocity agreement before accepting a
   successful propagated handoff.
 - [ ] Require consecutive unique PX4 attitude samples where post-reset VIO yaw
