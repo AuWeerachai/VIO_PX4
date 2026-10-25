@@ -98,6 +98,7 @@ class Config:
     recovery_velocity_agreement_samples: int = 3
     recovery_yaw_agreement_deg: float = 20.0
     recovery_yaw_agreement_samples: int = 5
+    recovery_reset_rotation_budget_deg: float = 2.0
     recovery_accuracy_tighten_s: float = 5.0
     rviz_enabled: bool = False
     state_dir: Path = field(default_factory=lambda: Path.home() / ".local/state/vio-launch")
@@ -183,6 +184,7 @@ def save_config(cfg: Config) -> None:
         "recovery_velocity_agreement_samples": cfg.recovery_velocity_agreement_samples,
         "recovery_yaw_agreement_deg": cfg.recovery_yaw_agreement_deg,
         "recovery_yaw_agreement_samples": cfg.recovery_yaw_agreement_samples,
+        "recovery_reset_rotation_budget_deg": cfg.recovery_reset_rotation_budget_deg,
         "recovery_accuracy_tighten_s": cfg.recovery_accuracy_tighten_s,
         "rviz_enabled": cfg.rviz_enabled,
         "vio_px4_dir": str(cfg.vio_px4_dir),
@@ -272,6 +274,7 @@ def apply_dict(cfg: Config, data: dict) -> Config:
         "recovery_velocity_agreement_samples",
         "recovery_yaw_agreement_deg",
         "recovery_yaw_agreement_samples",
+        "recovery_reset_rotation_budget_deg",
         "recovery_accuracy_tighten_s",
         "rviz_enabled",
     ):
@@ -1355,6 +1358,7 @@ def cmd_gps(cfg: Config) -> None:
         "recovery_velocity_agreement_samples": cfg.recovery_velocity_agreement_samples,
         "recovery_yaw_agreement_deg": cfg.recovery_yaw_agreement_deg,
         "recovery_yaw_agreement_samples": cfg.recovery_yaw_agreement_samples,
+        "recovery_reset_rotation_budget_deg": cfg.recovery_reset_rotation_budget_deg,
         "recovery_accuracy_tighten_s": cfg.recovery_accuracy_tighten_s,
         "status_file": str(cfg.state_dir / "navigation-status.json"),
         "camera_imu_required": "true" if selected_camera_mode(cfg) == "vio" else "false",
@@ -1485,6 +1489,11 @@ def show_navigation_status(cfg: Config) -> None:
             f"({yaw_count}/{cfg.recovery_yaw_agreement_samples}, "
             f"residual={residual_text})"
         )
+        if status.get("recovery_reset_stamp") is not None:
+            error = status.get("reset_rotation_error_deg")
+            measured = "unavailable" if error is None else f"{float(error):.2f} deg"
+            print("- PX4 reset check: rotation not explained by gyro = "
+                  f"{measured} (limit {cfg.recovery_reset_rotation_budget_deg:g} deg)")
         reordered = (
             int(status.get("inertial_reordered_odometry_drops", 0))
             + int(status.get("inertial_reordered_yaw_drops", 0))
@@ -1846,6 +1855,8 @@ def configure_pose_gate(cfg: Config) -> Config:
              cfg.recovery_yaw_agreement_deg, float, 0.0),
             ("yaw_samples", "Consecutive unique PX4 yaw-agreement samples",
              cfg.recovery_yaw_agreement_samples, int, 0),
+            ("reset_rotation", "Maximum accumulated PX4 rotation not explained by gyro, deg",
+             cfg.recovery_reset_rotation_budget_deg, float, 0.0),
             ("accuracy_tighten", "Seconds to tighten GPS accuracy back to 0.1 m",
              cfg.recovery_accuracy_tighten_s, float, -1.0),
         )),
@@ -1887,6 +1898,7 @@ def configure_pose_gate(cfg: Config) -> Config:
         recovery_velocity_agreement_samples=int(values["velocity_samples"]),
         recovery_yaw_agreement_deg=float(values["yaw_agreement"]),
         recovery_yaw_agreement_samples=int(values["yaw_samples"]),
+        recovery_reset_rotation_budget_deg=float(values["reset_rotation"]),
         recovery_accuracy_tighten_s=float(values["accuracy_tighten"]),
     )
     save_config(cfg)

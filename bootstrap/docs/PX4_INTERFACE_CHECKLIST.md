@@ -107,10 +107,28 @@ firmware because message handling and estimator requirements can change.
   before resuming from the frozen position. A new velocity fault restarts its
   agreement window; it cannot contribute to recovery.
 - [ ] Stale/non-finite/regressed/gapped attitude or excessive yaw rate latches
-  heading unsafe. A PX4 estimator reset, untrusted odometry source/frame, or
-  loss of odometry timing/reset-counter continuity blocks recovery too: the
-  available telemetry cannot exclude an intervening yaw reset. Fresh VIO alone
-  cannot repair the missing independent heading reference; do not auto-unlatch.
+  heading unsafe. Untrusted odometry source/frame or loss of odometry timing
+  continuity also blocks recovery. Fresh VIO alone cannot repair a missing
+  independent heading reference; do not auto-unlatch.
+- [ ] Treat ODOMETRY reset-counter changes as aggregate state resets, not proof
+  of yaw resets. Discard translation, retain the original frozen anchor/deadline,
+  and restart both agreement windows. Compare subsequent counters to the last
+  accepted packet (not forever to the pre-loss counter).
+- [ ] Automatic recovery across a counter change requires continuous ODOMETRY
+  quaternion/body-gyro evidence from quarantine entry through the reset, plus
+  fresh post-reset ATTITUDE. Integrate body gyro over each actual sample interval
+  and compare the resulting orientation to the next quaternion. Use all axes
+  so vehicle pitch/roll do not masquerade as yaw resets.
+- [ ] Bound the SUM of unexplained rotation across the whole quarantine using
+  CLI `recovery_reset_rotation_budget_deg` (initial engineering limit 2 degrees,
+  not a PX4-derived or flight-validated value). Candidate restarts and subsequent
+  PX4 resets must not renew this budget. Missing evidence, excessive discrepancy,
+  or broken timing still blocks. This is bounded consistency evidence, not a
+  definitive reset-type decoder or proof of absolute heading accuracy.
+- [ ] Bench-test stationary and moving resets, both telemetry arrival orders,
+  and long visual loss. A counter change with unchanged attitude must recover
+  only after full fresh windows; a 3-degree unsupported yaw jump must still block
+  even when it is below the configured physical yaw-rate limit.
 - [ ] Verify the reported case: position uncertainty 3.109 m with a 3 m limit
   freezes translation while heading remains tracked. A stable stationary VIO
   epoch passes all windows and resumes at the frozen anchor, not at its jump.

@@ -47,6 +47,7 @@ from vio_px4_bridge.geo_utils import yaw_from_quaternion_xyzw
 from vio_px4_bridge.local_continuity import LocalPoseContinuity
 from vio_px4_bridge.recovery_yaw import RecoveryYawAgreement
 from vio_px4_bridge.recovery_yaw import timestamp_order
+from vio_px4_bridge.reset_heading import ResetHeadingEvidence
 from vio_px4_bridge.mag_declination import default_table_path
 from vio_px4_bridge.mag_declination import lookup_declination_deg
 from vio_px4_bridge.spoof_readiness import SpoofReadiness
@@ -152,6 +153,7 @@ class VioPx4GpsBridge(Node):
         self.declare_parameter("recovery_velocity_agreement_samples", 3)
         self.declare_parameter("recovery_yaw_agreement_deg", 20.0)
         self.declare_parameter("recovery_yaw_agreement_samples", 5)
+        self.declare_parameter("recovery_reset_rotation_budget_deg", 2.0)
         self.declare_parameter("recovery_accuracy_tighten_s", 5.0)
 
         self.odom_topic = str(self.get_parameter("odom_topic").value)
@@ -334,6 +336,12 @@ class VioPx4GpsBridge(Node):
             math.radians(self.recovery_yaw_agreement_deg),
             self.recovery_yaw_agreement_samples,
         )
+        self.recovery_reset_rotation_budget_deg = float(
+            self.get_parameter("recovery_reset_rotation_budget_deg").value
+        )
+        if (not math.isfinite(self.recovery_reset_rotation_budget_deg)
+                or self.recovery_reset_rotation_budget_deg <= 0):
+            raise ValueError("recovery_reset_rotation_budget_deg must be finite and positive")
         self.recovery_accuracy_tighten_s = max(
             0.0, float(self.get_parameter("recovery_accuracy_tighten_s").value)
         )
@@ -367,6 +375,10 @@ class VioPx4GpsBridge(Node):
         self.latest_px4_velocity = None
         self.latest_px4_yaw = None
         self.latest_px4_odometry = None
+        self.latest_px4_rotation_evidence = None
+        self.reset_heading_evidence = None
+        self.recovery_reset_stamp = None
+        self.recovery_reset_reported_stamp = None
         self.inertial_active = False
         self.inertial_position_safe = False
         self.inertial_heading_safe = False
@@ -490,6 +502,11 @@ class VioPx4GpsBridge(Node):
             "recovery_position_safe": self.inertial_position_safe,
             "recovery_heading_safe": self.inertial_heading_safe,
             "recovery_heading_failure": self.inertial_heading_failure,
+            "recovery_reset_stamp": self.recovery_reset_stamp,
+            "reset_rotation_error_deg": (
+                None if self.reset_heading_evidence is None else
+                math.degrees(self.reset_heading_evidence.error_sum)
+            ),
             "inertial_fallback_to_frozen_pose": self.inertial_fallback_to_frozen_pose,
             "inertial_recovery_failure": self.inertial_failure_reason,
             "frozen_position_uncertainty_m": self.frozen_position_uncertainty_m,
@@ -803,8 +820,7 @@ class VioPx4GpsBridge(Node):
         self._send_status_text("VIO GPS stopped: recovery heading unverified", 3)
 
     def _fail_inertial_propagation(self, reason: str):
-        # Unknown estimator resets / missing reset-counter continuity can
-        # affect both frames. These remain blocking, unlike position-only loss.
+        # Missing/untrusted telemetry cannot establish frame continuity.
         self._reject_position_propagation(reason)
         self._reject_heading_recovery(reason)
 
@@ -819,6 +835,17 @@ class VioPx4GpsBridge(Node):
         self.inertial_heading_safe = True
         self.inertial_failure_reason = None
         self.inertial_heading_failure = None
+        self.recovery_reset_stamp = None
+        self.recovery_reset_reported_stamp = None
+        self.reset_heading_evidence = ResetHeadingEvidence(
+            math.radians(self.recovery_reset_rotation_budget_deg),
+            self.inertial_max_message_gap_s, self.inertial_reorder_tolerance_s,
+        )
+        if (self.latest_px4_rotation_evidence is None
+                or now - self.latest_px4_rotation_evidence[0] > self.inertial_max_message_age_s):
+            self.reset_heading_evidence.reject("rotation_baseline_unavailable")
+        else:
+            self.reset_heading_evidence.observe(self.latest_px4_rotation_evidence)
         self.inertial_start_time = now
         self.inertial_displacement_ned = [0.0, 0.0, 0.0]
         self.inertial_integrated_duration_s = 0.0
@@ -916,12 +943,21 @@ class VioPx4GpsBridge(Node):
                 f"limit_s={self.inertial_max_message_gap_s:.3f}"
             )
             return
-        if reset_counter != self.inertial_start_odometry[8]:
-            self.recovery_velocity_agreement_count = 0
-            self._fail_inertial_propagation(
-                f"px4_estimator_reset old={self.inertial_start_odometry[8]} "
-                f"new={reset_counter}"
+        if reset_counter != previous[8]:
+            # Aggregate counter: position/velocity/attitude share it. Discard
+            # translation and start NEW agreement windows, but do not assume
+            # lost yaw when synchronized quaternion/gyro evidence spans reset.
+            self._reject_position_propagation(
+                f"px4_estimator_reset old={previous[8]} new={reset_counter}")
+            self.recovery_reset_stamp = odom_time
+            self._reset_recovery_agreement()
+            self.get_logger().warn(
+                f"VIO_RECOVERY_PX4_RESET old={previous[8]} new={reset_counter}; "
+                "position=frozen; checking rotation evidence and fresh agreement windows"
             )
+            self._reset_heading_ready()
+            # This packet becomes the velocity baseline, not an agreement
+            # sample. Keep the original quarantine anchor and timeout.
             return
         uncertainty = math.sqrt(max(0.0, var_n, var_e))
         if uncertainty > self.inertial_max_position_uncertainty_m:
@@ -1003,6 +1039,44 @@ class VioPx4GpsBridge(Node):
         self.inertial_yaw_delta = wrap_pi(self.inertial_yaw_delta + delta)
         self.inertial_last_yaw = sample
 
+    def _observe_reset_heading(self, sample):
+        if not self.inertial_active:
+            self.latest_px4_rotation_evidence = sample
+            return
+        if self.reset_heading_evidence.observe(sample):
+            self.latest_px4_rotation_evidence = sample
+        if self.recovery_reset_stamp is not None:
+            self._reset_heading_ready()
+
+    def _reset_heading_ready(self):
+        """No automatic reset recovery without evidence across the reset."""
+        if self.recovery_reset_stamp is None:
+            return True
+        evidence = self.reset_heading_evidence
+        now = time.monotonic()
+        if evidence is None or evidence.failure is not None:
+            self._reject_heading_recovery(
+                "px4_reset_rotation_unverified: "
+                + ("no_evidence" if evidence is None else evidence.failure))
+            return False
+        if not evidence.verifies(self.recovery_reset_stamp, now, self.inertial_max_message_age_s):
+            if evidence.last is None or now-evidence.last[0] > self.inertial_max_message_age_s:
+                self._reject_heading_recovery("px4_reset_rotation_evidence_stale")
+            return False
+        # ATTITUDE and ODOMETRY arrive separately. Do not authorize recovery
+        # using an ATTITUDE sample from before the reset was observed.
+        ready = (self.latest_px4_yaw is not None
+                 and self.latest_px4_yaw[1] >= self.recovery_reset_stamp)
+        if ready and self.recovery_reset_reported_stamp != self.recovery_reset_stamp:
+            self.recovery_reset_reported_stamp = self.recovery_reset_stamp
+            self.get_logger().info(
+                "VIO_RECOVERY_RESET_ROTATION_VERIFIED "
+                f"unexplained_deg={math.degrees(evidence.error_sum):.3f} "
+                f"limit_deg={self.recovery_reset_rotation_budget_deg:.3f}; "
+                "waiting for fresh VIO stability/velocity/yaw windows"
+            )
+        return ready
+
     def _inertial_recovery_target(self):
         if not self.inertial_active:
             return None
@@ -1020,6 +1094,8 @@ class VioPx4GpsBridge(Node):
                 or now - self.latest_px4_yaw[0] > self.inertial_max_message_age_s):
             self._reject_heading_recovery("attitude_message_stale")
         if not self.inertial_heading_safe:
+            return None
+        if not self._reset_heading_ready():
             return None
         if not self.inertial_position_safe:
             return (0.0, 0.0, 0.0), self.inertial_yaw_delta
@@ -1595,6 +1671,10 @@ class VioPx4GpsBridge(Node):
                             "invalid_px4_odometry_source_frame_or_covariance"
                         )
                 else:
+                    self._observe_reset_heading(
+                        (now, sample_time, tuple(float(v) for v in msg.q),
+                         (float(msg.rollspeed), float(msg.pitchspeed), float(msg.yawspeed)))
+                    )
                     self._update_px4_odometry(
                         (now, sample_time, north, east, vn, ve,
                          var_n, var_e, reset_counter)

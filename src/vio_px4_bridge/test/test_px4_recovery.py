@@ -13,6 +13,7 @@ from vio_px4_bridge.geo_utils import (
 )
 from vio_px4_bridge.recovery_yaw import RecoveryYawAgreement, timestamp_order
 from vio_px4_bridge.local_continuity import LocalPoseContinuity
+from vio_px4_bridge.reset_heading import ResetHeadingEvidence
 
 
 def test_velocity_frame_is_independent_of_position_frame():
@@ -44,6 +45,8 @@ def bridge():
              '_update_px4_odometry', '_fail_inertial_propagation',
              '_reject_position_propagation', '_reject_heading_recovery',
              '_validated_recovery_target', '_reset_recovery_agreement',
+             '_observe_reset_heading', '_reset_heading_ready',
+             '_poll_mavlink',
              '_recovery_velocity_agrees', '_tick', '_odom_callback',
              '_recovery_yaw_agrees', '_finish_inertial_propagation', '_select_accuracy'}
     module = ast.Module(body=[n for n in cls.body if getattr(n, 'name', '') in names],
@@ -55,6 +58,8 @@ def bridge():
               Odometry=SimpleNamespace, enu_offset_to_ned=enu_offset_to_ned,
               yaw_from_quaternion_xyzw=yaw_from_quaternion_xyzw,
               ned_offset_to_lla=ned_offset_to_lla,
+              ResetHeadingEvidence=ResetHeadingEvidence,
+              mavlink_velocity_to_ned=mavlink_velocity_to_ned,
               Phase=SimpleNamespace(SPOOF='spoof', LIVE='live', ALIGNING='aligning', WAITING='waiting'))
     exec(compile(module, str(source), 'exec'), ns)
     obj = type('RecoveryHarness', (), {name: ns[name] for name in names})()
@@ -63,6 +68,11 @@ def bridge():
     obj.clock = clock
     obj.inertial_active = obj.inertial_position_safe = obj.inertial_heading_safe = True
     obj.inertial_heading_failure = None
+    obj.recovery_reset_rotation_budget_deg = 2.
+    obj.recovery_reset_stamp = None
+    obj.recovery_reset_reported_stamp = None
+    obj.latest_px4_rotation_evidence = None
+    obj.reset_heading_evidence = None
     obj.inertial_reordered_odometry_drops = obj.inertial_reordered_yaw_drops = 0
     obj.inertial_fallback_to_frozen_pose = False
     obj.inertial_failure_reason = None
@@ -93,6 +103,9 @@ def bridge():
     obj.phase = 'live'
     obj.frozen_position_uncertainty_m = 0.0
     obj._poll_mavlink = Mock()
+    obj.poll_real = type(obj)._poll_mavlink.__get__(obj)
+    obj.transport = 'mavlink'
+    obj.px4_target_sysid = 1
     obj._maybe_end_spoof_by_timer = Mock()
     obj._set_live_output_state = Mock()
     obj._publish_fix = Mock()
@@ -175,7 +188,7 @@ def test_reset_counter_after_timeout_still_blocks(bridge):
     bridge._inertial_recovery_target()
     bridge._update_px4_odometry((10.1, 10.1, 0, 0, 0, 0, 0.1, 0.1, 1))
     assert not bridge.inertial_heading_safe
-    assert 'px4_estimator_reset' in bridge.inertial_heading_failure
+    assert 'px4_reset_rotation_unverified' in bridge.inertial_heading_failure
 
 
 def test_yaw_jump_after_timeout_still_blocks(bridge):
@@ -248,7 +261,7 @@ def test_uncertainty_failure_does_not_hide_later_reset(bridge):
     assert bridge.inertial_heading_safe
     feed_px4(bridge, 10.10, variance=3.109 ** 2, reset=1)
     assert not bridge.inertial_heading_safe
-    assert 'px4_estimator_reset' in bridge.inertial_heading_failure
+    assert 'px4_reset_rotation_unverified' in bridge.inertial_heading_failure
     assert 'position_uncertainty' in bridge.inertial_failure_reason
 
 
@@ -383,3 +396,81 @@ def test_real_motion_uses_propagated_target_when_position_remains_safe(bridge):
     assert bridge.inertial_position_safe
     assert bridge.continuity.last_output_position[0] == pytest.approx(.5*(t-10.05))
     assert bridge.frozen_position_uncertainty_m == 0.
+
+
+def telemetry(bridge, t, counter, yaw=0., gyro_z=0., attitude_first=True):
+    """Feed actual MAVLink dispatch with synchronized ODOMETRY q/body gyro."""
+    bridge.clock.now = t
+    odom = SimpleNamespace(
+        get_type=lambda: 'ODOMETRY', get_srcSystem=lambda: 1,
+        time_usec=round(t*1e6), frame_id=1, child_frame_id=1, estimator_type=8,
+        x=0., y=0., vx=0., vy=0., vz=0., q=(math.cos(yaw/2), 0., 0., math.sin(yaw/2)),
+        rollspeed=0., pitchspeed=0., yawspeed=gyro_z,
+        pose_covariance=[.1]*21, reset_counter=counter)
+    attitude = SimpleNamespace(
+        get_type=lambda: 'ATTITUDE', get_srcSystem=lambda: 1,
+        time_boot_ms=round(t*1000), roll=0., pitch=0., yaw=yaw)
+    queue = [attitude, odom, None] if attitude_first else [odom, attitude, None]
+    bridge._mav = SimpleNamespace(recv_match=Mock(side_effect=queue))
+    bridge.poll_real()
+
+
+@pytest.mark.parametrize('heading_reset', [False, True])
+def test_45_second_loss_and_aggregate_resets_through_actual_dispatch(bridge, heading_reset):
+    bridge.continuity = LocalPoseContinuity(confirmation_samples=3, recovery_samples=3)
+    bridge.inertial_active = False
+    bridge.continuity_recovering = False
+    telemetry(bridge, 10., 9)
+    bridge._odom_callback(vio_message(10., 0.))
+    original = dict(bridge.latest_fix)
+    telemetry(bridge, 10.05, 9)
+    bridge._odom_callback(vio_message(10.05, 100., yaw=2.))
+    anchor = bridge.continuity.recovery_anchor_position
+    start = bridge.inertial_start_time
+    # No camera samples during the loss. PX4 position resets twice. The second
+    # condition inserts a small yaw reset below the old physical-rate gate:
+    # 3deg / .05s = 60deg/s, plausible as motion but not supported by zero gyro.
+    for i in range(2, 902):
+        t = 10. + i*.05
+        counter = 9 if i < 200 else (11 if i < 600 else 12)
+        yaw = math.radians(3) if heading_reset and i >= 200 else 0.
+        telemetry(bridge, t, counter, yaw, attitude_first=i % 2 == 0)
+        bridge._tick()
+        bridge._publish_fix.assert_not_called()
+        assert bridge.continuity.recovery_anchor_position == anchor
+        assert bridge.inertial_start_time == start
+    assert not bridge.inertial_position_safe
+    assert bridge.inertial_heading_safe != heading_reset
+    for i in range(902, 932):
+        t = 10. + i*.05
+        telemetry(bridge, t, 12, math.radians(3) if heading_reset else 0.)
+        bridge._odom_callback(vio_message(t, 100., yaw=2.))
+        bridge._tick()
+        if not bridge.continuity_recovering:
+            break
+        bridge._publish_fix.assert_not_called()
+    if heading_reset:
+        assert bridge.continuity_recovering
+        assert 'rotation_unverified' in bridge.inertial_heading_failure
+    else:
+        assert not bridge.continuity_recovering
+        bridge._publish_fix.assert_called_once()
+        assert bridge.latest_fix['lat'] == original['lat']
+        assert bridge.latest_fix['lon'] == original['lon']
+        assert bridge.latest_fix['eph'] >= 450.  # uncertainty not hidden
+        assert bridge.recovery_velocity_agreement_count >= 2
+        assert bridge.recovery_yaw_agreement.good_samples >= 2
+
+
+def test_counter_wrap_restarts_velocity_window_but_not_propagation(bridge):
+    bridge.inertial_active = False
+    telemetry(bridge, 10., 255)
+    bridge._start_inertial_propagation()
+    telemetry(bridge, 10.05, 0)
+    assert bridge.inertial_heading_safe
+    assert not bridge.inertial_position_safe
+    assert not bridge.recovery_velocity_sample_valid
+    assert bridge.recovery_velocity_agreement_count == 0
+    telemetry(bridge, 10.1, 0)
+    assert bridge.recovery_velocity_sample_valid
+    assert bridge.inertial_start_time == 10.
