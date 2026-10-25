@@ -31,7 +31,7 @@ class RecoveryYawResult:
 
 
 class RecoveryYawAgreement:
-    """Compare relative VIO yaw with independent PX4 yaw propagation.
+    """Compare relative VIO yaw change with the trusted FCU heading change.
 
     Absolute yaw is intentionally ignored: a new VIO epoch may start at any
     numerical angle.  The first paired sample establishes a baseline, and only

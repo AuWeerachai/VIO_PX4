@@ -1,4 +1,7 @@
-"""Bounded evidence for heading continuity across an aggregate EKF reset.
+"""Legacy rotation-evidence experiment; NOT used by the active GPS bridge.
+
+The active recovery policy trusts current FCU heading after fresh agreement
+windows. This helper is retained for comparison, not as a recovery gate.
 
 ODOMETRY's counter does not identify the state that reset. Compare its attitude
 with body-gyro rotation at the same sample timestamps, including tilt. This is

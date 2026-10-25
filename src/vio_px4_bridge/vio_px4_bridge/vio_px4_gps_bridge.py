@@ -47,7 +47,6 @@ from vio_px4_bridge.geo_utils import yaw_from_quaternion_xyzw
 from vio_px4_bridge.local_continuity import LocalPoseContinuity
 from vio_px4_bridge.recovery_yaw import RecoveryYawAgreement
 from vio_px4_bridge.recovery_yaw import timestamp_order
-from vio_px4_bridge.reset_heading import ResetHeadingEvidence
 from vio_px4_bridge.mag_declination import default_table_path
 from vio_px4_bridge.mag_declination import lookup_declination_deg
 from vio_px4_bridge.spoof_readiness import SpoofReadiness
@@ -153,6 +152,7 @@ class VioPx4GpsBridge(Node):
         self.declare_parameter("recovery_velocity_agreement_samples", 3)
         self.declare_parameter("recovery_yaw_agreement_deg", 20.0)
         self.declare_parameter("recovery_yaw_agreement_samples", 5)
+        # Accepted for old launch/config compatibility; no longer a recovery gate.
         self.declare_parameter("recovery_reset_rotation_budget_deg", 2.0)
         self.declare_parameter("recovery_accuracy_tighten_s", 5.0)
 
@@ -336,12 +336,6 @@ class VioPx4GpsBridge(Node):
             math.radians(self.recovery_yaw_agreement_deg),
             self.recovery_yaw_agreement_samples,
         )
-        self.recovery_reset_rotation_budget_deg = float(
-            self.get_parameter("recovery_reset_rotation_budget_deg").value
-        )
-        if (not math.isfinite(self.recovery_reset_rotation_budget_deg)
-                or self.recovery_reset_rotation_budget_deg <= 0):
-            raise ValueError("recovery_reset_rotation_budget_deg must be finite and positive")
         self.recovery_accuracy_tighten_s = max(
             0.0, float(self.get_parameter("recovery_accuracy_tighten_s").value)
         )
@@ -375,10 +369,7 @@ class VioPx4GpsBridge(Node):
         self.latest_px4_velocity = None
         self.latest_px4_yaw = None
         self.latest_px4_odometry = None
-        self.latest_px4_rotation_evidence = None
-        self.reset_heading_evidence = None
         self.recovery_reset_stamp = None
-        self.recovery_reset_reported_stamp = None
         self.inertial_active = False
         self.inertial_position_safe = False
         self.inertial_heading_safe = False
@@ -503,10 +494,7 @@ class VioPx4GpsBridge(Node):
             "recovery_heading_safe": self.inertial_heading_safe,
             "recovery_heading_failure": self.inertial_heading_failure,
             "recovery_reset_stamp": self.recovery_reset_stamp,
-            "reset_rotation_error_deg": (
-                None if self.reset_heading_evidence is None else
-                math.degrees(self.reset_heading_evidence.error_sum)
-            ),
+            "recovery_heading_reference": "current_fcu_heading",
             "inertial_fallback_to_frozen_pose": self.inertial_fallback_to_frozen_pose,
             "inertial_recovery_failure": self.inertial_failure_reason,
             "frozen_position_uncertainty_m": self.frozen_position_uncertainty_m,
@@ -793,7 +781,7 @@ class VioPx4GpsBridge(Node):
             self._send_status_text(text, 3)
 
     def _reject_position_propagation(self, reason: str):
-        """Discard translation only; do not erase independently tracked yaw."""
+        """Discard translation only; current FCU heading can still be used."""
         if self.inertial_failure_reason is not None:
             return
         self.inertial_position_safe = False
@@ -802,31 +790,32 @@ class VioPx4GpsBridge(Node):
         self.inertial_displacement_ned = [0.0, 0.0, 0.0]
         self.get_logger().error(
             f"VIO_RECOVERY_POSITION_FROZEN reason={reason}; propagated movement "
-            "discarded; independent heading and VIO checks still required"
+            "discarded; fresh FCU heading and camera agreement still required"
         )
         self._send_status_text("VIO recovery: position frozen; checking heading", 4)
 
     def _reject_heading_recovery(self, reason: str):
-        """Loss of yaw continuity cannot be repaired by a position fallback."""
-        if self.inertial_heading_failure is not None:
-            return
+        """Pause recovery until fresh valid FCU heading is available again."""
+        changed = self.inertial_heading_failure != reason
         self.inertial_heading_safe = False
         self.inertial_heading_failure = reason
-        self.recovery_yaw_agreement.reset()
-        self.recovery_yaw_agreement_state = "blocked_heading_unverified"
-        self.get_logger().error(
-            f"VIO_RECOVERY_HEADING_REJECTED reason={reason}; HIL_GPS stays stopped"
-        )
-        self._send_status_text("VIO GPS stopped: recovery heading unverified", 3)
+        self._reset_recovery_agreement()
+        if changed:
+            self.get_logger().warn(
+                f"VIO_RECOVERY_HEADING_WAIT reason={reason}; waiting for fresh FCU heading"
+            )
+            self._send_status_text("VIO recovery: waiting for FCU heading", 4)
 
     def _fail_inertial_propagation(self, reason: str):
-        # Missing/untrusted telemetry cannot establish frame continuity.
+        # Position propagation remains rejected for this quarantine. Fresh
+        # telemetry may rebuild recovery agreement, without restoring movement.
         self._reject_position_propagation(reason)
-        self._reject_heading_recovery(reason)
+        self.recovery_velocity_sample_valid = False
+        self._reset_recovery_agreement()
 
     def _start_inertial_propagation(self):
         # Another candidate can fail during the same quarantine. Keep the
-        # original motion reference, deadline, and any latched safety failure.
+        # original position reference, deadline, and latched position failure.
         if self.inertial_active:
             return
         now = time.monotonic()
@@ -836,16 +825,6 @@ class VioPx4GpsBridge(Node):
         self.inertial_failure_reason = None
         self.inertial_heading_failure = None
         self.recovery_reset_stamp = None
-        self.recovery_reset_reported_stamp = None
-        self.reset_heading_evidence = ResetHeadingEvidence(
-            math.radians(self.recovery_reset_rotation_budget_deg),
-            self.inertial_max_message_gap_s, self.inertial_reorder_tolerance_s,
-        )
-        if (self.latest_px4_rotation_evidence is None
-                or now - self.latest_px4_rotation_evidence[0] > self.inertial_max_message_age_s):
-            self.reset_heading_evidence.reject("rotation_baseline_unavailable")
-        else:
-            self.reset_heading_evidence.observe(self.latest_px4_rotation_evidence)
         self.inertial_start_time = now
         self.inertial_displacement_ned = [0.0, 0.0, 0.0]
         self.inertial_integrated_duration_s = 0.0
@@ -881,23 +860,19 @@ class VioPx4GpsBridge(Node):
             self.latest_px4_velocity = (now, odom_time + age, vn, ve)
             if math.sqrt(max(var_n, var_e)) > self.inertial_max_position_uncertainty_m:
                 self._reject_position_propagation("position_uncertainty_at_quarantine")
-        if self.latest_px4_yaw is None:
-            self._reject_heading_recovery("attitude_unavailable_at_quarantine")
-        elif now - self.latest_px4_yaw[0] > self.inertial_max_message_age_s:
-            self._reject_heading_recovery("attitude_stale_at_quarantine")
-        else:
-            yaw_arrival, yaw_boot, yaw = self.latest_px4_yaw
-            self.inertial_last_yaw = (
-                now, yaw_boot + (now - yaw_arrival), yaw
-            )
+        # Do not extrapolate the timestamp without extrapolating orientation:
+        # doing so shortens the next dt and can manufacture a high yaw rate.
+        self.inertial_last_yaw = self.latest_px4_yaw
+        self._refresh_recovery_heading()
         self.get_logger().warn(
             "VIO_INERTIAL_RECOVERY_STARTED source=PX4_ODOMETRY_position+variance+"
-            "reset_counter+ATTITUDE_yaw gps_output=silent"
+            "reset_counter heading_reference=current_FCU_ATTITUDE gps_output=silent"
         )
 
     def _update_px4_odometry(self, sample):
         """Track PX4 EKF displacement while synthetic GPS output is silent."""
         if not all(math.isfinite(value) for value in sample) or min(sample[6:8]) < 0:
+            self.latest_px4_odometry = None
             self.recovery_velocity_sample_valid = False
             self.recovery_velocity_agreement_count = 0
             if self.inertial_active:
@@ -921,6 +896,11 @@ class VioPx4GpsBridge(Node):
                 self._fail_inertial_propagation(
                     f"odometry_timestamp_regression dt_s={dt:.6f}"
                 )
+                # Establish a new clock baseline; do not remain stuck comparing
+                # every later packet against a timestamp from before a reboot.
+                self.inertial_last_odometry = sample
+                self.latest_px4_odometry = None
+                self.recovery_reset_stamp = odom_time
                 return
         self.latest_px4_odometry = sample
         self.latest_px4_velocity = (sample[0], odom_time, vn, ve)
@@ -944,18 +924,17 @@ class VioPx4GpsBridge(Node):
             )
             return
         if reset_counter != previous[8]:
-            # Aggregate counter: position/velocity/attitude share it. Discard
-            # translation and start NEW agreement windows, but do not assume
-            # lost yaw when synchronized quaternion/gyro evidence spans reset.
+            # Keep the original position anchor/deadline. Current FCU heading
+            # is authoritative; require new post-reset agreement windows.
             self._reject_position_propagation(
                 f"px4_estimator_reset old={previous[8]} new={reset_counter}")
             self.recovery_reset_stamp = odom_time
             self._reset_recovery_agreement()
             self.get_logger().warn(
                 f"VIO_RECOVERY_PX4_RESET old={previous[8]} new={reset_counter}; "
-                "position=frozen; checking rotation evidence and fresh agreement windows"
+                "position=frozen; using current FCU heading with fresh agreement windows"
             )
-            self._reset_heading_ready()
+            self._refresh_recovery_heading()
             # This packet becomes the velocity baseline, not an agreement
             # sample. Keep the original quarantine anchor and timeout.
             return
@@ -993,7 +972,9 @@ class VioPx4GpsBridge(Node):
         self.inertial_last_odometry = sample
 
     def _integrate_px4_yaw(self, sample):
+        """Receive absolute FCU yaw (legacy method name, no yaw integration)."""
         if not all(math.isfinite(value) for value in sample):
+            self.latest_px4_yaw = None
             if self.inertial_active:
                 self._reject_heading_recovery("invalid_px4_attitude_sample")
             return
@@ -1009,73 +990,63 @@ class VioPx4GpsBridge(Node):
                 )
                 return
             if ordering == "regressed":
+                self.latest_px4_yaw = None
+                self.inertial_last_yaw = sample
                 self._reject_heading_recovery(
                     f"yaw_timestamp_regression dt_s={dt:.6f}"
                 )
                 return
+        if self.inertial_active and self.inertial_last_yaw is not None:
+            dt = sample[1] - self.inertial_last_yaw[1]
+            yaw_rate = abs(wrap_pi(sample[2] - self.inertial_last_yaw[2])) / dt
+            if (dt > self.inertial_max_message_gap_s
+                    or yaw_rate > self.continuity.max_yaw_rate_rad_s):
+                # A discontinuity invalidates OLD agreement samples, not the
+                # FCU's new heading. Never latch it unsafe until restart.
+                self._reset_recovery_agreement()
+                self.get_logger().warn(
+                    "VIO_RECOVERY_FCU_HEADING_REBASE "
+                    f"gap_s={dt:.3f} yaw_rate_deg_s={math.degrees(yaw_rate):.3f}; "
+                    "using current FCU heading; restarting agreement windows"
+                )
         self.latest_px4_yaw = sample
-        if not self.inertial_active or not self.inertial_heading_safe:
-            return
-        if self.inertial_last_yaw is None:
-            self.inertial_last_yaw = sample
-            return
-        _, old_t, old_yaw = self.inertial_last_yaw
-        _, new_t, yaw = sample
-        dt = new_t - old_t
-        if dt > self.inertial_max_message_gap_s:
-            self._reject_heading_recovery(
-                f"yaw_message_gap gap_s={dt:.3f} "
-                f"limit_s={self.inertial_max_message_gap_s:.3f}"
-            )
-            return
-        delta = wrap_pi(yaw - old_yaw)
-        yaw_rate = abs(delta) / dt
-        if yaw_rate > self.continuity.max_yaw_rate_rad_s:
-            self._reject_heading_recovery(
-                f"yaw_rate_limit yaw_rate_deg_s={math.degrees(yaw_rate):.3f} "
-                f"limit_deg_s={math.degrees(self.continuity.max_yaw_rate_rad_s):.3f}"
-            )
-            return
-        self.inertial_yaw_delta = wrap_pi(self.inertial_yaw_delta + delta)
         self.inertial_last_yaw = sample
+        if self.inertial_active:
+            self._refresh_recovery_heading()
 
-    def _observe_reset_heading(self, sample):
-        if not self.inertial_active:
-            self.latest_px4_rotation_evidence = sample
-            return
-        if self.reset_heading_evidence.observe(sample):
-            self.latest_px4_rotation_evidence = sample
-        if self.recovery_reset_stamp is not None:
-            self._reset_heading_ready()
+    def _refresh_recovery_heading(self):
+        """Align the recovery target to CURRENT FCU heading, not old yaw deltas.
 
-    def _reset_heading_ready(self):
-        """No automatic reset recovery without evidence across the reset."""
-        if self.recovery_reset_stamp is None:
-            return True
-        evidence = self.reset_heading_evidence
+        Corrected local yaw + fixed heading_offset = earth/NED yaw. Therefore
+        anchor_yaw + recovery_delta + heading_offset must equal FCU yaw.
+        Position remains anchored; changing this delta never rotates the old
+        global path. This deliberately trusts FCU heading, not gyro evidence.
+        """
         now = time.monotonic()
-        if evidence is None or evidence.failure is not None:
-            self._reject_heading_recovery(
-                "px4_reset_rotation_unverified: "
-                + ("no_evidence" if evidence is None else evidence.failure))
+        sample = self.latest_px4_yaw
+        if sample is None or not all(math.isfinite(v) for v in sample):
+            self._reject_heading_recovery("attitude_unavailable")
             return False
-        if not evidence.verifies(self.recovery_reset_stamp, now, self.inertial_max_message_age_s):
-            if evidence.last is None or now-evidence.last[0] > self.inertial_max_message_age_s:
-                self._reject_heading_recovery("px4_reset_rotation_evidence_stale")
+        if not 0.0 <= now - sample[0] <= self.inertial_max_message_age_s:
+            self._reject_heading_recovery("attitude_message_stale")
             return False
-        # ATTITUDE and ODOMETRY arrive separately. Do not authorize recovery
-        # using an ATTITUDE sample from before the reset was observed.
-        ready = (self.latest_px4_yaw is not None
-                 and self.latest_px4_yaw[1] >= self.recovery_reset_stamp)
-        if ready and self.recovery_reset_reported_stamp != self.recovery_reset_stamp:
-            self.recovery_reset_reported_stamp = self.recovery_reset_stamp
+        if self.recovery_reset_stamp is not None and sample[1] < self.recovery_reset_stamp:
+            self._reject_heading_recovery("waiting_for_post_reset_attitude")
+            return False
+        anchor_yaw = self.continuity.recovery_anchor_yaw
+        if (anchor_yaw is None or self.heading_offset_rad is None
+                or not all(math.isfinite(v) for v in (anchor_yaw, self.heading_offset_rad))):
+            self._reject_heading_recovery("heading_alignment_unavailable")
+            return False
+        self.inertial_yaw_delta = wrap_pi(sample[2] - self.heading_offset_rad - anchor_yaw)
+        if not self.inertial_heading_safe:
+            self._reset_recovery_agreement()
             self.get_logger().info(
-                "VIO_RECOVERY_RESET_ROTATION_VERIFIED "
-                f"unexplained_deg={math.degrees(evidence.error_sum):.3f} "
-                f"limit_deg={self.recovery_reset_rotation_budget_deg:.3f}; "
-                "waiting for fresh VIO stability/velocity/yaw windows"
+                "VIO_RECOVERY_FCU_HEADING_AVAILABLE; collecting fresh agreement windows"
             )
-        return ready
+        self.inertial_heading_safe = True
+        self.inertial_heading_failure = None
+        return True
 
     def _inertial_recovery_target(self):
         if not self.inertial_active:
@@ -1083,19 +1054,13 @@ class VioPx4GpsBridge(Node):
         now = time.monotonic()
         elapsed = now - self.inertial_start_time
         if elapsed > self.inertial_max_duration_s and not self.inertial_fallback_to_frozen_pose:
-            # A displacement budget expiring does not invalidate a continuous
-            # attitude stream. Discard translation, but keep validating yaw,
-            # freshness and estimator reset counters before allowing recovery.
+            # A displacement budget expiring does not invalidate current FCU
+            # heading. Discard translation; fresh agreement is still required.
             self._reject_position_propagation(f"duration_limit elapsed_s={elapsed:.3f}")
         if (self.latest_px4_odometry is None
                 or now - self.latest_px4_odometry[0] > self.inertial_max_message_age_s):
             self._fail_inertial_propagation("odometry_message_stale")
-        if (self.latest_px4_yaw is None
-                or now - self.latest_px4_yaw[0] > self.inertial_max_message_age_s):
-            self._reject_heading_recovery("attitude_message_stale")
-        if not self.inertial_heading_safe:
-            return None
-        if not self._reset_heading_ready():
+        if not self._refresh_recovery_heading():
             return None
         if not self.inertial_position_safe:
             return (0.0, 0.0, 0.0), self.inertial_yaw_delta
@@ -1138,7 +1103,7 @@ class VioPx4GpsBridge(Node):
             # on resumption; bound the possible loss using the configured speed.
             resume_eph = max(resume_eph, self.continuity.max_speed_mps * elapsed)
             self.frozen_position_uncertainty_m += self.continuity.max_speed_mps * elapsed
-            source = "frozen_pose_guarded_yaw"
+            source = "frozen_pose_current_fcu_heading"
         self.recovery_resume_eph_m = resume_eph
         self.recovery_resume_time = time.monotonic()
         self.get_logger().info(
@@ -1191,9 +1156,8 @@ class VioPx4GpsBridge(Node):
     def _recovery_yaw_agrees(self, raw_vio_yaw: float) -> bool:
         """Gate reset recovery on VIO/PX4 relative yaw-change agreement."""
         if not self.inertial_heading_safe:
-            # Position can safely remain frozen, but an unavailable independent
-            # yaw delta must never authorize a rotated global trajectory.
-            self.recovery_yaw_agreement_state = "blocked_heading_unverified"
+            # A current heading reference is required even with frozen position.
+            self.recovery_yaw_agreement_state = "waiting_for_fcu_heading"
             return False
         if (self.latest_px4_yaw is None
                 or time.monotonic() - self.latest_px4_yaw[0] > self.inertial_max_message_age_s):
@@ -1238,7 +1202,7 @@ class VioPx4GpsBridge(Node):
         self.recovery_yaw_agreement.reset()
         self.recovery_yaw_agreement_state = (
             "waiting_for_baseline" if self.inertial_heading_safe
-            else "blocked_heading_unverified"
+            else "waiting_for_fcu_heading"
         )
         self.recovery_velocity_agreement_count = 0
         self.recovery_velocity_last_timestamp = None
@@ -1633,11 +1597,12 @@ class VioPx4GpsBridge(Node):
                 roll, pitch, yaw = float(msg.roll), float(msg.pitch), float(msg.yaw)
                 boot_time = float(msg.time_boot_ms) * 1e-3
                 if all(math.isfinite(value) for value in (roll, pitch, yaw, boot_time)):
-                    # PX4 yaw is excluded from initial earth-heading alignment.
-                    # Its delta is used only while HIL_GPS is silent in quarantine.
+                    # Initial earth-heading alignment is unchanged. Recovery
+                    # trusts current PX4 yaw while HIL_GPS is silent.
                     self.latest_attitude = (now, roll, pitch, yaw)
                     self._integrate_px4_yaw((now, boot_time, yaw))
                 elif self.inertial_active:
+                    self.latest_px4_yaw = None
                     self._reject_heading_recovery("invalid_px4_attitude_sample")
                 continue
             if message_type == "ODOMETRY":
@@ -1666,15 +1631,12 @@ class VioPx4GpsBridge(Node):
                 )
                 values = (sample_time, north, east, vn, ve, var_n, var_e)
                 if not valid_source or not all(math.isfinite(value) for value in values):
+                    self.latest_px4_odometry = None
                     if self.inertial_active:
                         self._fail_inertial_propagation(
                             "invalid_px4_odometry_source_frame_or_covariance"
                         )
                 else:
-                    self._observe_reset_heading(
-                        (now, sample_time, tuple(float(v) for v in msg.q),
-                         (float(msg.rollspeed), float(msg.pitchspeed), float(msg.yawspeed)))
-                    )
                     self._update_px4_odometry(
                         (now, sample_time, north, east, vn, ve,
                          var_n, var_e, reset_counter)

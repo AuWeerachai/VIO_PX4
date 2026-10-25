@@ -83,13 +83,14 @@ firmware because message handling and estimator requirements can change.
   even if a sample returns to the old trajectory. No single-sample shortcut
   may resume GPS or accept a jump merely because time has elapsed.
 - [ ] Repeated disturbances within one quarantine must preserve the original
-  PX4 propagation reference, time limit, and latched safety failures.
+  PX4 position propagation reference, time limit, and latched position failures.
 - [ ] Require `continuity_confirmation_samples` internally consistent poses
   before declaring a new cuVSLAM coordinate epoch.
 - [ ] Verify candidate and recovery VIO samples cannot modify the last trusted
   output anchor.
 - [ ] While HIL_GPS is silent, integrate PX4 `ODOMETRY` horizontal velocity
-  and track ATTITUDE yaw change; never copy PX4's absolute/global position.
+  within its guarded time budget, and use current `ATTITUDE` heading for
+  recovery orientation; never copy PX4's absolute/global position.
 - [ ] Validate the separate velocity `child_frame_id`: accept LOCAL_NED,
   rotate BODY_FRD using the message's wxyz quaternion, reject other frames.
 - [ ] Reject non-autopilot/non-NED odometry, excessive position variance, and
@@ -106,29 +107,33 @@ firmware because message handling and estimator requirements can change.
   fresh physically plausible PX4 velocity agreement, and relative-yaw agreement
   before resuming from the frozen position. A new velocity fault restarts its
   agreement window; it cannot contribute to recovery.
-- [ ] Stale/non-finite/regressed/gapped attitude or excessive yaw rate latches
-  heading unsafe. Untrusted odometry source/frame or loss of odometry timing
-  continuity also blocks recovery. Fresh VIO alone cannot repair a missing
-  independent heading reference; do not auto-unlatch.
+- [ ] Recovery trusts **current FCU heading** as its earth-heading reference.
+  This is an explicit operating assumption, not independent proof of accuracy.
+  A wrong FCU heading will rotate the recovered trajectory incorrectly. Initial
+  heading alignment, PX4 magnetometer configuration and normal live output are
+  unchanged; no VIO yaw is sent back to PX4.
+- [ ] Missing/stale/non-finite attitude pauses recovery and clears agreement
+  windows. Fresh valid packets allow NEW windows automatically. A heading jump
+  or message gap restarts the windows, never permanently latches heading unsafe.
+  Out-of-order packets do not count as fresh evidence. Odometry source/frame,
+  freshness and physical velocity checks still gate the final handoff.
 - [ ] Treat ODOMETRY reset-counter changes as aggregate state resets, not proof
   of yaw resets. Discard translation, retain the original frozen anchor/deadline,
   and restart both agreement windows. Compare subsequent counters to the last
   accepted packet (not forever to the pre-loss counter).
-- [ ] Automatic recovery across a counter change requires continuous ODOMETRY
-  quaternion/body-gyro evidence from quarantine entry through the reset, plus
-  fresh post-reset ATTITUDE. Integrate body gyro over each actual sample interval
-  and compare the resulting orientation to the next quaternion. Use all axes
-  so vehicle pitch/roll do not masquerade as yaw resets.
-- [ ] Bound the SUM of unexplained rotation across the whole quarantine using
-  CLI `recovery_reset_rotation_budget_deg` (initial engineering limit 2 degrees,
-  not a PX4-derived or flight-validated value). Candidate restarts and subsequent
-  PX4 resets must not renew this budget. Missing evidence, excessive discrepancy,
-  or broken timing still blocks. This is bounded consistency evidence, not a
-  definitive reset-type decoder or proof of absolute heading accuracy.
+- [ ] After a counter change require fresh post-reset ATTITUDE, but not an
+  unbroken gyro history. The former accumulated-rotation budget is inactive
+  (the old ROS parameter/config key is accepted only for compatibility).
+- [ ] Recovery target yaw is FCU yaw minus the fixed earth-heading offset.
+  The local continuity delta is that target minus the pre-quarantine anchor yaw.
+  This uses current absolute heading, not accumulated pre-reset yaw increments.
+  Rotate the recovered epoch **about the frozen/propagated position anchor**;
+  never rotate the entire old trajectory or change its home reference.
 - [ ] Bench-test stationary and moving resets, both telemetry arrival orders,
-  and long visual loss. A counter change with unchanged attitude must recover
-  only after full fresh windows; a 3-degree unsupported yaw jump must still block
-  even when it is below the configured physical yaw-rate limit.
+  and 30--45 second visual loss. Even after a 422 deg/s FCU heading discontinuity,
+  stable camera samples plus fresh stable FCU telemetry must recover after full
+  windows. Missing FCU telemetry or ongoing camera jumps must still block. Test
+  arbitrary new camera yaw, nonzero earth-heading offsets and +/-180 deg wrap.
 - [ ] Verify the reported case: position uncertainty 3.109 m with a 3 m limit
   freezes translation while heading remains tracked. A stable stationary VIO
   epoch passes all windows and resumes at the frozen anchor, not at its jump.
@@ -139,14 +144,14 @@ firmware because message handling and estimator requirements can change.
 - [ ] Require consecutive VIO/PX4 velocity agreement before accepting a
   successful propagated or frozen handoff. Count unique PX4 odometry timestamps,
   not repeated VIO callbacks using the same telemetry sample. Compare velocity
-  using the final recovery rotation, including guarded yaw motion.
+  using the final recovery rotation aligned to current FCU heading.
 - [ ] Require consecutive unique PX4 attitude samples where post-reset VIO yaw
   change agrees with PX4 yaw change. Never compare the arbitrary absolute yaw
   origin of the recovered VIO epoch.
 - [ ] Verify a yaw disagreement resets the recovery window without allowing
   rejected samples to contribute to the next agreement window.
 - [ ] A new candidate/reconfirmed epoch resets both agreement windows without
-  resetting the propagation timer or clearing latched reference failures.
+  resetting the propagation timer or clearing latched position failures.
 - [ ] Verify small out-of-order PX4 motion packets are dropped and counted,
   while regressions beyond `inertial_reorder_tolerance_s` reject propagation.
 - [ ] Verify rejected PX4 propagation freezes position but never bypasses

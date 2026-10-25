@@ -33,8 +33,9 @@ def test_separate_recovery_status_and_honest_age(tmp_path, capsys, heading_safe)
     assert 'Last accepted VIO sample: 47.88 s ago' in output
     assert 'Latency:' not in output
     if heading_safe:
-        assert 'Heading recovery: tracking' in output
+        assert 'Heading recovery: using current FCU heading' in output
         assert 'restart/re-alignment required' not in output
     else:
-        assert 'Heading recovery: blocked' in output
+        assert 'Heading recovery: waiting for fresh FCU heading' in output
+        assert 'restart/re-alignment required' not in output
         assert 'yaw_message_gap' in output
