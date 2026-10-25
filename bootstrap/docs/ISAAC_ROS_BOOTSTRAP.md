@@ -15,12 +15,15 @@ ROS 2 Humble system.
 | `isaac_ros_common` | `fcf4d9e17f8f0a7f47f1d22d6a18421ce3768c01` |
 | `isaac_ros_visual_slam` | `e31f4cc1d41a329a01946e5fe63669f8b15da677` |
 | Visual-SLAM NGC asset | `3.1.0` (the asset used by the 3.2 documentation) |
-| librealsense source | `v2.55.1` |
+| Base image / VO librealsense | `v2.55.1` (retained for fallback) |
+| Default VIO librealsense overlay | `v2.56.5`, commit `38a41441971387197193ad3aeae3cefe6a11f2cb` |
 | NVIDIA RealSense ROS branch | `release/4.51.1-isaac` |
+| VIO wrapper commit | `c04f43308c00a6f495f14a47cc84cc293047cdff` |
 | Docker image key | `aarch64.ros2_humble.realsense` |
 
 The authoritative machine-readable pins are in
-`bootstrap/jetson-config/isaac_ros_release.env`.
+`bootstrap/jetson-config/isaac_ros_release.env` (base image) and
+`bootstrap/jetson-config/isaac_ros_overrides/scripts/vio_imu_release.env` (VIO overlay).
 
 ## Why the original setup was difficult to reproduce
 
@@ -64,6 +67,12 @@ The bootstrap performs these operations in order:
 5. Applies the captured Docker and cuVSLAM source patches idempotently.
 6. Installs the project-owned body-frame/extrinsic launch scripts.
 7. Builds the VIO/PX4 ROS package and exposes `~/vio-launch`.
+8. Installs IMU timestamp/remapping fixes and staged startup; new setups default to VIO.
+9. On first VIO start, builds the pinned SDK and camera wrapper inside the
+   container, under `${ISAAC_ROS_WS}/.vio-imu/`. This can take 20–40 minutes.
+   Completed builds are cached; later launches do not rebuild them.
+10. Checks actual IMU fusion, incoming IMU, and body odometry before either PX4
+    path proceeds. Missing IMU does not silently fall back to VO.
 
 `bootstrap_jetson.sh` also reconstructs the standalone
 `~/workspaces/mavros` workspace at the pinned commit recorded in
@@ -80,10 +89,21 @@ causes a rebuild.
 
 The captured source patch is retained because the requirement is to reproduce
 the proven machine exactly. For normal operation, VIO_PX4 also passes the
-60 ms jitter threshold explicitly and starts visual-only mode explicitly. This
-makes the operational setting visible at the launch boundary instead of relying
-solely on modified NVIDIA defaults. IMU fusion remains staged until its separate
-bench-validation checklist passes.
+60 ms jitter threshold explicitly and selects **VIO (stereo + IMU)** by default.
+The compatible SDK and wrapper are a private workspace overlay: the Docker image
+and `/usr/local` driver are not replaced. The mounted overlay survives container
+recreation. Its build recipe, not generated binaries, is kept in Git.
+
+The October 2026 bench trial confirmed that SDK 2.55.1 could not deliver motion
+samples with D456 firmware 5.17.0.10, while the isolated SDK 2.56.5 could. The
+newer SDK handles the firmware's newer IMU packet format. IMU delivery and
+stationary tracking passed; this is not flight qualification. The camera's
+missing-IMU-calibration warning still requires attention.
+
+`~/vio-imu-mode vo` selects the original visual-only fallback;
+`~/vio-imu-mode vio` reselects VIO. Fully stop existing sessions before switching.
+Bootstrap preserves an existing explicit VO selection. A running session with
+the wrong fusion mode is rejected.
 
 Do not copy generated `build/`, `install/`, Docker images, the 11 GB asset
 directory, logs, core dumps, swap files, or RViz-generated frame diagrams into

@@ -11,6 +11,15 @@ cd ~/workspaces/VIO_PX4/scripts/vio-launch
 
 ## Main menu
 
+The header shows **Selected camera mode: VIO (stereo + IMU)** by default.
+Both navigation paths verify the actual fusion setting, live IMU, and body
+odometry before proceeding. The first VIO start builds a pinned driver overlay;
+later starts reuse its cache. See `bootstrap/docs/ISAAC_ROS_BOOTSTRAP.md`.
+
+For fallback, run `~/vio-imu-mode vo`, fully stop the existing camera session,
+then restart. Reselect VIO with `~/vio-imu-mode vio`. Changing the saved mode
+does not modify an already-running session; a mismatched session is rejected.
+
 | Item | What it does |
 |------|----------------|
 | **Path A — GPS spoof → live** | Internship-style global GPS (`HIL_GPS`) |

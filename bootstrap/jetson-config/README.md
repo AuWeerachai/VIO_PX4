@@ -41,9 +41,11 @@ Both large runtime workspaces remain standalone siblings:
 The full bootstrap creates and builds the first two; generated build trees and
 Docker images are intentionally not nested in this repository or committed.
 
-The default launch is the proven visual-only cuVSLAM configuration. The staged
-RealSense IMU design is documented in `bootstrap/docs/STAGED_IMU_IMPLEMENTATION.md` and
-must not become the default until it passes the documented bench tests.
+The default launch is VIO (stereo + RealSense IMU), using a pinned, cached SDK
+2.56.5 overlay built inside the container. The base-image VO driver is retained.
+See `bootstrap/docs/STAGED_IMU_IMPLEMENTATION.md` for the verified startup
+sequence and remaining walking/flight validation. Use `~/vio-imu-mode vo` and
+restart for the visual-only fallback.
 
 The exact NVIDIA/JetPack pins, original manual layers, and clean-room rebuild
 sequence are documented in `bootstrap/docs/ISAAC_ROS_BOOTSTRAP.md`.

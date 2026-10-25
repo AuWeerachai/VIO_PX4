@@ -1045,6 +1045,21 @@ def stop_visible_isaac_sessions() -> None:
     # RViz attaches to the existing container; stop it first. Stopping the VIO
     # session then ends the owning docker-run shell and removes the container.
     stop_rviz_session()
+    if tmux_session_exists(ISAAC_TMUX_VIO) and isaac_container_running():
+        # Let ROS release its shared-memory ports before run_dev's auto-removed
+        # container is torn down. Killing the terminal first can strand them.
+        subprocess.run(["tmux", "send-keys", "-t", ISAAC_TMUX_VIO, "C-c"],
+                       check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.monotonic() + 12.0
+        while time.monotonic() < deadline:
+            result = subprocess.run(
+                ["docker", "exec", ISAAC_CONTAINER, "pgrep", "-f",
+                 "[s]cripts/start_vio.sh|[r]clcpp_components/component_container_mt"],
+                capture_output=True, timeout=3,
+            )
+            if result.returncode != 0:
+                break
+            time.sleep(0.25)
     for session in (ISAAC_TMUX_VIO, *LEGACY_ISAAC_TMUX_SESSIONS):
         subprocess.run(["tmux", "kill-session", "-t", session], check=False,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1096,7 +1111,37 @@ def start_rviz_session(cfg: Config) -> None:
     )
 
 
+def selected_camera_mode(cfg: Config) -> str:
+    path = cfg.isaac_ros_dir / "src/isaac_ros_common/scripts/vio_imu_mode"
+    mode = path.read_text().strip().lower() if path.exists() else "vio"
+    if mode not in ("vio", "vo"):
+        raise RuntimeError(f"Invalid camera mode in {path}: {mode!r}")
+    return mode
+
+
+def camera_mode_label(cfg: Config) -> str:
+    mode = selected_camera_mode(cfg)
+    return "VIO (stereo + IMU)" if mode == "vio" else "VO (stereo only)"
+
+
+def require_camera_ready(cfg: Config) -> None:
+    mode = selected_camera_mode(cfg)
+    command = (
+        "source /opt/ros/humble/setup.bash && "
+        "python3 ${ISAAC_ROS_WS}/src/isaac_ros_common/scripts/check_camera_ready.py "
+        f"{mode} --timeout 12"
+    )
+    result = subprocess.run(
+        ["docker", "exec", "-u", "admin", ISAAC_CONTAINER, "bash", "-lc", command],
+        capture_output=True, text=True, timeout=20,
+    )
+    if result.returncode:
+        raise RuntimeError(result.stdout.strip() or result.stderr.strip() or "Camera readiness check failed")
+    print(f"- {result.stdout.strip()}")
+
+
 def cmd_vio(cfg: Config) -> None:
+    print(f"- Selected camera mode: {camera_mode_label(cfg)}")
     if not shutil.which("tmux") or not shutil.which("gnome-terminal"):
         raise RuntimeError("tmux and gnome-terminal are required for visible Isaac sessions")
     raw_topic = "/visual_slam/tracking/odometry"
@@ -1109,6 +1154,7 @@ def cmd_vio(cfg: Config) -> None:
         except RuntimeError:
             print("Existing Isaac VIO session is not healthy; restarting it...", flush=True)
         else:
+            require_camera_ready(cfg)
             print("- Existing cuVSLAM body odometry is healthy; reusing Terminal 1.")
             if cfg.rviz_enabled and not tmux_session_exists(ISAAC_TMUX_RVIZ):
                 start_rviz_session(cfg)
@@ -1120,7 +1166,7 @@ def cmd_vio(cfg: Config) -> None:
             return
     print("- Opening Terminal 1: Isaac ROS VIO (run_dev.sh → start_vio.sh)...")
     start_visible_isaac_session(cfg, ISAAC_TMUX_VIO, "Isaac ROS VIO")
-    deadline = time.monotonic() + 600.0
+    deadline = time.monotonic() + 2700.0
     while not isaac_container_running():
         recent = tmux_recent_output(ISAAC_TMUX_VIO)
         if (
@@ -1134,7 +1180,7 @@ def cmd_vio(cfg: Config) -> None:
             )
         if time.monotonic() >= deadline:
             stop_visible_isaac_sessions()
-            raise RuntimeError("Isaac container did not start within 10 minutes")
+            raise RuntimeError("Isaac container did not start within 45 minutes")
         time.sleep(1.0)
     # The keystrokes remain queued until run_dev.sh presents the admin shell.
     time.sleep(2.0)
@@ -1149,6 +1195,7 @@ def cmd_vio(cfg: Config) -> None:
         "source ${ISAAC_ROS_WS}/install/setup.bash; fi && "
         "echo \"=== Using: $(ros2 pkg prefix isaac_ros_visual_slam) ===\" && "
         "cd ${ISAAC_ROS_WS}/src/isaac_ros_common && "
+        f"VIO_MODE={selected_camera_mode(cfg)} "
         f"CAMERA_X_M={cfg.camera_x_m:.17g} "
         f"CAMERA_Y_M={cfg.camera_y_m:.17g} "
         f"CAMERA_Z_M={cfg.camera_z_m:.17g} "
@@ -1158,8 +1205,9 @@ def cmd_vio(cfg: Config) -> None:
         "./scripts/start_vio.sh",
     )
     print("- Terminal 1 is rebuilding changed VSLAM files, then starting cuVSLAM...")
+    print("- First VIO start may build the cached IMU driver overlay; subsequent starts reuse it.")
     try:
-        odom_deadline = time.monotonic() + 600.0
+        odom_deadline = time.monotonic() + 2700.0
         while True:
             try:
                 require_ros_message(
@@ -1173,6 +1221,8 @@ def cmd_vio(cfg: Config) -> None:
                     "process has finished cleanly" in recent
                     or "process has died" in recent
                     or "user interrupted with ctrl-c" in recent
+                    or "VIO setup failed" in recent
+                    or "VIO IMU FAILED" in recent
                 )
                 if launch_stopped or not tmux_session_exists(ISAAC_TMUX_VIO):
                     raise RuntimeError(
@@ -1181,17 +1231,29 @@ def cmd_vio(cfg: Config) -> None:
                     ) from exc
                 if time.monotonic() >= odom_deadline:
                     raise RuntimeError(
-                        f"No body odometry arrived on {raw_topic} within 10 minutes"
+                        f"No body odometry arrived on {raw_topic} within 45 minutes"
                     ) from exc
+        require_camera_ready(cfg)
         if cfg.rviz_enabled:
             start_rviz_session(cfg)
             print("- RViz is running.")
         else:
             print("- RViz auto-launch is OFF; continuing without RViz.")
         print("- cuVSLAM is publishing vehicle-body odometry directly (drone_link).")
-    except Exception:
+    except Exception as exc:
+        # Capture evidence before closing the auto-removed container/terminal.
+        recent = tmux_recent_output(ISAAC_TMUX_VIO, lines=200)
+        log_note = ""
+        try:
+            cfg.log_dir.mkdir(parents=True, exist_ok=True)
+            failure_log = cfg.log_dir / "camera-startup-failure.log"
+            failure_log.write_text(recent, encoding="utf-8")
+            log_note = f"\nCamera startup log: {failure_log}"
+        except OSError:
+            pass  # Do not hide the actual startup error if storage is full.
         stop_visible_isaac_sessions()
-        raise
+        tail = "\n".join(recent.splitlines()[-30:])
+        raise RuntimeError(f"{exc}{log_note}\nRecent camera output:\n{tail}") from exc
     print("- cuVSLAM body odometry ready.")
 
 
@@ -1915,7 +1977,8 @@ def interactive_main(cfg: Config) -> int:
                 MenuItem("Leave CLI (keep processes running)", "detach"),
                 MenuItem("Stop all processes (including Isaac container)", "stop-all"),
             ],
-            subtitle=f"Hardware: Jetson + Cube · link={cfg.mavlink_url}",
+            subtitle=(f"Hardware: Jetson + Cube · link={cfg.mavlink_url}\n"
+                      f"Selected camera mode: {camera_mode_label(cfg)}"),
         )
 
         if choice is None:
