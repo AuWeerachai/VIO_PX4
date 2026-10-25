@@ -1112,11 +1112,8 @@ def start_rviz_session(cfg: Config) -> None:
 
 
 def selected_camera_mode(cfg: Config) -> str:
-    path = cfg.isaac_ros_dir / "src/isaac_ros_common/scripts/vio_imu_mode"
-    mode = path.read_text().strip().lower() if path.exists() else "vio"
-    if mode not in ("vio", "vo"):
-        raise RuntimeError(f"Invalid camera mode in {path}: {mode!r}")
-    return mode
+    # Restored VO baseline: ignore stale IMU opt-in files from the experiment.
+    return "vo"
 
 
 def camera_mode_label(cfg: Config) -> str:
@@ -1212,7 +1209,6 @@ def cmd_vio(cfg: Config, defer_health: bool = False) -> None:
         "./scripts/start_vio.sh",
     )
     print("- Terminal 1 is rebuilding changed VSLAM files, then starting cuVSLAM...")
-    print("- First VIO start may build the cached IMU driver overlay; subsequent starts reuse it.")
     try:
         odom_deadline = time.monotonic() + 2700.0
         while True:

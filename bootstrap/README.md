@@ -55,11 +55,12 @@ logs, bags, credentials, and Docker images are intentionally not stored in Git.
 
 ## Operator launcher
 
-VIO (stereo + RealSense IMU) is now the default. The bootstrap installs the
-IMU source fixes and a reproducible SDK 2.56.5/NVIDIA camera-wrapper overlay
-builder. The first VIO start builds it inside the container; subsequent starts
-reuse the mounted cache. It does not replace the original VO driver or flash
-camera firmware. Use `~/vio-imu-mode vo` and a full camera restart for fallback.
+Stereo-only VO is restored as the camera baseline. The launcher explicitly
+disables IMU fusion and uses the base-image RealSense driver, without building
+or loading the experimental SDK/wrapper overlay. Body-frame extrinsics and the
+latest bridge quarantine/recovery fixes remain enabled. Existing IMU tools and
+cached builds are retained but inactive; no firmware is flashed or downgraded.
+Fully stop the camera session and reopen the CLI before starting this version.
 
 Run the repository-root entry point; its implementation is versioned under
 `scripts/vio-launch/`:

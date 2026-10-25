@@ -11,17 +11,20 @@ cd ~/workspaces/VIO_PX4/scripts/vio-launch
 
 ## Main menu
 
-The header shows **Selected camera mode: VIO (stereo + IMU)** by default.
-Path A checks recent IMU/body odometry during its 15-second stationary spoof,
+The header shows **Selected camera mode: VO (stereo only)**.
+The camera path is restored to the pre-IMU baseline (`50a159b`): fusion is
+explicitly disabled and the base-image RealSense driver is used. No experimental
+IMU overlay is built or sourced. Current extrinsics and the newer bridge
+quarantine/recovery fixes remain in use.
+
+Path A checks recent body odometry during its 15-second stationary spoof,
 along with fusion mode, heading alignment and pose-gate health. Startup glitches
 can recover; failed validation stops GPS and then cuVSLAM/RViz. Keep the drone
 stationary until live handoff. Path B keeps its pre-launch readiness check.
-The first VIO start builds a pinned driver overlay;
-later starts reuse its cache. See `bootstrap/docs/ISAAC_ROS_BOOTSTRAP.md`.
-
-For fallback, run `~/vio-imu-mode vo`, fully stop the existing camera session,
-then restart. Reselect VIO with `~/vio-imu-mode vio`. Changing the saved mode
-does not modify an already-running session; a mismatched session is rejected.
+Fully stop the old camera session and reopen the CLI before restarting.
+Old IMU selection files do not re-enable fusion; a mismatched running session
+or a shell with the experimental IMU overlay still sourced is rejected.
+The archived IMU tools/cache are not needed for VO and are not deleted.
 
 | Item | What it does |
 |------|----------------|

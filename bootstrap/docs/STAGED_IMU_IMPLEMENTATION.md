@@ -1,7 +1,10 @@
-# RealSense IMU / default VIO startup
+# RealSense IMU experiment (inactive)
 
-Implemented and stationary-bench tested on 2026-10-21. VIO is the default;
-VO remains an explicit fallback. This does not certify flight performance.
+Current status (2026-10-25): restored stereo-only VO after reported stationary
+cuVSLAM jumps with IMU enabled. The root cause is not proven. The active launcher
+does not build/source this overlay or enable IMU fusion. Extrinsics and bridge
+quarantine/recovery fixes remain enabled. The following records the historical
+IMU implementation and bench checks, not the current launch sequence.
 
 ## Reproducible sequence
 

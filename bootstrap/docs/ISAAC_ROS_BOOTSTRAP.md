@@ -67,13 +67,12 @@ The bootstrap performs these operations in order:
 5. Applies the captured Docker and cuVSLAM source patches idempotently.
 6. Installs the project-owned body-frame/extrinsic launch scripts.
 7. Builds the VIO/PX4 ROS package and exposes `~/vio-launch`.
-8. Installs IMU timestamp/remapping fixes and staged startup; new setups default to VIO.
-9. On first VIO start, builds the pinned SDK and camera wrapper inside the
-   container, under `${ISAAC_ROS_WS}/.vio-imu/`. This can take 20–40 minutes.
-   Completed builds are cached; later launches do not rebuild them.
-10. Checks actual IMU fusion, incoming IMU, and body odometry before live VIO
+8. Installs the stereo-only VO launcher using the base-image camera driver.
+   IMU fusion is explicitly disabled; no experimental IMU overlay is built or loaded.
+9. Preserves configurable body-to-camera extrinsics and bridge recovery checks.
+10. Checks that IMU fusion is disabled and body odometry is healthy before live GPS
     output. Path A performs validation during its stationary spoof; Path B
-    checks before starting. Missing IMU does not silently fall back to VO.
+    checks before starting. An existing IMU-enabled session must be fully stopped.
 
 `bootstrap_jetson.sh` also reconstructs the standalone
 `~/workspaces/mavros` workspace at the pinned commit recorded in
@@ -90,8 +89,8 @@ causes a rebuild.
 
 The captured source patch is retained because the requirement is to reproduce
 the proven machine exactly. For normal operation, VIO_PX4 also passes the
-60 ms jitter threshold explicitly and selects **VIO (stereo + IMU)** by default.
-The compatible SDK and wrapper are a private workspace overlay: the Docker image
+60 ms jitter threshold explicitly and selects **VO (stereo only)**.
+The inactive experimental SDK and wrapper are a private workspace overlay: the Docker image
 and `/usr/local` driver are not replaced. The mounted overlay survives container
 recreation. Its build recipe, not generated binaries, is kept in Git.
 
@@ -101,10 +100,10 @@ newer SDK handles the firmware's newer IMU packet format. IMU delivery and
 stationary tracking passed; this is not flight qualification. The camera's
 missing-IMU-calibration warning still requires attention.
 
-`~/vio-imu-mode vo` selects the original visual-only fallback;
-`~/vio-imu-mode vio` reselects VIO. Fully stop existing sessions before switching.
-Bootstrap preserves an existing explicit VO selection. A running session with
-the wrong fusion mode is rejected.
+The current launcher ignores old IMU mode-selection files and always uses VO.
+The compatibility helper `~/vio-imu-mode` reports VO and refuses to enable IMU.
+Fully stop existing sessions before launching the restored baseline. A running
+session with the wrong fusion mode or a sourced IMU overlay is rejected.
 
 Do not copy generated `build/`, `install/`, Docker images, the 11 GB asset
 directory, logs, core dumps, swap files, or RViz-generated frame diagrams into

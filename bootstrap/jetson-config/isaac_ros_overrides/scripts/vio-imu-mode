@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Select next-launch camera mode without restarting running processes."""
+"""Compatibility helper for the restored stereo-only camera baseline."""
 import argparse
 import json
 import os
@@ -8,6 +8,8 @@ from pathlib import Path
 parser = argparse.ArgumentParser()
 parser.add_argument('mode', nargs='?', choices=['vio', 'vo'])
 args = parser.parse_args()
+if args.mode == 'vio':
+    parser.error('IMU mode is disabled in this VO baseline; no setting changed.')
 config = Path.home()/'.config/vio-launch/config.json'
 saved = json.loads(config.read_text()) if config.exists() else {}
 workspace = Path(os.environ.get('ISAAC_ROS_WS') or saved.get('isaac_ros_dir') or Path.home()/'workspaces/isaac_ros-dev').expanduser()
@@ -18,7 +20,7 @@ if args.mode:
     tmp = path.with_suffix('.tmp')
     tmp.write_text(args.mode+'\n')
     tmp.replace(path)
-mode = path.read_text().strip() if path.exists() else 'vio'
+mode = 'vo'  # Current launcher ignores old IMU selection files.
 print('Selected camera mode:', mode.upper(), '(stereo + IMU)' if mode == 'vio' else '(stereo only)')
 if args.mode:
     print('Fully stop the current camera session, then restart through ~/vio-launch.')

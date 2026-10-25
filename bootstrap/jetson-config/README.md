@@ -41,11 +41,10 @@ Both large runtime workspaces remain standalone siblings:
 The full bootstrap creates and builds the first two; generated build trees and
 Docker images are intentionally not nested in this repository or committed.
 
-The default launch is VIO (stereo + RealSense IMU), using a pinned, cached SDK
-2.56.5 overlay built inside the container. The base-image VO driver is retained.
-See `bootstrap/docs/STAGED_IMU_IMPLEMENTATION.md` for the verified startup
-sequence and remaining walking/flight validation. Use `~/vio-imu-mode vo` and
-restart for the visual-only fallback.
+The active launch is stereo-only VO, using the base-image camera driver with
+IMU fusion explicitly disabled. The experimental SDK 2.56.5 overlay is not
+built or sourced. Camera extrinsics and bridge safety fixes are preserved.
+`bootstrap/docs/STAGED_IMU_IMPLEMENTATION.md` records the inactive IMU experiment.
 
 The exact NVIDIA/JetPack pins, original manual layers, and clean-room rebuild
 sequence are documented in `bootstrap/docs/ISAAC_ROS_BOOTSTRAP.md`.

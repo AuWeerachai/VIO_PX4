@@ -121,13 +121,13 @@ install_override \
 install_override \
   "$SCRIPT_DIR/jetson-config/isaac_ros_overrides/scripts/start_rviz.sh" \
   "$ISAAC_SCRIPTS/start_rviz.sh"
-for helper in build_vio_imu_overlay.sh vio_imu_release.env stage_realsense_imu.py check_camera_ready.py apply_vio_imu_fixes.py; do
+for helper in check_camera_ready.py; do
   install_override "$SCRIPT_DIR/jetson-config/isaac_ros_overrides/scripts/$helper" "$ISAAC_SCRIPTS/$helper"
 done
 install_override "$SCRIPT_DIR/jetson-config/isaac_ros_overrides/scripts/vio-imu-mode" "$HOME/vio-imu-mode"
-# Respect an explicitly selected VO fallback on an existing installation.
+# Kept for older launchers; the current launcher always selects stereo VO.
 if [[ ! -f "$ISAAC_SCRIPTS/vio_imu_mode" ]]; then
-  printf 'vio\n' > "$ISAAC_SCRIPTS/vio_imu_mode"
+  printf 'vo\n' > "$ISAAC_SCRIPTS/vio_imu_mode"
 fi
 install -m 0644 \
   "$SCRIPT_DIR/jetson-config/isaac_ros_overrides/.isaac_ros_common-config" \
@@ -155,7 +155,7 @@ else
   exit 1
 fi
 
-python3 "$ISAAC_SCRIPTS/apply_vio_imu_fixes.py" "$ISAAC_VSLAM/isaac_ros_visual_slam"
+# No IMU source fixes/driver overlay are required by the restored VO path.
 
 set +u
 source /opt/ros/humble/setup.bash
@@ -176,5 +176,5 @@ echo "MAVROS workspace: $MAVROS_WS"
 echo "Launcher:        $HOME/vio-launch"
 echo
 echo "Start with: ~/vio-launch"
-echo "Default camera: VIO (stereo + IMU); explicit VO fallback: ~/vio-imu-mode vo"
-echo "First VIO start builds a pinned, cached driver overlay in the mounted Isaac workspace."
+echo "Camera: VO (stereo only); RealSense IMU fusion disabled"
+echo "Uses the base-image camera driver; no IMU overlay build is required."

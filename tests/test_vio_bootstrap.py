@@ -25,22 +25,23 @@ fixes = load('vio_imu_fixes_test', SCRIPTS/'apply_vio_imu_fixes.py')
 
 def test_default_and_explicit_modes(tmp_path):
     cfg = cli.Config(isaac_ros_dir=tmp_path)
-    assert cli.selected_camera_mode(cfg) == 'vio'
-    assert cli.camera_mode_label(cfg) == 'VIO (stereo + IMU)'
+    assert cli.selected_camera_mode(cfg) == 'vo'
+    assert cli.camera_mode_label(cfg) == 'VO (stereo only)'
     mode = tmp_path/'src/isaac_ros_common/scripts/vio_imu_mode'
     mode.parent.mkdir(parents=True)
     mode.write_text('vo\n')
     assert cli.camera_mode_label(cfg) == 'VO (stereo only)'
+    mode.write_text('vio\n')
+    assert cli.camera_mode_label(cfg) == 'VO (stereo only)'
     mode.write_text('garbage')
-    with pytest.raises(RuntimeError):
-        cli.selected_camera_mode(cfg)
+    assert cli.selected_camera_mode(cfg) == 'vo'
 
 
 def test_menu_reports_selected_mode(tmp_path):
     cfg = cli.Config(isaac_ros_dir=tmp_path)
     with patch.object(cli, 'select_menu', return_value='detach') as menu, patch.object(cli, '_clear'):
         assert cli.interactive_main(cfg) == 0
-    assert 'Selected camera mode: VIO (stereo + IMU)' in menu.call_args.kwargs['subtitle']
+    assert 'Selected camera mode: VO (stereo only)' in menu.call_args.kwargs['subtitle']
 
 
 def test_readiness_failure_blocks_reuse(tmp_path):
@@ -95,7 +96,7 @@ def test_readiness_runs_as_camera_user_and_propagates_failure(tmp_path):
         with pytest.raises(RuntimeError, match='IMU missing'):
             cli.require_camera_ready(cli.Config(isaac_ros_dir=tmp_path))
     assert run.call_args.args[0][:4] == ['docker', 'exec', '-u', 'admin']
-    assert 'vio --timeout 12' in run.call_args.args[0][-1]
+    assert 'vo --timeout 12' in run.call_args.args[0][-1]
 
 
 def test_path_a_defers_health_but_path_b_does_not(tmp_path):
@@ -127,9 +128,55 @@ def test_started_only_probe_does_not_request_full_data_validation(tmp_path):
     assert '--started-only' in run.call_args.args[0][-1]
 
 
-def test_camera_launcher_only_configures_imu():
+def test_camera_launcher_restores_vo_without_loading_imu_overlay():
     script = (SCRIPTS/'start_vio.sh').read_text()
-    assert 'stage_realsense_imu.py --configure-only' in script
+    assert 'enable_imu_fusion:=False' in script
+    assert 'stage_realsense_imu.py' not in script
+    assert 'build_vio_imu_overlay.sh' not in script
+    assert 'ros_install/local_setup.bash' not in script
+    assert 'CAMERA_PITCH_RAD' in script and 'CAMERA_YAW_RAD' in script
+
+
+def test_vo_shell_launch_preserves_extrinsics_and_ignores_old_mode_file(tmp_path):
+    import os
+    workspace = tmp_path/'workspace'
+    common = workspace/'src/isaac_ros_common'
+    (common/'scripts').mkdir(parents=True)
+    (common/'scripts/vio_imu_mode').write_text('vio\n')
+    bin_dir = tmp_path/'bin'
+    bin_dir.mkdir()
+    recorder = bin_dir/'ros2'
+    recorder.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$VO_TEST_CALLS"\n')
+    recorder.chmod(0o755)
+    calls = tmp_path/'calls'
+    env = {**os.environ, 'ISAAC_ROS_WS': str(workspace),
+           'PATH': str(bin_dir)+':'+os.environ['PATH'], 'VO_TEST_CALLS': str(calls),
+           'AMENT_PREFIX_PATH': '', 'LD_LIBRARY_PATH': '', 'CMAKE_PREFIX_PATH': '',
+           'CAMERA_X_M': '-0.15', 'CAMERA_Y_M': '0', 'CAMERA_Z_M': '-0.165',
+           'CAMERA_ROLL_RAD': '-0.02059', 'CAMERA_PITCH_RAD': '0.5585',
+           'CAMERA_YAW_RAD': '3.14159'}
+    env.pop('VIO_MODE', None)
+    result = subprocess.run(['bash', str(SCRIPTS/'start_vio.sh')],
+                            env=env, capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    launched = calls.read_text()
+    assert 'enable_imu_fusion:=False' in launched
+    assert '--x -0.15 --y 0 --z -0.165' in launched
+    assert '--yaw 3.14159 --pitch 0.5585 --roll -0.02059' in launched
+    assert 'base_frame:=drone_link' in launched
+
+
+@pytest.mark.parametrize('overrides', [
+    {'VIO_MODE': 'vio'},
+    {'VIO_MODE': 'vo', 'AMENT_PREFIX_PATH': '/workspaces/isaac_ros-dev/.vio-imu/test/ros_install'},
+])
+def test_vo_shell_refuses_imu_request_or_sourced_overlay(tmp_path, overrides):
+    import os
+    (tmp_path/'src/isaac_ros_common').mkdir(parents=True)
+    result = subprocess.run(['bash', str(SCRIPTS/'start_vio.sh')],
+                            env={**os.environ, 'ISAAC_ROS_WS': str(tmp_path), **overrides},
+                            capture_output=True, text=True, timeout=5)
+    assert result.returncode == 2
 
 
 def test_source_fixes_idempotent_and_keep_other_edits(tmp_path):
