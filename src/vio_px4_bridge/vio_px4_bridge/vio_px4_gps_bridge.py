@@ -143,6 +143,7 @@ class VioPx4GpsBridge(Node):
         self.declare_parameter("continuity_max_speed_m_s", 10.0)
         self.declare_parameter("continuity_max_acceleration_m_s2", 5.0)
         self.declare_parameter("continuity_max_yaw_rate_deg_s", 360.0)
+        # Legacy parameter accepted but ignored: recovery has no fixed time cutoff.
         self.declare_parameter("inertial_max_duration_s", 2.0)
         self.declare_parameter("inertial_max_message_age_s", 0.25)
         self.declare_parameter("inertial_max_message_gap_s", 0.25)
@@ -304,9 +305,6 @@ class VioPx4GpsBridge(Node):
                 float(self.get_parameter("continuity_max_yaw_rate_deg_s").value)
             ),
         )
-        self.inertial_max_duration_s = max(
-            0.1, float(self.get_parameter("inertial_max_duration_s").value)
-        )
         self.inertial_max_message_age_s = max(
             0.05, float(self.get_parameter("inertial_max_message_age_s").value)
         )
@@ -378,6 +376,8 @@ class VioPx4GpsBridge(Node):
         self.inertial_start_time = None
         self.inertial_displacement_ned = [0.0, 0.0, 0.0]
         self.inertial_integrated_duration_s = 0.0
+        self.inertial_position_uncertainty_m = 0.0
+        self.inherited_position_uncertainty_m = 0.0
         self.inertial_yaw_delta = 0.0
         self.inertial_last_yaw = None
         self.inertial_start_odometry = None
@@ -498,6 +498,7 @@ class VioPx4GpsBridge(Node):
             "inertial_fallback_to_frozen_pose": self.inertial_fallback_to_frozen_pose,
             "inertial_recovery_failure": self.inertial_failure_reason,
             "frozen_position_uncertainty_m": self.frozen_position_uncertainty_m,
+            "inherited_position_uncertainty_m": self.inherited_position_uncertainty_m,
             "inertial_reordered_odometry_drops": self.inertial_reordered_odometry_drops,
             "inertial_reordered_yaw_drops": self.inertial_reordered_yaw_drops,
             "inertial_displacement_n_m": self.inertial_displacement_ned[0],
@@ -615,15 +616,13 @@ class VioPx4GpsBridge(Node):
                     f"and heading stays on compass (current={gps_ctrl_bits})"
                 )
             noaid_tout_s = float(noaid_tout_us) * 1e-6
-            if self.inertial_max_duration_s >= noaid_tout_s:
-                raise RuntimeError(
-                    "inertial_max_duration_s must be shorter than PX4 "
-                    f"EKF2_NOAID_TOUT ({noaid_tout_s:.3f}s); current="
-                    f"{self.inertial_max_duration_s:.3f}s"
-                )
             self.get_logger().info(
                 "PX4 parameter gates passed: MAV_USEHILGPS=1 "
                 f"EKF2_GPS_CTRL={gps_ctrl_bits} EKF2_NOAID_TOUT={noaid_tout_s:.3f}s"
+            )
+            self.get_logger().info(
+                "Recovery uses guarded PX4 position displacement without a fixed "
+                "duration cutoff; PX4 position-loss failsafes remain unchanged"
             )
             if self.validate_dual_gps_selection:
                 self._validate_dual_gps_selection(heartbeat)
@@ -815,7 +814,7 @@ class VioPx4GpsBridge(Node):
 
     def _start_inertial_propagation(self):
         # Another candidate can fail during the same quarantine. Keep the
-        # original position reference, deadline, and latched position failure.
+        # original position reference and latched position failure.
         if self.inertial_active:
             return
         now = time.monotonic()
@@ -828,6 +827,7 @@ class VioPx4GpsBridge(Node):
         self.inertial_start_time = now
         self.inertial_displacement_ned = [0.0, 0.0, 0.0]
         self.inertial_integrated_duration_s = 0.0
+        self.inertial_position_uncertainty_m = 0.0
         self.inertial_yaw_delta = 0.0
         self.inertial_last_yaw = None
         self.inertial_start_odometry = None
@@ -858,6 +858,7 @@ class VioPx4GpsBridge(Node):
             self.inertial_start_odometry = boundary
             self.inertial_last_odometry = boundary
             self.latest_px4_velocity = (now, odom_time + age, vn, ve)
+            self.inertial_position_uncertainty_m = math.sqrt(max(var_n, var_e))
             if math.sqrt(max(var_n, var_e)) > self.inertial_max_position_uncertainty_m:
                 self._reject_position_propagation("position_uncertainty_at_quarantine")
         # Do not extrapolate the timestamp without extrapolating orientation:
@@ -924,7 +925,7 @@ class VioPx4GpsBridge(Node):
             )
             return
         if reset_counter != previous[8]:
-            # Keep the original position anchor/deadline. Current FCU heading
+            # Keep the original position anchor. Current FCU heading
             # is authoritative; require new post-reset agreement windows.
             self._reject_position_propagation(
                 f"px4_estimator_reset old={previous[8]} new={reset_counter}")
@@ -936,9 +937,11 @@ class VioPx4GpsBridge(Node):
             )
             self._refresh_recovery_heading()
             # This packet becomes the velocity baseline, not an agreement
-            # sample. Keep the original quarantine anchor and timeout.
+            # sample. Keep the original quarantine anchor.
             return
         uncertainty = math.sqrt(max(0.0, var_n, var_e))
+        self.inertial_position_uncertainty_m = max(
+            self.inertial_position_uncertainty_m, uncertainty)
         if uncertainty > self.inertial_max_position_uncertainty_m:
             self._reject_position_propagation(
                 f"position_uncertainty uncertainty_m={uncertainty:.3f} "
@@ -961,14 +964,21 @@ class VioPx4GpsBridge(Node):
                 f"limit_m_s2={self.continuity.max_acceleration_mps2:.3f}"
             )
             return
-        # Integrate PX4 EKF velocity rather than copying its absolute local
-        # position. This preserves real motion without importing small PX4
-        # position corrections into the recovered VIO trajectory.
+        # Use the actual PX4 local-position displacement, not another integral
+        # of its velocity. Subtract the quarantine-boundary position so PX4's
+        # arbitrary local origin never replaces the bridge's global home.
+        # Unannounced/impossible position steps also invalidate translation.
         self.recovery_velocity_sample_valid = True
         if self.inertial_position_safe:
-            self.inertial_displacement_ned[0] += 0.5 * (old_vn + vn) * dt
-            self.inertial_displacement_ned[1] += 0.5 * (old_ve + ve) * dt
-            self.inertial_integrated_duration_s += dt
+            step = math.hypot(north - previous[2], east - previous[3])
+            if step > self.continuity.max_speed_mps * dt + 1e-6:
+                self._reject_position_propagation(
+                    f"position_step_limit displacement_m={step:.3f} dt_s={dt:.3f} "
+                    f"limit_m_s={self.continuity.max_speed_mps:.3f}")
+            else:
+                start = self.inertial_start_odometry
+                self.inertial_displacement_ned = [north - start[2], east - start[3], 0.0]
+                self.inertial_integrated_duration_s = odom_time - start[1]
         self.inertial_last_odometry = sample
 
     def _integrate_px4_yaw(self, sample):
@@ -1052,11 +1062,6 @@ class VioPx4GpsBridge(Node):
         if not self.inertial_active:
             return None
         now = time.monotonic()
-        elapsed = now - self.inertial_start_time
-        if elapsed > self.inertial_max_duration_s and not self.inertial_fallback_to_frozen_pose:
-            # A displacement budget expiring does not invalidate current FCU
-            # heading. Discard translation; fresh agreement is still required.
-            self._reject_position_propagation(f"duration_limit elapsed_s={elapsed:.3f}")
         if (self.latest_px4_odometry is None
                 or now - self.latest_px4_odometry[0] > self.inertial_max_message_age_s):
             self._fail_inertial_propagation("odometry_message_stale")
@@ -1096,14 +1101,20 @@ class VioPx4GpsBridge(Node):
         variance = 0.0 if self.latest_px4_odometry is None else max(
             0.0, self.latest_px4_odometry[6], self.latest_px4_odometry[7]
         )
-        resume_eph = max(self.cruise_eph_m, math.sqrt(variance))
-        source = "px4_odometry"
+        resume_eph = max(self.cruise_eph_m, math.sqrt(variance),
+                         self.inertial_position_uncertainty_m)
+        source = "px4_position_displacement"
         if self.inertial_fallback_to_frozen_pose:
             # Freezing loses unknown real movement. Do not claim 0.1 m accuracy
             # on resumption; bound the possible loss using the configured speed.
             resume_eph = max(resume_eph, self.continuity.max_speed_mps * elapsed)
             self.frozen_position_uncertainty_m += self.continuity.max_speed_mps * elapsed
             source = "frozen_pose_current_fcu_heading"
+        else:
+            # Aligning to PX4 is not a new independent absolute measurement.
+            # Stable camera tracking cannot remove the inherited global error.
+            self.inherited_position_uncertainty_m = max(
+                self.inherited_position_uncertainty_m, resume_eph)
         self.recovery_resume_eph_m = resume_eph
         self.recovery_resume_time = time.monotonic()
         self.get_logger().info(
@@ -1336,7 +1347,7 @@ class VioPx4GpsBridge(Node):
         frame_key = f"{msg.header.frame_id}|{msg.child_frame_id}"
         inertial_target = None
         if self.inertial_active:
-            # Evaluate age/duration/reset/uncertainty guards even while the
+            # Evaluate freshness/reset/uncertainty guards even while the
             # agreement windows are still collecting samples.
             inertial_target = self._validated_recovery_target((vn, ve, vd), raw_body_yaw_ned)
         recovery_displacement = None if inertial_target is None else inertial_target[0]
@@ -1518,10 +1529,11 @@ class VioPx4GpsBridge(Node):
     def _select_accuracy(self) -> tuple[float, float]:
         if self.phase == Phase.SPOOF:
             return self.spoof_eph_m, self.spoof_epv_m
+        accuracy_floor = max(self.cruise_eph_m, self.inherited_position_uncertainty_m)
         if self.frozen_position_uncertainty_m > 0.0:
             # Stable relative vision cannot recover an unknown global offset.
             # Require a new verified origin/restart before claiming tight GPS.
-            return max(self.cruise_eph_m, self.frozen_position_uncertainty_m,
+            return max(accuracy_floor, self.frozen_position_uncertainty_m,
                        self.recovery_resume_eph_m or 0.0), self.cruise_epv_m
         if self.recovery_resume_eph_m is not None and self.recovery_resume_time is not None:
             if self.recovery_accuracy_tighten_s <= 0.0:
@@ -1540,12 +1552,12 @@ class VioPx4GpsBridge(Node):
                 if fraction >= 1.0:
                     self.recovery_resume_eph_m = None
                     self.recovery_resume_time = None
-                return max(self.cruise_eph_m, eph), self.cruise_epv_m
+                return max(accuracy_floor, eph), self.cruise_epv_m
         if self.live_start_time is None:
-            return self.boot_accuracy_m, self.spoof_epv_m
+            return max(accuracy_floor, self.boot_accuracy_m), self.spoof_epv_m
         if (time.monotonic() - self.live_start_time) < self.boot_duration_s:
-            return self.boot_accuracy_m, self.spoof_epv_m
-        return self.cruise_eph_m, self.cruise_epv_m
+            return max(accuracy_floor, self.boot_accuracy_m), self.spoof_epv_m
+        return accuracy_floor, self.cruise_epv_m
 
     def _enter_live(self, reason: str):
         if self.phase == Phase.LIVE:
@@ -1628,6 +1640,7 @@ class VioPx4GpsBridge(Node):
                 valid_source = (
                     int(msg.frame_id) == 1
                     and int(msg.estimator_type) == 8
+                    and int(getattr(msg, "quality", 0)) >= 0
                 )
                 values = (sample_time, north, east, vn, ve, var_n, var_e)
                 if not valid_source or not all(math.isfinite(value) for value in values):
@@ -1710,7 +1723,7 @@ class VioPx4GpsBridge(Node):
     def _tick(self):
         self._poll_mavlink()
         if self.inertial_active:
-            # Enforce duration and stream-freshness guards even if cuVSLAM has
+            # Enforce stream-freshness guards even if cuVSLAM has
             # stopped producing callbacks during quarantine.
             self._inertial_recovery_target()
         if self.phase == Phase.WAITING:

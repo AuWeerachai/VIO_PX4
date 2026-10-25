@@ -89,7 +89,7 @@ class Config:
     gate_max_speed_m_s: float = 10.0
     gate_max_acceleration_m_s2: float = 5.0
     gate_max_yaw_rate_deg_s: float = 360.0
-    inertial_max_duration_s: float = 2.0
+    inertial_max_duration_s: float = 2.0  # legacy config, ignored (no time cutoff)
     inertial_max_message_age_s: float = 0.25
     inertial_max_message_gap_s: float = 0.25
     inertial_reorder_tolerance_s: float = 0.05
@@ -175,7 +175,6 @@ def save_config(cfg: Config) -> None:
         "gate_max_speed_m_s": cfg.gate_max_speed_m_s,
         "gate_max_acceleration_m_s2": cfg.gate_max_acceleration_m_s2,
         "gate_max_yaw_rate_deg_s": cfg.gate_max_yaw_rate_deg_s,
-        "inertial_max_duration_s": cfg.inertial_max_duration_s,
         "inertial_max_message_age_s": cfg.inertial_max_message_age_s,
         "inertial_max_message_gap_s": cfg.inertial_max_message_gap_s,
         "inertial_reorder_tolerance_s": cfg.inertial_reorder_tolerance_s,
@@ -1348,7 +1347,6 @@ def cmd_gps(cfg: Config) -> None:
         "continuity_max_speed_m_s": cfg.gate_max_speed_m_s,
         "continuity_max_acceleration_m_s2": cfg.gate_max_acceleration_m_s2,
         "continuity_max_yaw_rate_deg_s": cfg.gate_max_yaw_rate_deg_s,
-        "inertial_max_duration_s": cfg.inertial_max_duration_s,
         "inertial_max_message_age_s": cfg.inertial_max_message_age_s,
         "inertial_max_message_gap_s": cfg.inertial_max_message_gap_s,
         "inertial_reorder_tolerance_s": cfg.inertial_reorder_tolerance_s,
@@ -1444,10 +1442,13 @@ def show_navigation_status(cfg: Config) -> None:
     if float(status.get("frozen_position_uncertainty_m", 0.0)) > 0:
         print("- Global position uncertainty: movement was discarded during recovery; "
               "verify/reset origin before relying on tight GPS accuracy")
+    inherited = float(status.get("inherited_position_uncertainty_m", 0.0))
+    if inherited > 0:
+        print(f"- Position uncertainty inherited from PX4: at least {inherited:.2f} m")
     if status.get("inertial_recovery_active"):
         if "recovery_position_safe" in status:
             if status["recovery_position_safe"]:
-                print("- Position recovery: tracking guarded PX4 displacement")
+                print("- Position recovery: following guarded PX4 position; no time cutoff")
             else:
                 print("- Position recovery: frozen; movement discarded "
                       f"({status.get('inertial_recovery_failure') or 'unknown reason'})")
@@ -1828,8 +1829,6 @@ def configure_pose_gate(cfg: Config) -> Config:
              cfg.gate_recovery_samples, int, 0),
         )),
         ("GPS-silent PX4 inertial propagation", (
-            ("inertial_duration", "Maximum propagation duration s",
-             cfg.inertial_max_duration_s, float, 0.0),
             ("inertial_age", "Maximum PX4 motion-message age s",
              cfg.inertial_max_message_age_s, float, 0.0),
             ("inertial_gap", "Maximum PX4 motion-message gap s",
@@ -1880,7 +1879,6 @@ def configure_pose_gate(cfg: Config) -> Config:
         gate_max_gap_s=float(values["gap"]),
         gate_confirmation_samples=int(values["confirmation"]),
         gate_recovery_samples=int(values["recovery"]),
-        inertial_max_duration_s=float(values["inertial_duration"]),
         inertial_max_message_age_s=float(values["inertial_age"]),
         inertial_max_message_gap_s=float(values["inertial_gap"]),
         inertial_reorder_tolerance_s=float(values["inertial_reorder"]),
@@ -1900,6 +1898,7 @@ def configure_pose_gate(cfg: Config) -> Config:
     )
     print(
         "During quarantine, PX4 odometry is used only while HIL_GPS is silent. "
+        "There is no fixed duration cutoff. "
         "If position propagation fails a guard, position remains frozen. "
         "Recovery uses current FCU heading after fresh camera/FCU agreement; "
         "it does not require uninterrupted heading during the disturbance."

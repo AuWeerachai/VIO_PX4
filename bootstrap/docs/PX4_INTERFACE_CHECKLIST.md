@@ -83,24 +83,32 @@ firmware because message handling and estimator requirements can change.
   even if a sample returns to the old trajectory. No single-sample shortcut
   may resume GPS or accept a jump merely because time has elapsed.
 - [ ] Repeated disturbances within one quarantine must preserve the original
-  PX4 position propagation reference, time limit, and latched position failures.
+  PX4 position reference and latched position failures.
 - [ ] Require `continuity_confirmation_samples` internally consistent poses
   before declaring a new cuVSLAM coordinate epoch.
 - [ ] Verify candidate and recovery VIO samples cannot modify the last trusted
   output anchor.
-- [ ] While HIL_GPS is silent, integrate PX4 `ODOMETRY` horizontal velocity
-  within its guarded time budget, and use current `ATTITUDE` heading for
-  recovery orientation; never copy PX4's absolute/global position.
+- [ ] While HIL_GPS is silent, track PX4 `ODOMETRY` horizontal position change
+  from the quarantine boundary. Use this displacement once at handoff, anchored
+  to the last trusted bridge position. Do not replace the bridge's home with
+  PX4's arbitrary local origin, or integrate PX4 velocity a second time.
+- [ ] There is no fixed recovery-duration cutoff. The old
+  `inertial_max_duration_s` parameter/config key is accepted but ignored, and
+  removed from the CLI prompts. PX4 `EKF2_NOAID_TOUT` and failsafes are unchanged.
 - [ ] Validate the separate velocity `child_frame_id`: accept LOCAL_NED,
   rotate BODY_FRD using the message's wxyz quaternion, reject other frames.
-- [ ] Reject non-autopilot/non-NED odometry, excessive position variance, and
-  any estimator reset-counter change.
-- [ ] Verify a stationary disturbance resumes exactly at the trusted anchor.
+- [ ] Reject non-autopilot/non-NED odometry, reported quality=-1, excessive
+  position variance, and any estimator reset-counter change. Quality=0 means
+  unknown, not affirmative proof of valid position. Keep all other guards.
+- [ ] Reject unannounced position steps exceeding configured speed times dt,
+  even when reported velocity remains plausible. Never treat reset jumps as motion.
+- [ ] With unchanged PX4 position, verify a stationary disturbance resumes
+  exactly at the trusted anchor. PX4 drift is inherited, not independently corrected.
 - [ ] Verify real motion during quarantine resumes at the trusted anchor plus
   the guarded PX4 inertial displacement.
 - [ ] Position and heading safety have independent state from quarantine entry.
-  Excessive position uncertainty, speed, acceleration, displacement, or elapsed
-  propagation time discards translation only. Continue tracking valid yaw and
+  Excessive position uncertainty, speed, acceleration, or displacement discards
+  translation only. Continue tracking valid yaw and
   monitoring fresh odometry/reset counters; do not erase yaw or latch it unsafe
   solely because translation failed.
 - [ ] After a position-only failure, require the full VIO stability window,
@@ -118,7 +126,7 @@ firmware because message handling and estimator requirements can change.
   Out-of-order packets do not count as fresh evidence. Odometry source/frame,
   freshness and physical velocity checks still gate the final handoff.
 - [ ] Treat ODOMETRY reset-counter changes as aggregate state resets, not proof
-  of yaw resets. Discard translation, retain the original frozen anchor/deadline,
+  of yaw resets. Discard translation, retain the original frozen anchor,
   and restart both agreement windows. Compare subsequent counters to the last
   accepted packet (not forever to the pre-loss counter).
 - [ ] After a counter change require fresh post-reset ATTITUDE, but not an
@@ -130,7 +138,7 @@ firmware because message handling and estimator requirements can change.
   Rotate the recovered epoch **about the frozen/propagated position anchor**;
   never rotate the entire old trajectory or change its home reference.
 - [ ] Bench-test stationary and moving resets, both telemetry arrival orders,
-  and 30--45 second visual loss. Even after a 422 deg/s FCU heading discontinuity,
+  and 30--90 second visual loss. Even after a 422 deg/s FCU heading discontinuity,
   stable camera samples plus fresh stable FCU telemetry must recover after full
   windows. Missing FCU telemetry or ongoing camera jumps must still block. Test
   arbitrary new camera yaw, nonzero earth-heading offsets and +/-180 deg wrap.
@@ -151,15 +159,22 @@ firmware because message handling and estimator requirements can change.
 - [ ] Verify a yaw disagreement resets the recovery window without allowing
   rejected samples to contribute to the next agreement window.
 - [ ] A new candidate/reconfirmed epoch resets both agreement windows without
-  resetting the propagation timer or clearing latched position failures.
+  changing the position baseline or clearing latched position failures.
 - [ ] Verify small out-of-order PX4 motion packets are dropped and counted,
   while regressions beyond `inertial_reorder_tolerance_s` reject propagation.
 - [ ] Verify rejected PX4 propagation freezes position but never bypasses
   heading validation or automatically resumes HIL_GPS.
 - [ ] Status shows separate position/heading recovery outcomes and reasons.
   "Last accepted VIO sample" is accepted-data age, not transport/camera latency.
-- [ ] Resume with EPH no tighter than PX4's horizontal uncertainty, then tighten
-  gradually to the configured 0.1 m VIO accuracy.
+- [ ] Successful PX4-position recovery retains the peak reported horizontal
+  uncertainty during the outage (and any previously inherited floor). Do not
+  automatically tighten inherited global uncertainty to 0.1 m merely because
+  relative camera tracking stabilizes or PX4 later reports a smaller variance.
+- [ ] Verify 30- and 90-second stationary and moving tests recover to the
+  trusted anchor plus actual PX4 position displacement, without the old time
+  cutoff or a speed-times-duration penalty when no position guard failed.
+- [ ] After handoff, further PX4 position changes must not move the bridge's
+  camera trajectory. It is a one-time alignment, not independent GPS truth.
 - [ ] After re-anchoring, keep GPS stopped for
   `continuity_recovery_samples` additional valid poses.
 - [ ] Validate continuity thresholds against the vehicle's maximum real speed

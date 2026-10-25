@@ -66,19 +66,29 @@ gate consistent when the effective odometry frequency changes.
 
 A coordinate reset means cuVSLAM has started reporting the same physical scene
 from a different raw origin or heading. After the first suspicious sample, the
-bridge pauses GPS. If subsequent samples return to the old trajectory, the
-first sample is discarded as an outlier. If the configured number of samples
-are mutually consistent in the new coordinates, the reset is confirmed and
-the new segment is aligned with the last accepted pose. GPS remains paused for
-the configured additional recovery samples. The default maximum yaw rate is
-`360 deg/s`.
+bridge pauses GPS. Even if samples return to the old trajectory, full recovery
+checks are required; there is no single-sample shortcut. Mutually consistent
+samples confirm a new coordinate segment, followed by the configured stable
+sample window and fresh velocity/yaw-change agreement. The default maximum
+yaw rate is `360 deg/s`.
 
-If only the PX4 displacement duration budget expires, recovery freezes the
-last trusted position while continuing guarded PX4 yaw tracking. Stable VIO
-and velocity/yaw agreement are still required. Stale telemetry, estimator
-resets or other propagation failures keep GPS stopped; restart only after
-checking the vehicle state and origin. The duration setting already in the CLI
-controls this behavior.
+Recovery prefers PX4's dead-reckoned horizontal position change from the start
+of quarantine, anchored to the last trusted bridge position. It uses current
+FCU heading to orient the recovered camera segment. There is **no fixed
+two-second cutoff** and no extra integration of PX4 velocity. Old saved
+`inertial_max_duration_s` settings are ignored. No PX4 failsafe setting is changed.
+
+Freshness, finite values, frame/source, reported failure quality, position
+uncertainty, speed, acceleration, position-step and estimator-reset checks
+remain. A failed position check freezes the original anchor for that quarantine;
+fresh heading and camera/velocity agreement can still permit recovery there.
+No continuous PX4-position-to-GPS feedback runs after the one-time handoff.
+
+After a successful dead-reckoned handoff, retain the highest reported horizontal
+uncertainty seen during the outage as an accuracy floor. Stable relative vision
+does not remove inherited absolute position error; a new independent reference
+is needed before claiming better global accuracy. Reported uncertainty itself
+is an estimator estimate, not a guarantee of true error.
 
 Freezing cannot account for movement during the outage. Recovery therefore
 retains a conservative global uncertainty floor (maximum configured speed
