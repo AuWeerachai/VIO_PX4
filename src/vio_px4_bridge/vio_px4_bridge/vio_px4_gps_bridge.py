@@ -22,6 +22,8 @@ from pathlib import Path
 
 import rclpy
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Imu
+from rcl_interfaces.srv import GetParameters
 try:
     from px4_msgs.msg import SensorGps
 except ImportError:
@@ -47,6 +49,7 @@ from vio_px4_bridge.recovery_yaw import RecoveryYawAgreement
 from vio_px4_bridge.recovery_yaw import timestamp_order
 from vio_px4_bridge.mag_declination import default_table_path
 from vio_px4_bridge.mag_declination import lookup_declination_deg
+from vio_px4_bridge.spoof_readiness import SpoofReadiness
 
 
 class Phase(Enum):
@@ -74,6 +77,7 @@ class VioPx4GpsBridge(Node):
         self.declare_parameter("ros2_gps_topic", "/fmu/in/sensor_gps")
         self.declare_parameter("rate_hz", 10.0)
         self.declare_parameter("status_file", "")
+        self.declare_parameter("camera_imu_required", True)
 
         # Home / EKF origin (spoof target and LLA anchor for live VIO)
         self.declare_parameter("home_lat_deg", 40.4433)
@@ -389,6 +393,13 @@ class VioPx4GpsBridge(Node):
         self.last_px4_heartbeat_time = None
         self.px4_target_sysid = None
         self.status_file = str(self.get_parameter("status_file").value).strip()
+        self.camera_readiness = SpoofReadiness(
+            require_imu=bool(self.get_parameter("camera_imu_required").value)
+        )
+        self.spoof_failure_reason = None
+        self._camera_param_future = None
+        self._camera_param_sent = 0.0
+        self._last_handoff_reason = None
 
         self._mav = None
         self._gps_pub = None
@@ -402,6 +413,15 @@ class VioPx4GpsBridge(Node):
             depth=5,
         )
         self.create_subscription(Odometry, self.odom_topic, self._odom_callback, qos)
+        self.create_subscription(Imu, "/imu", self._camera_imu_callback, QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST, depth=100,
+        ))
+        self._camera_param_client = self.create_client(
+            GetParameters, "/visual_slam_node/get_parameters"
+        )
+        self.create_timer(0.5, self._check_camera_fusion)
         self.create_timer(1.0 / self.rate_hz, self._tick)
         if self.status_file:
             self.create_timer(0.5, self._write_status_file)
@@ -483,6 +503,8 @@ class VioPx4GpsBridge(Node):
             ),
             "hil_gps_output_active": self.live_output_active,
             "output_block_reason": self.live_output_block_reason,
+            "spoof_failure_reason": self.spoof_failure_reason,
+            "handoff_check_reason": self._handoff_block_reason(),
             "px4_fallback": (
                 "not_needed" if self.live_output_active or navigation == "spoof_active"
                 else "PX4 selects physical GPS if healthy; otherwise dead reckoning/failsafe"
@@ -1080,7 +1102,57 @@ class VioPx4GpsBridge(Node):
             self.recovery_yaw_agreement_state = "collecting"
         return result.agreed
 
+    def _camera_imu_callback(self, msg: Imu):
+        stamp = msg.header.stamp
+        self.camera_readiness.observe_imu(
+            stamp.sec * 1000000000 + stamp.nanosec, time.monotonic(),
+            (msg.linear_acceleration.x, msg.linear_acceleration.y,
+             msg.linear_acceleration.z, msg.angular_velocity.x,
+             msg.angular_velocity.y, msg.angular_velocity.z), msg.header.frame_id,
+        )
+
+    def _check_camera_fusion(self):
+        now = time.monotonic()
+        future = self._camera_param_future
+        if future is not None:
+            if future.done():
+                try:
+                    response = future.result()
+                    if response and len(response.values) == 1 and response.values[0].type == 1:
+                        self.camera_readiness.observe_fusion(response.values[0].bool_value, now)
+                except Exception as exc:
+                    self.get_logger().warn(f"Camera fusion query failed: {exc}")
+                self._camera_param_future = None
+            elif now - self._camera_param_sent > 2.0:
+                self._camera_param_client.remove_pending_request(future)
+                future.cancel()
+                self._camera_param_future = None
+            else:
+                return
+        if self._camera_param_client.service_is_ready():
+            request = GetParameters.Request()
+            request.names = ["enable_imu_fusion"]
+            self._camera_param_future = self._camera_param_client.call_async(request)
+            self._camera_param_sent = now
+
+    def _handoff_block_reason(self):
+        now = time.monotonic()
+        if not self.have_vio or self.last_vio_time is None or now - self.last_vio_time > self.vio_timeout_s:
+            return "accepted VIO odometry not fresh"
+        if self.heading_offset_rad is None:
+            return "heading alignment incomplete"
+        if self.continuity_recovering:
+            return "pose-jump gate recovering"
+        return self.camera_readiness.reason(now)
+
     def _odom_callback(self, msg: Odometry):
+        pos, orientation = msg.pose.pose.position, msg.pose.pose.orientation
+        stamp = msg.header.stamp
+        self.camera_readiness.observe_odom(
+            stamp.sec * 1000000000 + stamp.nanosec, time.monotonic(),
+            (pos.x, pos.y, pos.z, orientation.x, orientation.y, orientation.z, orientation.w),
+            msg.child_frame_id, self.expected_child_frame,
+        )
         if msg.child_frame_id != self.expected_child_frame:
             if msg.child_frame_id != self.rejected_odom_frame:
                 self.rejected_odom_frame = msg.child_frame_id
@@ -1180,6 +1252,11 @@ class VioPx4GpsBridge(Node):
         # startup relocalization should establish a fresh local origin rather
         # than invoke PX4-aided in-flight recovery.
         if continuity.recovering and self.phase != Phase.LIVE:
+            self.camera_readiness.odom.reset("pose-jump gate restarted startup trajectory")
+            self.anchor_ned = None
+            self.heading_offset_rad = None
+            self.heading_samples.clear()
+            self.last_alignment_mag_id = None
             self.continuity.reset()
             continuity = self.continuity.update(
                 (north, east, down), raw_body_yaw_ned, (vn, ve, vd),
@@ -1376,7 +1453,11 @@ class VioPx4GpsBridge(Node):
 
     def _enter_live(self, reason: str):
         if self.phase == Phase.LIVE:
-            return
+            return True
+        blocked = self._handoff_block_reason()
+        if blocked:
+            self.live_output_block_reason = blocked
+            return False
         previous_phase = self.phase
         self.phase = Phase.LIVE
         self.live_start_time = time.monotonic()
@@ -1385,6 +1466,7 @@ class VioPx4GpsBridge(Node):
         else:
             self.get_logger().info(f"RC activated live VIO GPS ({reason})")
         self._send_status_text("VIO GPS: live VIO active", 6)
+        return True
 
     def _rc_position(self, pwm: int) -> str | None:
         if pwm in (0, 65535):
@@ -1478,34 +1560,32 @@ class VioPx4GpsBridge(Node):
                 continue
             rising_high = self.last_rc_position != "high" and position == "high"
             self.last_rc_position = position
-            if not rising_high or self.phase != Phase.WAITING:
+            if (not rising_high or self.phase != Phase.WAITING
+                    or self.spoof_failure_reason is not None):
                 continue
-
-            vio_is_fresh = (
-                self.have_vio
-                and self.last_vio_time is not None
-                and (now - self.last_vio_time) <= self.vio_timeout_s
-            )
             self.get_logger().info(
                 f"RC channel {self.rc_channel} pwm={pwm} triggered GPS bootstrap"
             )
-            # `spoof_until_vio=true` permits an immediate handoff when VIO is
-            # already healthy. With it disabled, always provide the complete
-            # timed stationary bootstrap before switching to live VIO.
-            if (
-                self.spoof_until_vio
-                and vio_is_fresh
-                and self.heading_offset_rad is not None
-            ):
-                self._enter_live("rc_trigger_vio_already_ready")
-            else:
-                self.phase = Phase.SPOOF
-                self.start_time = now
-                self.get_logger().info(
-                    f"GPS spoof started from RC channel {self.rc_channel} "
-                    f"for up to {self.spoof_duration_s:.1f}s"
-                )
-                self._send_status_text("VIO GPS: home spoof active (15 s max)", 6)
+            # Evidence must be collected during this activation, not reused
+            # from a previous successful run or a prior spoof attempt.
+            self.camera_readiness.reset()
+            self.continuity.reset()
+            self.continuity_recovering = False
+            self.have_vio = False
+            self.last_vio_time = None
+            self.anchor_ned = None
+            self.heading_offset_rad = None
+            self.heading_samples.clear()
+            self.last_alignment_mag_id = None
+            self.spoof_failure_reason = None
+            self._last_handoff_reason = None
+            self.phase = Phase.SPOOF
+            self.start_time = now
+            self.get_logger().info(
+                f"GPS spoof started from RC channel {self.rc_channel} for up to "
+                f"{self.spoof_duration_s:.1f}s; validating recent camera data"
+            )
+            self._send_status_text("VIO GPS: spoofing; checking camera health", 6)
 
     def _maybe_end_spoof_by_timer(self):
         if self.phase not in (Phase.SPOOF, Phase.ALIGNING):
@@ -1515,17 +1595,17 @@ class VioPx4GpsBridge(Node):
         if self.start_time is None:
             return
         if (time.monotonic() - self.start_time) >= self.spoof_duration_s:
-            if self.have_vio and self.heading_offset_rad is not None:
-                self._enter_live("spoof_duration")
-            else:
+            if not self._enter_live("spoof_duration_health_passed"):
+                self.spoof_failure_reason = self._handoff_block_reason()
                 self.phase = Phase.WAITING
                 self.start_time = None
+                self._set_live_output_state(False, "spoof_validation_failed")
                 self.get_logger().warn(
-                    f"GPS spoof expired after {self.spoof_duration_s:.1f}s without "
-                    "fresh, heading-aligned VIO; "
-                    f"GPS output stopped. Toggle RC channel {self.rc_channel} LOW then HIGH to retry"
+                    f"GPS spoof expired after {self.spoof_duration_s:.1f}s; "
+                    f"validation failed: {self.spoof_failure_reason}. "
+                    "GPS output stopped; launcher will stop the camera session."
                 )
-                self._send_status_text("VIO GPS: spoof expired; output stopped", 4)
+                self._send_status_text("VIO GPS: camera check failed; GPS stopped", 4)
 
     def _tick(self):
         self._poll_mavlink()
@@ -1534,8 +1614,14 @@ class VioPx4GpsBridge(Node):
             # stopped producing callbacks during quarantine.
             self._inertial_recovery_target()
         if self.phase == Phase.WAITING:
-            self._set_live_output_state(False, "waiting_for_activation")
+            self._set_live_output_state(False, "spoof_validation_failed" if self.spoof_failure_reason
+                                        else "waiting_for_activation")
             return
+        if self.phase in (Phase.SPOOF, Phase.ALIGNING):
+            reason = self._handoff_block_reason() or "healthy; waiting for spoof timer"
+            if reason != self._last_handoff_reason:
+                self.get_logger().info(f"SPOOF_HEALTH_CHECK: {reason}")
+                self._last_handoff_reason = reason
         self._maybe_end_spoof_by_timer()
         if self.phase == Phase.WAITING:
             self._set_live_output_state(False, "spoof_expired")

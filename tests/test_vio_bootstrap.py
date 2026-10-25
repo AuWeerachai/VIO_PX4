@@ -98,6 +98,40 @@ def test_readiness_runs_as_camera_user_and_propagates_failure(tmp_path):
     assert 'vio --timeout 12' in run.call_args.args[0][-1]
 
 
+def test_path_a_defers_health_but_path_b_does_not(tmp_path):
+    cfg = cli.Config(isaac_ros_dir=tmp_path)
+    with patch.object(cli, 'cmd_vio') as camera, \
+         patch.object(cli, 'find_proc', return_value=None), \
+         patch.object(cli, 'cmd_gps'), patch.object(cli, 'cmd_ev_bridge'):
+        cli.cmd_run(cfg, 'a')
+        camera.assert_called_with(cfg, defer_health=True)
+        cli.cmd_run(cfg, 'b')
+        camera.assert_called_with(cfg, defer_health=False)
+
+
+def test_failed_spoof_stops_gps_before_camera_and_preserves_evidence(tmp_path):
+    cfg = cli.Config(state_dir=tmp_path)
+    events = []
+    with patch.object(cli, 'stop_managed', side_effect=lambda cfg, name: events.append(name)), \
+         patch.object(cli, 'tmux_recent_output', return_value='camera diagnostics'), \
+         patch.object(cli, 'stop_visible_isaac_sessions', side_effect=lambda: events.append('camera')):
+        cli.stop_failed_spoof(cfg, 'IMU timestamps unstable')
+    assert events == ['gps-bridge', 'camera']
+    assert 'IMU timestamps unstable' in (cfg.log_dir/'camera-spoof-failure.log').read_text()
+    assert 'camera diagnostics' in (cfg.log_dir/'camera-spoof-failure.log').read_text()
+
+
+def test_started_only_probe_does_not_request_full_data_validation(tmp_path):
+    with patch.object(cli.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout='started', stderr='')) as run:
+        cli.require_camera_ready(cli.Config(isaac_ros_dir=tmp_path), started_only=True)
+    assert '--started-only' in run.call_args.args[0][-1]
+
+
+def test_camera_launcher_only_configures_imu():
+    script = (SCRIPTS/'start_vio.sh').read_text()
+    assert 'stage_realsense_imu.py --configure-only' in script
+
+
 def test_source_fixes_idempotent_and_keep_other_edits(tmp_path):
     impl = tmp_path/'src/impl/visual_slam_impl.cpp'
     launch = tmp_path/'launch/isaac_ros_visual_slam_core.launch.py'

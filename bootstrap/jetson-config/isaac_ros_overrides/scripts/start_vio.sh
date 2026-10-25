@@ -63,6 +63,6 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 if [[ "$mode" == vio ]]; then
-  python3 ./scripts/stage_realsense_imu.py
+  python3 ./scripts/stage_realsense_imu.py --configure-only
 fi
 wait "$launch_pid"

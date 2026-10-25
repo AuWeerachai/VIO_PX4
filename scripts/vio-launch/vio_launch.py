@@ -1124,12 +1124,13 @@ def camera_mode_label(cfg: Config) -> str:
     return "VIO (stereo + IMU)" if mode == "vio" else "VO (stereo only)"
 
 
-def require_camera_ready(cfg: Config) -> None:
+def require_camera_ready(cfg: Config, started_only: bool = False) -> None:
     mode = selected_camera_mode(cfg)
     command = (
         "source /opt/ros/humble/setup.bash && "
         "python3 ${ISAAC_ROS_WS}/src/isaac_ros_common/scripts/check_camera_ready.py "
-        f"{mode} --timeout 12"
+        f"{mode} --timeout {3 if started_only else 12}"
+        + (" --started-only" if started_only else "")
     )
     result = subprocess.run(
         ["docker", "exec", "-u", "admin", ISAAC_CONTAINER, "bash", "-lc", command],
@@ -1140,29 +1141,35 @@ def require_camera_ready(cfg: Config) -> None:
     print(f"- {result.stdout.strip()}")
 
 
-def cmd_vio(cfg: Config) -> None:
+def cmd_vio(cfg: Config, defer_health: bool = False) -> None:
     print(f"- Selected camera mode: {camera_mode_label(cfg)}")
     if not shutil.which("tmux") or not shutil.which("gnome-terminal"):
         raise RuntimeError("tmux and gnome-terminal are required for visible Isaac sessions")
     raw_topic = "/visual_slam/tracking/odometry"
     if tmux_session_exists(ISAAC_TMUX_VIO) and isaac_container_running():
         try:
-            require_ros_message(
-                cfg, raw_topic, "existing cuVSLAM body odometry", 6.0,
-                message_type="nav_msgs/msg/Odometry",
-            )
+            if defer_health:
+                require_camera_ready(cfg, started_only=True)
+            else:
+                require_ros_message(
+                    cfg, raw_topic, "existing cuVSLAM body odometry", 6.0,
+                    message_type="nav_msgs/msg/Odometry",
+                )
         except RuntimeError:
             print("Existing Isaac VIO session is not healthy; restarting it...", flush=True)
         else:
-            require_camera_ready(cfg)
-            print("- Existing cuVSLAM body odometry is healthy; reusing Terminal 1.")
+            if not defer_health:
+                require_camera_ready(cfg)
+            print("- Existing cuVSLAM session reused; health will be checked during spoofing."
+                  if defer_health else "- Existing cuVSLAM body odometry is healthy; reusing Terminal 1.")
             if cfg.rviz_enabled and not tmux_session_exists(ISAAC_TMUX_RVIZ):
                 start_rviz_session(cfg)
             print(
                 "- RViz is running." if tmux_session_exists(ISAAC_TMUX_RVIZ)
                 else "- RViz auto-launch is OFF; continuing without RViz."
             )
-            print("- cuVSLAM body odometry ready.")
+            print("- Camera started; keep the drone stationary through spoofing."
+                  if defer_health else "- cuVSLAM body odometry ready.")
             return
     print("- Opening Terminal 1: Isaac ROS VIO (run_dev.sh → start_vio.sh)...")
     start_visible_isaac_session(cfg, ISAAC_TMUX_VIO, "Isaac ROS VIO")
@@ -1210,10 +1217,13 @@ def cmd_vio(cfg: Config) -> None:
         odom_deadline = time.monotonic() + 2700.0
         while True:
             try:
-                require_ros_message(
-                    cfg, raw_topic, "cuVSLAM body odometry", 3.0,
-                    message_type="nav_msgs/msg/Odometry",
-                )
+                if defer_health:
+                    require_camera_ready(cfg, started_only=True)
+                else:
+                    require_ros_message(
+                        cfg, raw_topic, "cuVSLAM body odometry", 3.0,
+                        message_type="nav_msgs/msg/Odometry",
+                    )
                 break
             except RuntimeError as exc:
                 recent = tmux_recent_output(ISAAC_TMUX_VIO, lines=120)
@@ -1233,13 +1243,15 @@ def cmd_vio(cfg: Config) -> None:
                     raise RuntimeError(
                         f"No body odometry arrived on {raw_topic} within 45 minutes"
                     ) from exc
-        require_camera_ready(cfg)
+        if not defer_health:
+            require_camera_ready(cfg)
         if cfg.rviz_enabled:
             start_rviz_session(cfg)
             print("- RViz is running.")
         else:
             print("- RViz auto-launch is OFF; continuing without RViz.")
-        print("- cuVSLAM is publishing vehicle-body odometry directly (drone_link).")
+        if not defer_health:
+            print("- cuVSLAM is publishing vehicle-body odometry directly (drone_link).")
     except Exception as exc:
         # Capture evidence before closing the auto-removed container/terminal.
         recent = tmux_recent_output(ISAAC_TMUX_VIO, lines=200)
@@ -1254,7 +1266,25 @@ def cmd_vio(cfg: Config) -> None:
         stop_visible_isaac_sessions()
         tail = "\n".join(recent.splitlines()[-30:])
         raise RuntimeError(f"{exc}{log_note}\nRecent camera output:\n{tail}") from exc
-    print("- cuVSLAM body odometry ready.")
+    print("- Camera started; health validation will run during spoofing. Keep the drone stationary."
+          if defer_health else "- cuVSLAM body odometry ready.")
+
+
+def stop_failed_spoof(cfg: Config, reason: str) -> None:
+    """GPS has already stopped in the bridge; stop it before camera teardown."""
+    print(f"- Spoof validation failed: {reason}", flush=True)
+    stop_managed(cfg, "gps-bridge")
+    # Save the camera evidence before the owning terminal/container is removed.
+    try:
+        cfg.log_dir.mkdir(parents=True, exist_ok=True)
+        (cfg.log_dir / "camera-spoof-failure.log").write_text(
+            f"Spoof validation failed: {reason}\n" + tmux_recent_output(ISAAC_TMUX_VIO, lines=200),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        print(f"- Could not save camera failure log: {exc}", flush=True)
+    stop_visible_isaac_sessions()
+    print("- GPS bridge and cuVSLAM/RViz sessions stopped. Start Path A again to retry.", flush=True)
 
 
 def cmd_gps(cfg: Config) -> None:
@@ -1331,6 +1361,7 @@ def cmd_gps(cfg: Config) -> None:
         "recovery_yaw_agreement_samples": cfg.recovery_yaw_agreement_samples,
         "recovery_accuracy_tighten_s": cfg.recovery_accuracy_tighten_s,
         "status_file": str(cfg.state_dir / "navigation-status.json"),
+        "camera_imu_required": "true" if selected_camera_mode(cfg) == "vio" else "false",
     }
     param_args = " ".join(
         f"-p {shlex.quote(f'{name}:={value}')}" for name, value in params.items()
@@ -1355,16 +1386,17 @@ def cmd_gps(cfg: Config) -> None:
         if navigation == "spoof_active" and not saw_spoof:
             saw_spoof = True
             print(
-                f"- Spoofing at {cfg.home_lat:.7f}, {cfg.home_lon:.7f} for 15 s.",
+                f"- Spoofing at {cfg.home_lat:.7f}, {cfg.home_lon:.7f} for 15 s; checking camera health.",
                 flush=True,
             )
         if saw_spoof and navigation == "live_vio":
             print("- 15 s done. VIO takes over. See option 3) Status.", flush=True)
             return
-        if saw_spoof and navigation == "waiting_for_rc":
+        if status.get("spoof_failure_reason") or (saw_spoof and navigation == "waiting_for_rc"):
+            reason = status.get("spoof_failure_reason") or "no healthy heading-aligned VIO handoff"
+            stop_failed_spoof(cfg, reason)
             raise RuntimeError(
-                "The spoof ended without a healthy heading-aligned VIO handoff. "
-                "See option 3) Status."
+                f"Spoof validation failed: {reason}. GPS and camera stopped."
             )
         try:
             os.kill(int(proc["pid"]), 0)
@@ -1407,6 +1439,10 @@ def show_navigation_status(cfg: Config) -> None:
     print(f"- Connection status: {connection}")
     print(f"- VIO status: {vio_status}")
     print(f"- Pose-jump gate status: {gate_status}")
+    if navigation in ("spoof_active", "waiting_for_rc"):
+        print(f"- Spoof health check: {status.get('handoff_check_reason') or 'healthy'}")
+    if status.get("spoof_failure_reason"):
+        print(f"- Spoof failed: {status['spoof_failure_reason']}")
     if float(status.get("frozen_position_uncertainty_m", 0.0)) > 0:
         print("- Global position uncertainty: movement was discarded during recovery; "
               "verify/reset origin before relying on tight GPS accuracy")
@@ -1474,13 +1510,7 @@ def cmd_run(
     label = "GPS spoof + VIO GPS" if which == "a" else "external vision"
     print(f"Starting Path {which.upper()} ({label})...\n", flush=True)
 
-    try:
-        require_ros_message(cfg, cfg.odom_topic, "body-frame cuVSLAM odometry", 2.0)
-    except RuntimeError:
-        if not find_proc(cfg, "cuvslam"):
-            cmd_vio(cfg)
-        else:
-            raise RuntimeError("cuVSLAM is running but body-frame odometry is not ready")
+    cmd_vio(cfg, defer_health=(which == "a"))
 
     if which == "b":
         if find_proc(cfg, "gps-bridge"):

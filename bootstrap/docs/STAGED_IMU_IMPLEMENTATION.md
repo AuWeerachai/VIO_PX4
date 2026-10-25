@@ -11,16 +11,27 @@ VO remains an explicit fallback. This does not certify flight performance.
 3. Launch stereo and cuVSLAM with `enable_imu_fusion=True` from construction.
 4. After stereo CameraInfo arrives, enable gyro/accel at 200 Hz and combine
    them using interpolation (`unite_imu_method=2`).
-5. After the parameter changes complete, require a new continuous two-second
-   IMU window containing at least 300 samples. Verify finite values, increasing
-   timestamps, sensor and delivery gaps no greater than 0.1 s, plausible
-   stationary gravity, the expected message frame, and fresh stereo CameraInfo.
-   A startup gap discards the preceding window and starts validation again;
-   it does not extend the 25-second deadline. Invalid data, wrong frames, or
-   duplicate/regressing timestamps still fail immediately. Both sensor time
-   and actual receipt time must span two seconds, so queued bursts cannot pass.
-6. Before either PX4 path starts/reuses the camera, check its actual fusion
-   parameter, incoming IMU, and fresh `drone_link` odometry inside the container.
+5. The normal camera launcher uses `stage_realsense_imu.py --configure-only`.
+   Parameter configuration errors still stop the launch, but early IMU gaps or
+   backward timestamps no longer kill cuVSLAM through the startup checker.
+6. Path A confirms the camera node and selected fusion mode, then connects to
+   PX4. After RC channel 6 triggers the 15-second stationary spoof, the bridge
+   gathers new evidence: two continuous healthy seconds of body odometry and,
+   in VIO mode, at least 300 IMU samples spanning two seconds. Sensor and delivery
+   gaps must be no greater than 0.1 s for IMU / 0.5 s for odometry. Invalid data,
+   wrong frames and timestamp discontinuities discard the affected window;
+   later healthy data can recover. Receipt time also must span two seconds.
+7. Handoff additionally requires a recently confirmed fusion setting, completed
+   heading alignment and no pose quarantine. Pre-trigger evidence is discarded;
+   the origin and heading initialization are refreshed while stationary.
+8. At 15 seconds, either switch to live GPS, or stop GPS output and latch the
+   failure. The CLI then stops the GPS bridge and cuVSLAM/RViz/container session,
+   saving `camera-spoof-failure.log`. Start Path A again to retry. The 15-second
+   deadline is not extended by bad samples. Keep the vehicle stationary and on
+   the ground until live handoff. This is not flight certification.
+9. Path B and the standalone `vio` command retain their strict readiness probe
+   before reporting success. VO fallback does not require IMU samples, but does
+   require the actual camera fusion mode to match and healthy body odometry.
 
 Changing a ROS parameter after starting cuVSLAM without fusion does not create
 its IMU subscription. Always restart when changing VO/VIO mode.
@@ -78,12 +89,15 @@ and bridge recovery tests remain necessary before flight use.
 
 ## Fallback
 
-Startup-gap correction (2026-10-25): the previous checker permanently included
-the first samples, so one 295 ms interruption during initialization stopped the
-whole launch. The new checker waits for a fresh healthy window, without relaxing
-the gap threshold. Persistent interruptions still stop startup. This is a
-startup check, not an in-flight IMU watchdog or a fix for the separate driver
-warning about missing IMU calibration.
+Spoof-period validation (2026-10-25): after testing a bounded startup window,
+validation was moved to the bridge's spoof phase. Early glitches are diagnostic
+evidence, not proof that cuVSLAM itself has failed. The bridge requires recovery
+before live output; the launcher shuts the camera down if handoff fails. Existing
+in-flight pose-jump and stale-odometry safeguards remain unchanged. This new
+readiness check is not a continuous in-flight IMU watchdog and does not fix the
+separate driver warning about missing IMU calibration. The standalone staged
+helper's strict bench-check mode remains available when `--configure-only` is
+omitted, but the normal launcher does not invoke that mode.
 
 Run `~/vio-imu-mode vo`, fully stop the camera session, then restart `~/vio-launch`.
 VO uses the original base-image driver without the VIO overlay. Reselect VIO

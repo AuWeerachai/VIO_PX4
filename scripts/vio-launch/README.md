@@ -12,8 +12,11 @@ cd ~/workspaces/VIO_PX4/scripts/vio-launch
 ## Main menu
 
 The header shows **Selected camera mode: VIO (stereo + IMU)** by default.
-Both navigation paths verify the actual fusion setting, live IMU, and body
-odometry before proceeding. The first VIO start builds a pinned driver overlay;
+Path A checks recent IMU/body odometry during its 15-second stationary spoof,
+along with fusion mode, heading alignment and pose-gate health. Startup glitches
+can recover; failed validation stops GPS and then cuVSLAM/RViz. Keep the drone
+stationary until live handoff. Path B keeps its pre-launch readiness check.
+The first VIO start builds a pinned driver overlay;
 later starts reuse its cache. See `bootstrap/docs/ISAAC_ROS_BOOTSTRAP.md`.
 
 For fallback, run `~/vio-imu-mode vo`, fully stop the existing camera session,

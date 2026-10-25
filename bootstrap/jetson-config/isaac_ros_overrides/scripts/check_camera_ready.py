@@ -14,6 +14,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('mode', choices=['vio', 'vo'])
     parser.add_argument('--timeout', type=float, default=12.0)
+    parser.add_argument('--started-only', action='store_true',
+                        help='Check selected mode and node availability, not data health')
     args = parser.parse_args()
     rclpy.init()
     node = rclpy.create_node('vio_launch_camera_readiness')
@@ -48,6 +50,9 @@ def main():
                     fusion = result.values[0].bool_value
                 if fusion is not None and fusion != (args.mode == 'vio'):
                     raise RuntimeError('Running camera mode differs from selected mode. Stop all processes, then restart.')
+                if args.started_only and fusion is not None:
+                    print(f'{args.mode.upper()} node started; data health not yet validated.')
+                    return 0
             now = time.monotonic()
             fresh_odom = odom and now - odom[-1] < 0.5
             fresh_imu = (len(imu) >= 300 and now - imu[-1][0] < 0.25

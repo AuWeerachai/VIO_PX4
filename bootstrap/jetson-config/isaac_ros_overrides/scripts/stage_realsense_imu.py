@@ -69,6 +69,11 @@ class ImuStartupWindow:
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--configure-only", action="store_true",
+                        help="Enable motion; let the bridge validate during spoofing")
+    args = parser.parse_args()
     # Keep the startup-window logic testable without ROS installed.
     import rclpy
     from rclpy.parameter import Parameter
@@ -129,6 +134,10 @@ def main():
                             ("accel_fps", 200), ("enable_gyro", True),
                             ("enable_accel", True)]:
             set_param(name, value)
+        if args.configure_only:
+            print("VIO IMU: motion configured; startup transients will not stop cuVSLAM. "
+                  "Path A validates recent IMU/odometry during spoofing.", flush=True)
+            return
         window = ImuStartupWindow(time.monotonic())
         print("VIO IMU: waiting for 2 continuous healthy seconds after configuration "
               "(at least 300 samples; gap limit 0.1s; timeout 25s).", flush=True)

@@ -71,8 +71,9 @@ The bootstrap performs these operations in order:
 9. On first VIO start, builds the pinned SDK and camera wrapper inside the
    container, under `${ISAAC_ROS_WS}/.vio-imu/`. This can take 20–40 minutes.
    Completed builds are cached; later launches do not rebuild them.
-10. Checks actual IMU fusion, incoming IMU, and body odometry before either PX4
-    path proceeds. Missing IMU does not silently fall back to VO.
+10. Checks actual IMU fusion, incoming IMU, and body odometry before live VIO
+    output. Path A performs validation during its stationary spoof; Path B
+    checks before starting. Missing IMU does not silently fall back to VO.
 
 `bootstrap_jetson.sh` also reconstructs the standalone
 `~/workspaces/mavros` workspace at the pinned commit recorded in
