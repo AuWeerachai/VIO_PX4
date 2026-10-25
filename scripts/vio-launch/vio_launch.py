@@ -1434,7 +1434,7 @@ def show_navigation_status(cfg: Config) -> None:
         vio_status = "VIO unhealthy"
     gate_status = "unhealthy" if status.get("pose_gate_quarantine") else "healthy"
     vio_age = status.get("vio_age_s")
-    latency = f"{float(vio_age) * 1000.0:.1f} ms" if vio_age is not None else "unavailable"
+    accepted_age = f"{float(vio_age):.2f} s" if vio_age is not None else "unavailable"
 
     print(f"- Connection status: {connection}")
     print(f"- VIO status: {vio_status}")
@@ -1447,7 +1447,21 @@ def show_navigation_status(cfg: Config) -> None:
         print("- Global position uncertainty: movement was discarded during recovery; "
               "verify/reset origin before relying on tight GPS accuracy")
     if status.get("inertial_recovery_active"):
-        if (status.get("inertial_recovery_safe")
+        if "recovery_position_safe" in status:
+            if status["recovery_position_safe"]:
+                print("- Position recovery: tracking guarded PX4 displacement")
+            else:
+                print("- Position recovery: frozen; movement discarded "
+                      f"({status.get('inertial_recovery_failure') or 'unknown reason'})")
+            if status.get("recovery_heading_safe"):
+                print("- Heading recovery: tracking; checking VIO agreement")
+            else:
+                print("- Heading recovery: blocked; restart/re-alignment required "
+                      f"({status.get('recovery_heading_failure') or 'unknown reason'})")
+            velocity_count = int(status.get("recovery_velocity_agreement_count", 0))
+            print(f"- Recovery velocity agreement: {velocity_count}/"
+                  f"{cfg.recovery_velocity_agreement_samples}")
+        elif (status.get("inertial_recovery_safe")
                 and status.get("inertial_fallback_to_frozen_pose")):
             print("- Recovery: displacement timed out; position frozen; "
                   "checking fresh PX4 yaw and stable VIO before resuming")
@@ -1481,7 +1495,7 @@ def show_navigation_status(cfg: Config) -> None:
         )
         if reordered:
             print(f"- Slightly late PX4 messages ignored: {reordered}")
-    print(f"- Latency: {latency}")
+    print(f"- Last accepted VIO sample: {accepted_age} ago")
     remaining = status.get("spoof_remaining_s")
     if remaining is not None:
         print(f"- Spoof remaining: {float(remaining):.1f} s")

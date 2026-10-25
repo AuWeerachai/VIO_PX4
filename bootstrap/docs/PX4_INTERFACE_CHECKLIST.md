@@ -97,28 +97,44 @@ firmware because message handling and estimator requirements can change.
 - [ ] Verify a stationary disturbance resumes exactly at the trusted anchor.
 - [ ] Verify real motion during quarantine resumes at the trusted anchor plus
   the guarded PX4 inertial displacement.
-- [ ] Verify stale, non-finite, timestamp-regressed, excessive-gap, over-speed,
-  over-acceleration and over-yaw-rate PX4 data discards the
-  propagated displacement, freezes position, and keeps HIL_GPS stopped because
-  heading is no longer independently verified.
-- [ ] Duration expiry alone freezes position but keeps fresh, continuous yaw
-  tracking. Require the existing VIO stability, velocity and relative-yaw
-  agreement windows before resuming. Reset/freshness guards remain active.
+- [ ] Position and heading safety have independent state from quarantine entry.
+  Excessive position uncertainty, speed, acceleration, displacement, or elapsed
+  propagation time discards translation only. Continue tracking valid yaw and
+  monitoring fresh odometry/reset counters; do not erase yaw or latch it unsafe
+  solely because translation failed.
+- [ ] After a position-only failure, require the full VIO stability window,
+  fresh physically plausible PX4 velocity agreement, and relative-yaw agreement
+  before resuming from the frozen position. A new velocity fault restarts its
+  agreement window; it cannot contribute to recovery.
+- [ ] Stale/non-finite/regressed/gapped attitude or excessive yaw rate latches
+  heading unsafe. A PX4 estimator reset, untrusted odometry source/frame, or
+  loss of odometry timing/reset-counter continuity blocks recovery too: the
+  available telemetry cannot exclude an intervening yaw reset. Fresh VIO alone
+  cannot repair the missing independent heading reference; do not auto-unlatch.
+- [ ] Verify the reported case: position uncertainty 3.109 m with a 3 m limit
+  freezes translation while heading remains tracked. A stable stationary VIO
+  epoch passes all windows and resumes at the frozen anchor, not at its jump.
 - [ ] Frozen-position recovery loses real movement. Advertise an uncertainty
   floor based on configured maximum speed times quarantine duration; never
   tighten it just because relative vision is stable. Verify a new global
   origin before restarting to clear this floor. PX4 may reject this degraded GPS.
 - [ ] Require consecutive VIO/PX4 velocity agreement before accepting a
-  successful propagated handoff.
+  successful propagated or frozen handoff. Count unique PX4 odometry timestamps,
+  not repeated VIO callbacks using the same telemetry sample. Compare velocity
+  using the final recovery rotation, including guarded yaw motion.
 - [ ] Require consecutive unique PX4 attitude samples where post-reset VIO yaw
   change agrees with PX4 yaw change. Never compare the arbitrary absolute yaw
   origin of the recovered VIO epoch.
 - [ ] Verify a yaw disagreement resets the recovery window without allowing
   rejected samples to contribute to the next agreement window.
+- [ ] A new candidate/reconfirmed epoch resets both agreement windows without
+  resetting the propagation timer or clearing latched reference failures.
 - [ ] Verify small out-of-order PX4 motion packets are dropped and counted,
   while regressions beyond `inertial_reorder_tolerance_s` reject propagation.
 - [ ] Verify rejected PX4 propagation freezes position but never bypasses
   heading validation or automatically resumes HIL_GPS.
+- [ ] Status shows separate position/heading recovery outcomes and reasons.
+  "Last accepted VIO sample" is accepted-data age, not transport/camera latency.
 - [ ] Resume with EPH no tighter than PX4's horizontal uncertainty, then tighten
   gradually to the configured 0.1 m VIO accuracy.
 - [ ] After re-anchoring, keep GPS stopped for
