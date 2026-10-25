@@ -36,7 +36,7 @@ def bridge():
     source = Path(__file__).parents[1] / 'vio_px4_bridge/vio_px4_gps_bridge.py'
     cls = next(n for n in ast.parse(source.read_text()).body
                if isinstance(n, ast.ClassDef) and n.name == 'VioPx4GpsBridge')
-    names = {'_inertial_recovery_target', '_integrate_px4_yaw',
+    names = {'_start_inertial_propagation', '_inertial_recovery_target', '_integrate_px4_yaw',
              '_update_px4_odometry', '_fail_inertial_propagation',
              '_recovery_yaw_agrees', '_finish_inertial_propagation', '_select_accuracy'}
     module = ast.Module(body=[n for n in cls.body if getattr(n, 'name', '') in names],
@@ -72,6 +72,28 @@ def bridge():
     obj.phase = 'live'
     obj.frozen_position_uncertainty_m = 0.0
     return obj
+
+
+def test_repeated_quarantine_preserves_original_propagation_boundary(bridge):
+    boundary = bridge.inertial_start_odometry
+    bridge._start_inertial_propagation()
+    assert bridge.inertial_start_time == 7.0
+    assert bridge.inertial_start_odometry == boundary
+    assert bridge.inertial_displacement_ned == [1.0, 2.0, 0.0]
+    assert bridge.inertial_yaw_delta == 0.4
+    # The original two-second deadline has still expired.
+    assert bridge._inertial_recovery_target() == ((0, 0, 0), 0.4)
+
+
+def test_repeated_quarantine_cannot_clear_latched_propagation_failure(bridge):
+    bridge._fail_inertial_propagation('px4_estimator_reset')
+    bridge._start_inertial_propagation()
+    assert bridge.inertial_active
+    assert not bridge.inertial_safe
+    assert bridge.inertial_failure_reason == 'px4_estimator_reset'
+    assert bridge.inertial_start_time == 7.0
+    assert bridge._inertial_recovery_target() == ((0, 0, 0), 0)
+    assert not bridge._recovery_yaw_agrees(2.0)
 
 
 def test_timeout_freezes_translation_but_preserves_guarded_yaw(bridge):

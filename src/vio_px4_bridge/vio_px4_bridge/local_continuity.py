@@ -204,15 +204,13 @@ class LocalPoseContinuity:
             self.suspect_detail = self._gate_detail(accepted, sample, reason)
             return self._held(reason, "quarantine_started", self.suspect_detail)
         else:
-            # Returning to the accepted trajectory means the prior point was
-            # an isolated outlier; discard it without moving the origin.
-            if self._motion_reason(accepted, sample, enforce_gap=False) is None:
-                old_reason, old_detail = self.suspect_reason, self.suspect_detail
-                self._clear_suspect()
-                self.recovery_anchor_position = self.recovery_anchor_yaw = None
-                return self._accept(sample, reason=old_reason,
-                                    event="isolated_outlier_rejected",
-                                    detail=old_detail)
+            # Quarantine is latched until full recovery. Never compare a new
+            # point to the increasingly old accepted sample to release it:
+            # delta/time would become small enough simply by waiting, allowing
+            # a persistent coordinate jump through without verified recovery.
+            # Even a return to the original trajectory must form a consistent
+            # candidate, pass the stable-sample period, and obtain an
+            # independently validated recovery target from the bridge.
             candidate_reason = self._motion_reason(self.suspect_samples[-1], sample)
             if candidate_reason is None:
                 self.suspect_samples.append(sample)

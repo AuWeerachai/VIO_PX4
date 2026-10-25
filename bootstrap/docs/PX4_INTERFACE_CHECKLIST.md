@@ -79,8 +79,11 @@ firmware because message handling and estimator requirements can change.
 - [ ] On cuVSLAM reset/relocalization, stop live GPS and require realignment.
 - [ ] A single innovation failure enters quarantine and stops live GPS; it must
   not immediately move the local-to-global origin.
-- [ ] Verify an isolated bad pose that returns to the old trajectory is dropped
-  without incrementing the continuity epoch.
+- [ ] Once quarantine starts, require full confirmation and recovery checks,
+  even if a sample returns to the old trajectory. No single-sample shortcut
+  may resume GPS or accept a jump merely because time has elapsed.
+- [ ] Repeated disturbances within one quarantine must preserve the original
+  PX4 propagation reference, time limit, and latched safety failures.
 - [ ] Require `continuity_confirmation_samples` internally consistent poses
   before declaring a new cuVSLAM coordinate epoch.
 - [ ] Verify candidate and recovery VIO samples cannot modify the last trusted

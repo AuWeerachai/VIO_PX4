@@ -50,17 +50,57 @@ def test_confirmed_position_jump_uses_independent_motion_only():
     assert update(tracker, 105.0, t=8.0, vx=1.0).position == (14.0, 0.0, 0.0)
 
 
-def test_isolated_outlier_is_discarded_without_reanchor():
-    tracker = LocalPoseContinuity()
+def test_return_to_original_path_requires_full_recovery():
+    tracker = LocalPoseContinuity(confirmation_samples=3, recovery_samples=2)
     update(tracker, 0.0, t=1.0, vx=1.0)
     before = update(tracker, 1.0, t=2.0, vx=1.0)
     bad = update(tracker, 50.0, t=3.0, vx=1.0)
     assert bad.recovering and bad.position == before.position
-    recovered = update(tracker, 3.0, t=4.0, vx=1.0)
+    for x, t in [(3, 4), (4, 5), (5, 6), (6, 7)]:
+        result = update(tracker, x, t=t, vx=1.0,
+                        recovery_displacement=(t - 2, 0, 0))
+        assert result.recovering
+        assert result.position == before.position
+        assert result.event != "isolated_outlier_rejected"
+    recovered = update(tracker, 7.0, t=8.0, vx=1.0,
+                       recovery_displacement=(6.0, 0.0, 0.0))
     assert not recovered.recovering
-    assert not recovered.reanchored
-    assert recovered.epoch == 0
-    assert recovered.position == (3.0, 0.0, 0.0)
+    assert recovered.event == "recovery_completed"
+    assert recovered.epoch == 1
+    assert recovered.position == (7.0, 0.0, 0.0)
+
+
+def test_waiting_cannot_make_a_ten_metre_jump_acceptable():
+    tracker = LocalPoseContinuity(max_speed_mps=15, max_acceleration_mps2=40,
+                                  confirmation_samples=15, recovery_samples=30)
+    update(tracker, 0, t=0)
+    for t in (.01, .10, .30, .50, .68, .90, 1.1):
+        result = update(tracker, 10, t=t)
+        assert result.recovering
+        assert result.position == (0, 0, 0)
+        assert result.event != "isolated_outlier_rejected"
+
+
+def test_90hz_disturbance_never_releases_based_on_age_of_old_sample():
+    tracker = LocalPoseContinuity(max_speed_mps=15, max_acceleration_mps2=40,
+                                  confirmation_samples=15, recovery_samples=30)
+    update(tracker, 0, t=0)
+    # Keep restarting candidates, then return exactly to the old position.
+    # Neither elapsed time nor that single plausible point may release GPS.
+    for i in range(1, 181):
+        result = update(tracker, 10 + (i % 2), t=i / 90)
+        assert result.recovering and result.position == (0, 0, 0)
+    returned = update(tracker, 0, t=181 / 90)
+    assert returned.recovering and returned.position == (0, 0, 0)
+
+
+def test_return_to_old_path_does_not_bypass_independent_target_requirement():
+    tracker = LocalPoseContinuity(confirmation_samples=3, recovery_samples=2)
+    update(tracker, 0, t=0)
+    assert update(tracker, 50, t=.01).recovering
+    for i in range(2, 200):
+        result = update(tracker, 0, t=i * .01)
+        assert result.recovering and result.position == (0, 0, 0)
 
 
 def test_yaw_jump_preserves_position_and_heading():

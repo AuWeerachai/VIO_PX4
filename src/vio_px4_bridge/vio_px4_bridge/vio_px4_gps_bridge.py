@@ -785,6 +785,10 @@ class VioPx4GpsBridge(Node):
         )
 
     def _start_inertial_propagation(self):
+        # Another candidate can fail during the same quarantine. Keep the
+        # original motion reference, deadline, and any latched safety failure.
+        if self.inertial_active:
+            return
         now = time.monotonic()
         self.inertial_active = True
         self.inertial_safe = True
@@ -1023,16 +1027,6 @@ class VioPx4GpsBridge(Node):
             f"elapsed_s={elapsed:.3f} source={source} resume_eph_m={resume_eph:.3f}"
         )
         self.inertial_active = False
-
-    def _cancel_inertial_propagation(self, reason: str):
-        if not self.inertial_active:
-            return
-        self.get_logger().info(
-            f"VIO_INERTIAL_RECOVERY_CANCELLED reason={reason}; "
-            "no propagated displacement applied"
-        )
-        self.inertial_active = False
-        self.inertial_safe = False
 
     def _recovery_velocity_agrees(self, local_velocity) -> bool:
         """Require recovered VIO motion to agree with PX4 before handoff."""
@@ -1284,8 +1278,6 @@ class VioPx4GpsBridge(Node):
                 self.recovery_yaw_agreement_state = "waiting_for_baseline"
             elif continuity.event == "recovery_completed":
                 self._finish_inertial_propagation()
-            elif continuity.event == "isolated_outlier_rejected":
-                self._cancel_inertial_propagation("isolated_outlier")
         if continuity.recovering:
             self.continuity_recovering = True
             return
