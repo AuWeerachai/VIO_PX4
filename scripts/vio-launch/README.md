@@ -32,7 +32,7 @@ The archived IMU tools/cache are not needed for VO and are not deleted.
 | **Path B — External vision** | Body VIO → MAVROS → Cube (`ODOMETRY`) |
 | **FC link** | Pick direct UART/USB serial, UDP networking, or keep the current setting |
 | **Home latitude/longitude** | Horizontal spoof/origin position |
-| **Heading alignment** | Configure compass/manual true-heading alignment |
+| **Heading alignment** | Use PX4 estimated heading (default) or explicit manual true heading |
 | **Camera extrinsic** | Configure the full ROS FLU `drone_link → camera_link` XYZ/RPY transform |
 | **Pose-jump gate limits** | Configure physical rate, timing, and recovery limits |
 | **RViz auto-launch** | Persistently toggle automatic RViz startup; default OFF |
@@ -45,6 +45,14 @@ the installed MAVROS workspace on that serial link. The paths are mutually
 exclusive; Micro XRCE-DDS is not used.
 
 Settings persist in `~/.config/vio-launch/config.json`.
+
+Old `heading_source=compass` settings automatically migrate to `px4` when loaded
+(persisted on the next settings save). The bridge also accepts `compass` as a
+deprecated alias for `px4`, with a warning. No bridge declination is added to
+PX4 yaw. Finish calibration and verify PX4's true heading before starting Path A.
+Fresh, stationary startup samples align the local trajectory to PX4; the offset
+then stays fixed in normal tracking. Existing quarantine recovery is unchanged.
+This does not certify north alignment or remove magnetic interference.
 
 Camera translation uses ROS FLU axes: +X forward, +Y left, and +Z up.
 Positive roll, pitch, and yaw follow the right-hand rule. In particular,

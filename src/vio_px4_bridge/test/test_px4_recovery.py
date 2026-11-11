@@ -102,6 +102,7 @@ def bridge():
     obj.poll_real = type(obj)._poll_mavlink.__get__(obj)
     obj.transport = 'mavlink'
     obj.px4_target_sysid = 1
+    obj.px4_target_compid = 1
     obj._maybe_end_spoof_by_timer = Mock()
     obj._set_live_output_state = Mock()
     obj._publish_fix = Mock()
@@ -425,7 +426,7 @@ def telemetry(bridge, t, counter, yaw=0., gyro_z=0., attitude_first=True,
         rollspeed=0., pitchspeed=0., yawspeed=gyro_z,
         pose_covariance=[variance]*21, reset_counter=counter, quality=quality)
     attitude = SimpleNamespace(
-        get_type=lambda: 'ATTITUDE', get_srcSystem=lambda: 1,
+        get_type=lambda: 'ATTITUDE', get_srcSystem=lambda: 1, get_srcComponent=lambda: 1,
         time_boot_ms=round(t*1000), roll=0., pitch=0., yaw=yaw)
     queue = [attitude, odom, None] if attitude_first else [odom, attitude, None]
     bridge._mav = SimpleNamespace(recv_match=Mock(side_effect=queue))

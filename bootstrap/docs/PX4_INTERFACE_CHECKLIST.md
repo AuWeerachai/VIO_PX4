@@ -52,29 +52,36 @@ firmware because message handling and estimator requirements can change.
   do not enable GPS dual-antenna heading fusion.
 - [ ] Static spoof has zero velocity and cannot establish heading.
 - [ ] Live handoff is forbidden until VIO is fresh and its world yaw has been
-  aligned to true north from an independent reference.
+  aligned to PX4's verified heading (or an explicit manual true heading).
 - [ ] Loss/staleness of VIO stops GPS messages rather than freezing a plausible
   moving fix, allowing PX4 to time out that source and fall back to Here GNSS.
 - [ ] Confirm `VIO_GPS_OUTPUT_STOPPED` and `VIO_GPS_OUTPUT_RESUMED` transitions
   in the bridge log and corresponding `VIO GPS:` messages in QGroundControl
   during a propeller-off VIO disconnect/recovery test.
 
-## Non-circular heading alignment
+## PX4-owned heading alignment
 
-- [ ] `MAG_DECLINATION_RESOLVED` reports the configured initial/home LLA, the
-  expected east-positive declination, bundled table path, and
-  `frozen_for_flight=true` before compass samples are accepted.
-- [ ] A table load/validation failure blocks launch. Manual fallback requires
-  explicitly selecting `mag_declination_source=manual`; never silently use 0°.
-- [ ] Request and receive PX4 `HIGHRES_IMU` magnetometer and `ATTITUDE` streams.
-- [ ] Use calibrated body-FRD magnetometer plus FC roll/pitch for tilt
-  compensation. Do not use FC/EKF yaw in the alignment calculation.
-- [ ] Apply magnetic declination for the configured home position.
+- [ ] Complete PX4 compass/heading calibration before starting the bridge.
+  Verify its true heading against an independent known direction, props off.
+- [ ] Default `heading_source=px4` uses MAVLink `ATTITUDE.yaw` (NED, radians).
+  Legacy `compass` settings migrate to `px4`; explicit `manual` remains available.
+- [ ] No bridge declination or magnetometer mounting correction is applied to
+  PX4 yaw. Legacy `mag_*` alignment parameters are accepted but ignored.
+- [ ] Receive fresh ATTITUDE from the connected PX4 system/component, not another
+  companion. No HIGHRES_IMU stream or declination table is needed for alignment.
 - [ ] Apply the measured cuVSLAM child-frame-to-vehicle-body mounting rotation.
-- [ ] Collect a stationary, fresh sample window; reject excessive circular
-  spread, stale attitude/magnetometer, invalid magnitude, or moving VIO.
+- [ ] Collect 30 distinct timestamped stationary heading-offset samples by
+  default, with at most 5 degrees circular spread and 0.5 s telemetry age/gap.
+  Invalid data, timestamp regression, movement, or stale data clears the window.
+- [ ] A heading change before live handoff reopens startup alignment. Confirm
+  `PX4_STARTUP_HEADING_ALIGNED` and check the reported offset. RC activation and
+  startup visual resets require new samples; stale evidence cannot authorize handoff.
+- [ ] These are telemetry checks, NOT proof that PX4 has initialized true north:
+  ATTITUDE has no yaw-aligned flag, and this firmware's ESTIMATOR_ATTITUDE bit
+  only confirms tilt alignment. Do not claim independent heading accuracy.
 - [ ] Freeze the accepted yaw offset. Never continuously update it from PX4
-  fused yaw after injected GPS begins.
+  fused yaw during normal live tracking. Existing GPS-silent quarantine recovery
+  still uses current FCU heading to orient the recovered local epoch.
 - [ ] Rotate both VIO displacement and world velocity by the same offset.
 - [ ] On cuVSLAM reset/relocalization, stop live GPS and require realignment.
 - [ ] A single innovation failure enters quarantine and stops live GPS; it must

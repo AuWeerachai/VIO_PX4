@@ -41,15 +41,13 @@ from vio_px4_bridge.geo_utils import ned_offset_to_lla
 from vio_px4_bridge.geo_utils import mavlink_velocity_to_ned
 from vio_px4_bridge.geo_utils import rotate_ned_heading
 from vio_px4_bridge.geo_utils import rotate_vector_by_quaternion_xyzw
-from vio_px4_bridge.geo_utils import tilt_compensated_compass_yaw
 from vio_px4_bridge.geo_utils import wrap_pi
 from vio_px4_bridge.geo_utils import yaw_from_quaternion_xyzw
 from vio_px4_bridge.local_continuity import LocalPoseContinuity
 from vio_px4_bridge.recovery_yaw import RecoveryYawAgreement
 from vio_px4_bridge.recovery_yaw import timestamp_order
-from vio_px4_bridge.mag_declination import default_table_path
-from vio_px4_bridge.mag_declination import lookup_declination_deg
 from vio_px4_bridge.spoof_readiness import SpoofReadiness
+from vio_px4_bridge.startup_heading import Px4StartupHeading, heading_source
 
 
 class Phase(Enum):
@@ -122,11 +120,12 @@ class VioPx4GpsBridge(Node):
         self.declare_parameter("rc_high_pwm_min", 1700)
         self.declare_parameter("rc_request_rate_hz", 10.0)
 
-        # Absolute heading alignment. Compass mode uses FC roll/pitch and the
-        # calibrated body-frame magnetometer, never the FC's fused yaw.
-        self.declare_parameter("heading_source", "compass")  # compass | manual
+        # PX4 owns earth heading at startup and recovery. Never add declination
+        # to ATTITUDE yaw: PX4 has already applied its heading corrections.
+        self.declare_parameter("heading_source", "px4")  # px4 | manual
         self.declare_parameter("manual_heading_deg", 0.0)
-        self.declare_parameter("mag_declination_source", "table")  # table | manual
+        # Legacy launch parameters accepted but no longer used for alignment.
+        self.declare_parameter("mag_declination_source", "table")
         self.declare_parameter("mag_declination_deg", 0.0)
         self.declare_parameter("mag_declination_table_path", "")
         self.declare_parameter("child_to_body_yaw_deg", 0.0)
@@ -221,61 +220,23 @@ class VioPx4GpsBridge(Node):
         if self.rc_low_pwm_max >= self.rc_high_pwm_min:
             raise ValueError("rc_low_pwm_max must be below rc_high_pwm_min")
 
-        self.heading_source = str(self.get_parameter("heading_source").value).lower()
-        if self.heading_source not in ("compass", "manual"):
-            raise ValueError("heading_source must be 'compass' or 'manual'")
-        if self.transport == "ros2" and self.heading_source == "compass":
+        requested_heading_source = self.get_parameter("heading_source").value
+        self.heading_source = heading_source(requested_heading_source)
+        if str(requested_heading_source).strip().lower() == "compass":
+            self.get_logger().warn(
+                "Legacy heading_source=compass migrated to px4; bridge declination "
+                "and magnetometer offsets are ignored. Verify PX4 heading before starting."
+            )
+        if self.transport == "ros2" and self.heading_source == "px4":
             raise ValueError(
-                "heading_source=compass requires MAVLink ATTITUDE/HIGHRES_IMU; "
+                "heading_source=px4 requires MAVLink ATTITUDE; "
                 "use transport=mavlink or an independently verified manual heading"
             )
         self.manual_heading_rad = math.radians(
             float(self.get_parameter("manual_heading_deg").value)
         )
-        manual_declination_deg = float(self.get_parameter("mag_declination_deg").value)
-        self.mag_declination_source = str(
-            self.get_parameter("mag_declination_source").value
-        ).lower()
-        if self.mag_declination_source not in ("table", "manual"):
-            raise ValueError("mag_declination_source must be 'table' or 'manual'")
-        table_path_param = str(
-            self.get_parameter("mag_declination_table_path").value
-        ).strip()
-        resolved_declination_deg = manual_declination_deg
-        if self.heading_source == "compass" and self.mag_declination_source == "table":
-            table_path = table_path_param or str(default_table_path())
-            try:
-                resolved_declination_deg = lookup_declination_deg(
-                    self.home_lat, self.home_lon, table_path
-                )
-                self.get_logger().info(
-                    "MAG_DECLINATION_RESOLVED "
-                    f"source=initial_home lat_deg={self.home_lat:.7f} "
-                    f"lon_deg={self.home_lon:.7f} "
-                    f"declination_deg={resolved_declination_deg:.3f} "
-                    f"table={table_path}; frozen_for_flight=true"
-                )
-            except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
-                self.get_logger().error(
-                    "MAG_DECLINATION_TABLE_FAILED "
-                    f"table={table_path} error={exc}; heading alignment blocked"
-                )
-                raise RuntimeError(
-                    "magnetic declination table lookup failed; repair the table "
-                    "or explicitly select mag_declination_source=manual"
-                ) from exc
-        self.mag_declination_deg = resolved_declination_deg
-        self.mag_declination_rad = math.radians(resolved_declination_deg)
         self.child_to_body_yaw_rad = math.radians(
             float(self.get_parameter("child_to_body_yaw_deg").value)
-        )
-        self.mag_mount_rpy = tuple(
-            math.radians(float(self.get_parameter(name).value))
-            for name in (
-                "mag_roll_offset_deg",
-                "mag_pitch_offset_deg",
-                "mag_yaw_offset_deg",
-            )
         )
         self.alignment_sample_count = max(
             5, int(self.get_parameter("alignment_samples").value)
@@ -288,6 +249,10 @@ class VioPx4GpsBridge(Node):
         )
         self.alignment_sensor_max_age_s = max(
             0.05, float(self.get_parameter("alignment_sensor_max_age_s").value)
+        )
+        self.startup_heading = Px4StartupHeading(
+            self.alignment_sample_count, self.alignment_max_std_rad,
+            self.alignment_max_speed, self.alignment_sensor_max_age_s,
         )
         self.continuity = LocalPoseContinuity(
             max_gap_s=float(self.get_parameter("continuity_max_gap_s").value),
@@ -361,9 +326,6 @@ class VioPx4GpsBridge(Node):
         self.last_rc_position = None
         self.messages_sent = 0
         self.heading_offset_rad = None
-        self.heading_samples = []
-        self.latest_attitude = None
-        self.latest_mag = None
         self.latest_px4_velocity = None
         self.latest_px4_yaw = None
         self.latest_px4_odometry = None
@@ -392,7 +354,6 @@ class VioPx4GpsBridge(Node):
         self.recovery_resume_eph_m = None
         self.frozen_position_uncertainty_m = 0.0
         self.recovery_resume_time = None
-        self.last_alignment_mag_id = None
         self.logged_odom_frames = False
         self.continuity_recovering = False
         self.live_output_active = False
@@ -487,6 +448,11 @@ class VioPx4GpsBridge(Node):
                 and (now - self.last_px4_heartbeat_time) <= self.heartbeat_timeout_s
             ),
             "heading_aligned": self.heading_offset_rad is not None,
+            "heading_source": self.heading_source,
+            "startup_heading_status": (
+                self.startup_heading.reason if self.heading_source == "px4"
+                else "explicit manual heading"
+            ),
             "pose_gate_quarantine": self.continuity_recovering,
             "inertial_recovery_active": self.inertial_active,
             "inertial_recovery_safe": self.inertial_position_safe and self.inertial_heading_safe,
@@ -613,7 +579,7 @@ class VioPx4GpsBridge(Node):
                 raise RuntimeError(
                     "EKF2_GPS_CTRL must be 1: longitude/latitude only; altitude "
                     "uses the configured height source, velocity is not fused, "
-                    f"and heading stays on compass (current={gps_ctrl_bits})"
+                    f"and GPS yaw is not fused (current={gps_ctrl_bits})"
                 )
             noaid_tout_s = float(noaid_tout_us) * 1e-6
             self.get_logger().info(
@@ -644,11 +610,11 @@ class VioPx4GpsBridge(Node):
                 "Requested ATTITUDE and ODOMETRY at 20 Hz for guarded GPS-silent "
                 "recovery (PX4 position/velocity variance and reset counter included)"
             )
-            if self.heading_source == "compass":
-                self._request_mavlink_stream(
-                    heartbeat, mavutil.mavlink.MAVLINK_MSG_ID_HIGHRES_IMU, 20.0
+            self.px4_target_compid = heartbeat.get_srcComponent()
+            if self.heading_source == "px4":
+                self.get_logger().info(
+                    "Startup heading uses PX4 ATTITUDE yaw; no bridge compass/declination correction"
                 )
-                self.get_logger().info("Requested HIGHRES_IMU at 20 Hz")
             self._send_status_text("VIO GPS: PX4 link ready", 6)
         elif self.transport == "ros2":
             if SensorGps is None:
@@ -1256,7 +1222,13 @@ class VioPx4GpsBridge(Node):
         if not self.have_vio or self.last_vio_time is None or now - self.last_vio_time > self.vio_timeout_s:
             return "accepted VIO odometry not fresh"
         if self.heading_offset_rad is None:
+            if self.heading_source == "px4":
+                return f"heading alignment incomplete: {self.startup_heading.reason}"
             return "heading alignment incomplete"
+        if self.heading_source == "px4" and (
+            self.startup_heading.offset is None or not self.startup_heading.fresh(now)
+        ):
+            return "PX4 startup heading missing, stale, or collecting fresh samples"
         if self.continuity_recovering:
             return "pose-jump gate recovering"
         return self.camera_readiness.reason(now)
@@ -1365,8 +1337,7 @@ class VioPx4GpsBridge(Node):
             self.camera_readiness.odom.reset("pose-jump gate restarted startup trajectory")
             self.anchor_ned = None
             self.heading_offset_rad = None
-            self.heading_samples.clear()
-            self.last_alignment_mag_id = None
+            self.startup_heading.reset()
             self.continuity.reset()
             continuity = self.continuity.update(
                 (north, east, down), raw_body_yaw_ned, (vn, ve, vd),
@@ -1457,10 +1428,14 @@ class VioPx4GpsBridge(Node):
                 self._send_status_text("VIO GPS: VIO ready, aligning heading", 6)
 
     def _update_heading_alignment(self, vio_body_yaw_ned: float, horizontal_speed: float):
-        if self.heading_offset_rad is not None:
+        # Normal tracking and quarantine recovery retain the original fixed
+        # offset. Recovery aligns its new local epoch using current FCU yaw.
+        if self.phase == Phase.LIVE:
             return
 
         if self.heading_source == "manual":
+            if self.heading_offset_rad is not None:
+                return
             self.heading_offset_rad = wrap_pi(
                 self.manual_heading_rad - vio_body_yaw_ned
             )
@@ -1470,61 +1445,22 @@ class VioPx4GpsBridge(Node):
             )
             return
 
-        now = time.monotonic()
-        if self.latest_attitude is None or self.latest_mag is None:
-            return
-        att_time, roll, pitch, _yaw = self.latest_attitude
-        mag_time, mag_id, mx, my, mz = self.latest_mag
-        if now - att_time > self.alignment_sensor_max_age_s:
-            return
-        if now - mag_time > self.alignment_sensor_max_age_s:
-            return
-        if mag_id == self.last_alignment_mag_id:
-            return
-        if horizontal_speed > self.alignment_max_speed:
-            return
-
-        mx, my, mz = self._rotate_mag_mount(mx, my, mz)
-        mag_norm = math.sqrt(mx * mx + my * my + mz * mz)
-        if not math.isfinite(mag_norm) or mag_norm < 1e-6:
-            return
-        compass_yaw = tilt_compensated_compass_yaw(
-            roll, pitch, mx, my, mz, self.mag_declination_rad
+        previous = self.heading_offset_rad
+        self.heading_offset_rad = self.startup_heading.update(
+            vio_body_yaw_ned, horizontal_speed, time.monotonic()
         )
-        offset = wrap_pi(compass_yaw - vio_body_yaw_ned)
-        self.last_alignment_mag_id = mag_id
-        self.heading_samples.append(offset)
-        if len(self.heading_samples) < self.alignment_sample_count:
-            return
-
-        sin_mean = sum(math.sin(x) for x in self.heading_samples) / len(self.heading_samples)
-        cos_mean = sum(math.cos(x) for x in self.heading_samples) / len(self.heading_samples)
-        resultant = math.hypot(sin_mean, cos_mean)
-        circular_std = math.sqrt(max(0.0, -2.0 * math.log(max(resultant, 1e-12))))
-        if circular_std > self.alignment_max_std_rad:
+        if self.heading_offset_rad is None and previous is not None:
             self.get_logger().warn(
-                "Compass/VIO heading samples unstable; restarting alignment "
-                f"(std={math.degrees(circular_std):.1f} deg)"
+                f"PX4_STARTUP_HEADING_WAIT: {self.startup_heading.reason}"
             )
-            self.heading_samples.clear()
-            return
-        self.heading_offset_rad = math.atan2(sin_mean, cos_mean)
-        self.get_logger().info(
-            "Independent compass heading alignment locked and frozen: "
-            f"offset={math.degrees(self.heading_offset_rad):.2f} deg, "
-            f"std={math.degrees(circular_std):.2f} deg, n={len(self.heading_samples)}"
-        )
-        self._send_status_text("VIO GPS: heading aligned", 6)
-
-    def _rotate_mag_mount(self, x: float, y: float, z: float):
-        """Apply configured Rx, then Ry, then Rz compass-to-body offsets."""
-        roll, pitch, yaw = self.mag_mount_rpy
-        cr, sr = math.cos(roll), math.sin(roll)
-        cp, sp = math.cos(pitch), math.sin(pitch)
-        cy, sy = math.cos(yaw), math.sin(yaw)
-        x1, y1, z1 = x, cr * y - sr * z, sr * y + cr * z
-        x2, y2, z2 = cp * x1 + sp * z1, y1, -sp * x1 + cp * z1
-        return cy * x2 - sy * y2, sy * x2 + cy * y2, z2
+        elif self.heading_offset_rad is not None and previous is None:
+            self.get_logger().info(
+                "PX4_STARTUP_HEADING_ALIGNED "
+                f"offset_deg={math.degrees(self.heading_offset_rad):.2f} "
+                f"samples={self.alignment_sample_count}; "
+                "no extra declination; fixed during live tracking"
+            )
+            self._send_status_text("VIO GPS: aligned to PX4 heading", 6)
 
     def _select_accuracy(self) -> tuple[float, float]:
         if self.phase == Phase.SPOOF:
@@ -1606,16 +1542,21 @@ class VioPx4GpsBridge(Node):
                 self.last_px4_heartbeat_time = now
                 continue
             if message_type == "ATTITUDE":
+                # Do not use another component's attitude on the same system.
+                if int(msg.get_srcComponent()) != self.px4_target_compid:
+                    continue
                 roll, pitch, yaw = float(msg.roll), float(msg.pitch), float(msg.yaw)
                 boot_time = float(msg.time_boot_ms) * 1e-3
                 if all(math.isfinite(value) for value in (roll, pitch, yaw, boot_time)):
-                    # Initial earth-heading alignment is unchanged. Recovery
-                    # trusts current PX4 yaw while HIL_GPS is silent.
-                    self.latest_attitude = (now, roll, pitch, yaw)
+                    if self.phase != Phase.LIVE:
+                        self.startup_heading.observe(now, boot_time, yaw)
                     self._integrate_px4_yaw((now, boot_time, yaw))
-                elif self.inertial_active:
-                    self.latest_px4_yaw = None
-                    self._reject_heading_recovery("invalid_px4_attitude_sample")
+                else:
+                    if self.phase != Phase.LIVE:
+                        self.startup_heading.observe(now, boot_time, float("nan"))
+                    if self.inertial_active:
+                        self.latest_px4_yaw = None
+                        self._reject_heading_recovery("invalid_px4_attitude_sample")
                 continue
             if message_type == "ODOMETRY":
                 sample_time = float(msg.time_usec) * 1e-6
@@ -1655,16 +1596,6 @@ class VioPx4GpsBridge(Node):
                          var_n, var_e, reset_counter)
                     )
                 continue
-            if message_type == "HIGHRES_IMU":
-                fields = int(getattr(msg, "fields_updated", 0))
-                mag_mask = (1 << 6) | (1 << 7) | (1 << 8)
-                if fields and (fields & mag_mask) != mag_mask:
-                    continue
-                mx, my, mz = float(msg.xmag), float(msg.ymag), float(msg.zmag)
-                if all(math.isfinite(v) for v in (mx, my, mz)):
-                    mag_id = int(getattr(msg, "time_usec", 0)) or time.monotonic_ns()
-                    self.latest_mag = (now, mag_id, mx, my, mz)
-                continue
             if message_type != "RC_CHANNELS" or not self.rc_trigger_enabled:
                 continue
             pwm = int(getattr(msg, f"chan{self.rc_channel}_raw", 65535))
@@ -1688,8 +1619,7 @@ class VioPx4GpsBridge(Node):
             self.last_vio_time = None
             self.anchor_ned = None
             self.heading_offset_rad = None
-            self.heading_samples.clear()
-            self.last_alignment_mag_id = None
+            self.startup_heading.reset()
             self.spoof_failure_reason = None
             self._last_handoff_reason = None
             self.phase = Phase.SPOOF

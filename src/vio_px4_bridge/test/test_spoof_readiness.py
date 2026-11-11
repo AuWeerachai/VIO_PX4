@@ -123,6 +123,8 @@ def bridge():
     obj.last_vio_time = 15
     obj.vio_timeout_s = .5
     obj.heading_offset_rad = 0.0
+    obj.heading_source = 'px4'
+    obj.startup_heading = SimpleNamespace(offset=0.0, fresh=lambda now: True, reason='collecting samples')
     obj.continuity_recovering = False
     obj.camera_readiness = Mock()
     obj.camera_readiness.reason.return_value = None

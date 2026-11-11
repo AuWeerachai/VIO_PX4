@@ -70,7 +70,7 @@ class Config:
     mavlink_url: str = "/dev/ttyUSB0:921600"
     mavlink_sysid: int = 1
     odom_topic: str = "/visual_slam/tracking/odometry"
-    heading_source: str = "compass"
+    heading_source: str = "px4"
     manual_heading_deg: float = 0.0
     mag_declination_source: str = "table"
     mag_declination_deg: float = 0.0
@@ -193,34 +193,10 @@ def save_config(cfg: Config) -> None:
     atomic_write_json(path, payload)
 
 
-def resolved_declination_deg(cfg: Config) -> Optional[float]:
-    """Preview the same bundled grid lookup used by the ROS bridge."""
-    if cfg.mag_declination_source == "manual":
-        return cfg.mag_declination_deg
-    table_path = (cfg.vio_px4_dir / "src/vio_px4_bridge/vio_px4_bridge/data/"
-                  "declination_table.json")
-    try:
-        table = json.loads(table_path.read_text())
-        grid = table["declination_deg"]
-        lon = cfg.home_lon
-        while lon > 180.0: lon -= 360.0
-        while lon < -180.0: lon += 360.0
-        i = min(max((cfg.home_lat-table["lat_min_deg"])/table["lat_step_deg"], 0.0), len(grid)-1.0)
-        j = min(max((lon-table["lon_min_deg"])/table["lon_step_deg"], 0.0), len(grid[0])-1.0)
-        i0, j0 = min(int(i), len(grid)-2), min(int(j), len(grid[0])-2)
-        fi, fj = i-i0, j-j0
-        return (grid[i0][j0]*(1-fi)*(1-fj) + grid[i0+1][j0]*fi*(1-fj)
-                + grid[i0][j0+1]*(1-fi)*fj + grid[i0+1][j0+1]*fi*fj)
-    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-        return None
-
-
-def declination_label(cfg: Config) -> str:
-    value = resolved_declination_deg(cfg)
-    if cfg.mag_declination_source == "table":
-        return (f"table(home)={value:.2f}°" if value is not None
-                else "table unavailable (launch blocked)")
-    return f"manual={cfg.mag_declination_deg:.2f}°"
+def heading_label(cfg: Config) -> str:
+    if cfg.heading_source in ("px4", "compass"):
+        return "PX4 estimated heading (declination handled by PX4)"
+    return f"manual true heading {cfg.manual_heading_deg:g}°"
 
 
 def atomic_write_json(path: Path, payload: dict) -> None:
@@ -281,6 +257,8 @@ def apply_dict(cfg: Config, data: dict) -> Config:
     for key in ("vio_px4_dir", "ros_setup", "mavros_dir", "isaac_ros_dir"):
         if key in data and data[key]:
             updates[key] = expand(str(data[key]))
+    if str(updates.get("heading_source", "")).strip().lower() == "compass":
+        updates["heading_source"] = "px4"
     return replace(cfg, **updates) if updates else cfg
 
 
@@ -855,14 +833,6 @@ def cmd_doctor(cfg: Config) -> int:
             str(cfg.isaac_ros_dir),
         ),
     ]
-    if cfg.heading_source == "compass" and cfg.mag_declination_source == "table":
-        resolved_declination = resolved_declination_deg(cfg)
-        checks.append((
-            "Magnetic declination table",
-            resolved_declination is not None,
-            (f"home lookup {resolved_declination:.3f} deg"
-             if resolved_declination is not None else "missing or invalid"),
-        ))
     if cfg.mavlink_url.startswith("/dev/"):
         dev = cfg.mavlink_url.rsplit(":", 1)[0]
         exists = Path(dev).exists()
@@ -879,7 +849,7 @@ def cmd_doctor(cfg: Config) -> int:
             failed += 1
     print(f"\nhorizontal origin: {cfg.home_lat}, {cfg.home_lon}")
     print(f"odom:     {cfg.odom_topic}")
-    print(f"heading:  {cfg.heading_source}, declination={declination_label(cfg)}, "
+    print(f"heading:  {heading_label(cfg)}, "
           f"child-to-body={cfg.child_to_body_yaw_deg} deg")
     print(f"checklist: {cfg.vio_px4_dir / 'bootstrap/docs/PX4_INTERFACE_CHECKLIST.md'}")
     print(f"config:   {user_config_path()}")
@@ -1704,54 +1674,41 @@ def configure_home(cfg: Config) -> Config:
 
 def configure_heading(cfg: Config) -> Config:
     _clear()
-    print("Configure independent heading alignment\n")
-    print("Compass mode uses Cube magnetometer + roll/pitch, but never PX4 yaw.")
-    print("Angles are degrees; declination is east-positive, west-negative.\n")
-    source = prompt_line("Source (compass/manual)", cfg.heading_source)
+    print("Configure startup heading alignment\n")
+    print("PX4 mode inherits the flight controller's estimated heading.")
+    print("The bridge does not add declination or calculate compass heading again.")
+    print("Verify PX4 heading first; keep the drone stationary during spoofing.")
+    print("Alignment stays fixed in normal tracking; recovery uses current PX4 heading.\n")
+    source = prompt_line("Source (px4/manual)", cfg.heading_source)
     if source is None:
         return cfg
     source = (source or cfg.heading_source).strip().lower()
-    if source not in ("compass", "manual"):
-        print("Invalid source; use compass or manual.")
+    if source not in ("px4", "manual"):
+        print("Invalid source; use px4 or manual.")
         pause()
         return cfg
-    declination_source = prompt_line(
-        "Declination source (table/manual)", cfg.mag_declination_source
-    )
-    if declination_source is None:
-        return cfg
-    declination_source = (declination_source or cfg.mag_declination_source).lower()
-    if declination_source not in ("table", "manual"):
-        print("Invalid declination source; use table or manual.")
-        pause()
-        return cfg
-    declination = str(cfg.mag_declination_deg)
-    if declination_source == "manual":
-        declination = prompt_line("Magnetic declination", declination)
     mounting = prompt_line(
         "cuVSLAM child-to-body yaw", str(cfg.child_to_body_yaw_deg)
     )
     manual = str(cfg.manual_heading_deg)
     if source == "manual":
-        manual = prompt_line("Body true heading at alignment", manual)
+        manual = prompt_line("Body true heading at alignment (deg clockwise from north)", manual)
     try:
-        values = tuple(float(x) for x in (declination, mounting, manual))
+        values = tuple(float(x) for x in (mounting, manual))
         if not all(math.isfinite(x) for x in values):
             raise ValueError("angles must be finite")
         cfg = replace(
             cfg,
             heading_source=source,
-            mag_declination_source=declination_source,
-            mag_declination_deg=values[0],
-            child_to_body_yaw_deg=values[1],
-            manual_heading_deg=values[2],
+            child_to_body_yaw_deg=values[0],
+            manual_heading_deg=values[1],
         )
     except (TypeError, ValueError) as exc:
         print(f"Invalid heading configuration: {exc}")
         pause()
         return cfg
     save_config(cfg)
-    print("Saved heading alignment configuration.")
+    print("Saved heading alignment configuration. Restart Path A to apply.")
     pause()
     return cfg
 
@@ -1993,7 +1950,7 @@ def interactive_main(cfg: Config) -> int:
                 MenuItem(
                     "Heading alignment",
                     "heading",
-                    f"{cfg.heading_source}; declination={declination_label(cfg)}, "
+                    f"{heading_label(cfg)}; "
                     f"child→body={cfg.child_to_body_yaw_deg}°",
                 ),
                 MenuItem(

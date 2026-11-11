@@ -23,6 +23,29 @@ cli = load('vio_launch_bootstrap_test', ROOT/'scripts/vio-launch/vio_launch.py')
 fixes = load('vio_imu_fixes_test', SCRIPTS/'apply_vio_imu_fixes.py')
 
 
+def test_heading_defaults_migrate_saved_compass_without_changing_extrinsics():
+    assert cli.Config().heading_source == 'px4'
+    cfg = cli.apply_dict(cli.Config(), dict(heading_source='compass',
+                         mag_declination_deg=35., camera_pitch_deg=32., camera_yaw_deg=180.))
+    assert cfg.heading_source == 'px4'
+    assert (cfg.camera_pitch_deg, cfg.camera_yaw_deg) == (32., 180.)
+    assert 'PX4' in cli.heading_label(cfg)
+    assert '35' not in cli.heading_label(cfg)
+    assert cli.apply_dict(cfg, {'heading_source': 'manual'}).heading_source == 'manual'
+
+
+def test_heading_menu_no_longer_prompts_for_bridge_declination():
+    cfg = cli.Config()
+    with patch.object(cli, '_clear'), patch.object(cli, 'pause'), \
+         patch.object(cli, 'prompt_line', side_effect=['px4', '0']) as prompt, \
+         patch.object(cli, 'save_config') as save:
+        changed = cli.configure_heading(cfg)
+    assert changed.heading_source == 'px4'
+    assert prompt.call_count == 2
+    assert all('declination' not in call.args[0].lower() for call in prompt.call_args_list)
+    save.assert_called_once_with(changed)
+
+
 def test_default_and_explicit_modes(tmp_path):
     cfg = cli.Config(isaac_ros_dir=tmp_path)
     assert cli.selected_camera_mode(cfg) == 'vo'

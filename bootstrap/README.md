@@ -121,8 +121,7 @@ ros2 run vio_px4_bridge vio_px4_gps_bridge --ros-args \
   -p cruise_eph_m:=0.1 \
   -p satellites:=40 \
   -p horizontal_only_output:=true \
-  -p heading_source:=compass \
-  -p mag_declination_source:=table \
+  -p heading_source:=px4 \
   -p child_to_body_yaw_deg:=0.0 \
   -p rate_hz:=10.0
 ```
@@ -146,7 +145,8 @@ The bridge refuses to start if `MAV_USEHILGPS` is not `1`, horizontal-position
 fusion is missing, unsupported GPS fusion bits are enabled, the sender system ID does
 not match PX4, or exposed dual-GPS selector values contradict the VIO-first
 policy. Firmware without `SENS_GPS_MASK`/`SENS_GPS_PRIME` produces an explicit
-unverified-selection warning and requires inspection before flight. Set the real magnetic declination and measured cuVSLAM
+unverified-selection warning and requires inspection before flight. Verify PX4's
+heading before bridge startup. Select PX4 heading and the measured cuVSLAM
 child-to-body yaw in the CLI's **Heading alignment** menu. Review
 `bootstrap/docs/PX4_INTERFACE_CHECKLIST.md` before hardware testing.
 
@@ -201,14 +201,18 @@ infer horizontal motion or acceleration from roll/pitch: valid forward,
 backward, or lateral translation may occur while the body remains approximately
 level.
 
-Compass heading defaults to an offline magnetic-declination lookup. The bundled
-10-degree IGRF-derived grid is the same table used by vns-sdk (extracted from
-ArduPilot `AP_Declination`). At bridge startup, `home_lat_deg/home_lon_deg` are
-bilinearly interpolated once, the result is logged as
-`MAG_DECLINATION_RESOLVED`, and the value is frozen for that flight. The bridge
-does not update it from its own generated GPS output. A missing or invalid table
-blocks compass alignment; select `mag_declination_source:=manual` explicitly to
-use `mag_declination_deg` instead.
+Startup heading defaults to PX4's estimated `ATTITUDE.yaw`, with no additional
+bridge declination or compass calculation. Saved `heading_source=compass`
+settings migrate to `px4`; explicit `manual` heading remains supported. Legacy
+magnetic-declination/magnetometer mounting parameters are accepted but ignored.
+During stationary spoof validation, collect 30 distinct fresh heading-offset
+samples (default circular spread limit 5 degrees, age/gap limit 0.5 s).
+Before live handoff, missing/invalid data, motion or a heading discontinuity
+requires a new window. The accepted alignment is fixed during normal tracking;
+existing GPS-silent recovery uses current FCU heading for the recovered epoch.
+This makes PX4 and the bridge consistent, not necessarily geographically correct:
+the operator must verify PX4's heading first. MAVLink ATTITUDE has no explicit
+true-north/yaw-aligned flag. See the interface checklist for bench validation.
 
 Path A owns `/dev/ttyUSB0` directly. MAVROS must not run concurrently; the CLI
 checks for an existing serial-port owner and fails rather than competing for it.
