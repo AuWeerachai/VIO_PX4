@@ -25,18 +25,37 @@ if [[ "${AMENT_PREFIX_PATH:-}:${LD_LIBRARY_PATH:-}:${CMAKE_PREFIX_PATH:-}" == *"
 fi
 echo '=== Camera mode: VO (stereo only; IMU fusion=False; base driver) ==='
 
+if [[ -z "${VIO_CAMERA_SERIAL:-}" ]]; then
+  echo 'VIO setup failed: launcher did not supply the rear D456 serial. Leave the old CLI and reopen ~/vio-launch; check Camera extrinsic settings. No camera was opened.' >&2
+  exit 2
+fi
+
+# Use the driver's SDK serial, not the USB ASIC serial. Never pick the first
+# available camera: the front/arm camera has a different mounting transform.
+camera_config="$(mktemp /tmp/vio-realsense-XXXXXX.yaml)"
+trap 'rm -f -- "$camera_config"' EXIT
+realsense_prefix="$(ros2 pkg prefix isaac_ros_realsense)"
+python3 ./scripts/camera_selection.py \
+  --serial "${VIO_CAMERA_SERIAL:-}" \
+  --base "$realsense_prefix/share/isaac_ros_realsense/config/realsense_stereo.yaml" \
+  --output "$camera_config"
+
 ros2 run tf2_ros static_transform_publisher \
   --x "$CAMERA_X_M" --y "$CAMERA_Y_M" --z "$CAMERA_Z_M" \
   --yaw "$CAMERA_YAW_RAD" --pitch "$CAMERA_PITCH_RAD" --roll "$CAMERA_ROLL_RAD" \
   --frame-id drone_link --child-frame-id camera_link &
 extrinsic_pid=$!
-cleanup() { kill "$extrinsic_pid" 2>/dev/null || true; }
+cleanup() {
+  kill "$extrinsic_pid" 2>/dev/null || true
+  rm -f -- "$camera_config"
+}
 trap cleanup EXIT INT TERM
 
 # image_jitter_threshold_ms is explicit so reproducing this pipeline never
 # requires editing NVIDIA's visual_slam_node.cpp default.
 setsid ros2 launch isaac_ros_examples isaac_ros_examples.launch.py \
   launch_fragments:=realsense_stereo_rect,visual_slam \
+  realsense_config_file:="$camera_config" \
   interface_specs_file:="${ISAAC_ROS_WS}/isaac_ros_assets/isaac_ros_visual_slam/quickstart_interface_specs.json" \
   base_frame:=drone_link \
   enable_imu_fusion:=False \
@@ -52,6 +71,7 @@ cleanup() {
   done
   kill -TERM -- "-$launch_pid" 2>/dev/null || true
   kill "$extrinsic_pid" 2>/dev/null || true
+  rm -f -- "$camera_config"
 }
 trap cleanup EXIT
 trap 'exit 130' INT

@@ -121,7 +121,7 @@ install_override \
 install_override \
   "$SCRIPT_DIR/jetson-config/isaac_ros_overrides/scripts/start_rviz.sh" \
   "$ISAAC_SCRIPTS/start_rviz.sh"
-for helper in check_camera_ready.py; do
+for helper in check_camera_ready.py camera_selection.py; do
   install_override "$SCRIPT_DIR/jetson-config/isaac_ros_overrides/scripts/$helper" "$ISAAC_SCRIPTS/$helper"
 done
 install_override "$SCRIPT_DIR/jetson-config/isaac_ros_overrides/scripts/vio-imu-mode" "$HOME/vio-imu-mode"

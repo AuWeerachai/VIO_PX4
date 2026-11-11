@@ -24,6 +24,8 @@ The bootstrap script copies the reviewed overrides to:
 ```text
 ${ISAAC_ROS_WS}/src/isaac_ros_common/scripts/start_vio.sh
 ${ISAAC_ROS_WS}/src/isaac_ros_common/scripts/start_rviz.sh
+${ISAAC_ROS_WS}/src/isaac_ros_common/scripts/camera_selection.py
+${ISAAC_ROS_WS}/src/isaac_ros_common/scripts/check_camera_ready.py
 ${ISAAC_ROS_WS}/src/isaac_ros_common/scripts/.isaac_ros_common-config
 ```
 
@@ -45,6 +47,13 @@ The active launch is stereo-only VO, using the base-image camera driver with
 IMU fusion explicitly disabled. The experimental SDK 2.56.5 overlay is not
 built or sourced. Camera extrinsics and bridge safety fixes are preserved.
 `bootstrap/docs/STAGED_IMU_IMPLEMENTATION.md` records the inactive IMU experiment.
+
+Before starting on a new vehicle, configure the rear D456 SDK serial in the
+CLI's Camera extrinsic menu. An empty serial is an error, not automatic camera
+selection. A temporary copy of the installed RealSense stereo configuration
+adds `serial_no` and `device_type: d456`; it does not edit `/opt/ros` or change
+stream settings. The actual camera identity is verified before accepting the
+running session. See the [RealSense selection parameters](https://github.com/realsenseai/realsense-ros#parameters).
 
 The exact NVIDIA/JetPack pins, original manual layers, and clean-room rebuild
 sequence are documented in `bootstrap/docs/ISAAC_ROS_BOOTSTRAP.md`.

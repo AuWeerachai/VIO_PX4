@@ -1,5 +1,23 @@
 # vio-launch
 
+Camera selection is explicit: in **Camera extrinsic**, enter the rear D456's
+SDK serial from `rs-enumerate-devices -s`. This is not necessarily the serial
+shown in USB/sysfs. The CLI stores it as `camera_serial` in its user config.
+The launcher passes both the serial and a D456 model filter to RealSense,
+preserving the installed stereo settings. It never falls back to the front
+camera. Readiness also checks the actual opened device through `device_info`,
+including when reusing an existing session. Restart VIO after changing it.
+
+During deployment, close existing CLI instances and stop the navigation
+publishers before replacing camera/bridge files. Reopen the CLI after the update.
+An already-open updated launcher detects changes to its own source and refuses
+new launches or settings saves; Leave and Stop remain available. Older launchers
+without this guard must be closed explicitly during their first upgrade.
+Direct `gps` and `ev-bridge` commands also verify camera identity. The CLI does
+not automatically restart the camera underneath a running navigation publisher;
+stop the pipeline deliberately first. Conflicting paths are rejected before
+the camera/session is touched.
+
 Interactive companion CLI (inspired by `theseus-packages`) for VIO ↔ PX4.
 
 **On Jetson (AnyDesk):** run `vio-launch` with no args → a numbered menu pops up.

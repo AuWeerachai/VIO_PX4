@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import hashlib
 import json
 import math
 import os
@@ -24,6 +25,25 @@ from pathlib import Path
 from typing import Optional
 
 VERSION = "0.1.0"
+_CLI_FILE = Path(__file__).resolve()
+_LOADED_CLI_HASH = hashlib.sha256(_CLI_FILE.read_bytes()).digest()
+
+
+class StaleLauncherError(RuntimeError):
+    pass
+
+
+def require_current_cli() -> None:
+    """Do not launch or save from a Python process predating a deployment."""
+    try:
+        current = hashlib.sha256(_CLI_FILE.read_bytes()).digest()
+    except OSError as exc:
+        raise StaleLauncherError('Cannot verify this launcher. Reopen ~/vio-launch.') from exc
+    if current != _LOADED_CLI_HASH:
+        raise StaleLauncherError(
+            'vio-launch was updated while this menu was open. '
+            'Leave CLI (keep processes running), then reopen ~/vio-launch. '
+            'No launch or settings save was performed.')
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +95,8 @@ class Config:
     mag_declination_source: str = "table"
     mag_declination_deg: float = 0.0
     child_to_body_yaw_deg: float = 0.0
+    # SDK serial from rs-enumerate-devices, NOT the USB ASIC identifier.
+    camera_serial: str = ""
     # drone_link -> camera_link extrinsic in ROS FLU coordinates.
     camera_x_m: float = 0.0
     camera_y_m: float = 0.0
@@ -149,6 +171,7 @@ def load_saved_overrides() -> dict:
 
 
 def save_config(cfg: Config) -> None:
+    require_current_cli()
     path = user_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -163,6 +186,7 @@ def save_config(cfg: Config) -> None:
         "mag_declination_source": cfg.mag_declination_source,
         "mag_declination_deg": cfg.mag_declination_deg,
         "child_to_body_yaw_deg": cfg.child_to_body_yaw_deg,
+        "camera_serial": cfg.camera_serial,
         "camera_x_m": cfg.camera_x_m,
         "camera_y_m": cfg.camera_y_m,
         "camera_z_m": cfg.camera_z_m,
@@ -227,6 +251,7 @@ def apply_dict(cfg: Config, data: dict) -> Config:
         "mag_declination_source",
         "mag_declination_deg",
         "child_to_body_yaw_deg",
+        "camera_serial",
         "camera_x_m",
         "camera_y_m",
         "camera_z_m",
@@ -482,6 +507,7 @@ def start_managed(
     bash_command: str,
     startup_check_s: float = 0.75,
 ) -> dict:
+    require_current_cli()
     existing = find_proc(cfg, name)
     if existing:
         raise RuntimeError(f"{name} already running (pid {existing['pid']}). Stop it first.")
@@ -887,6 +913,10 @@ def cmd_status(cfg: Config) -> None:
 
 
 def cmd_ev_bridge(cfg: Config) -> None:
+    require_current_cli()
+    if find_proc(cfg, "gps-bridge"):
+        raise RuntimeError("Path A is already running. Stop it before starting Path B.")
+    require_camera_ready(cfg)
     setup = cfg.vio_px4_dir / "install/setup.bash"
     if not setup.exists():
         raise RuntimeError(f"Missing {setup} — build vio_px4_bridge first")
@@ -1098,6 +1128,7 @@ def require_camera_ready(cfg: Config, started_only: bool = False) -> None:
         "source /opt/ros/humble/setup.bash && "
         "python3 ${ISAAC_ROS_WS}/src/isaac_ros_common/scripts/check_camera_ready.py "
         f"{mode} --timeout {3 if started_only else 12}"
+        + f" --serial {shlex.quote(cfg.camera_serial)}"
         + (" --started-only" if started_only else "")
     )
     result = subprocess.run(
@@ -1109,8 +1140,21 @@ def require_camera_ready(cfg: Config, started_only: bool = False) -> None:
     print(f"- {result.stdout.strip()}")
 
 
+def require_no_publishers_for_camera_restart(cfg: Config) -> None:
+    active = [name for name in ("gps-bridge", "ev-bridge") if find_proc(cfg, name)]
+    if active:
+        raise RuntimeError(
+            f"Cannot restart the camera while {', '.join(active)} is running. "
+            "Stop all processes deliberately before restarting the camera. "
+            "No camera restart was performed.")
+
+
 def cmd_vio(cfg: Config, defer_health: bool = False) -> None:
+    require_current_cli()
     print(f"- Selected camera mode: {camera_mode_label(cfg)}")
+    if not isinstance(cfg.camera_serial, str) or not cfg.camera_serial.isascii() or not cfg.camera_serial.isdecimal():
+        raise RuntimeError('Set the rear D456 SDK serial in Camera extrinsic settings first. Automatic camera selection is disabled.')
+    print(f"- Selected camera: rear D456, serial {cfg.camera_serial}")
     if not shutil.which("tmux") or not shutil.which("gnome-terminal"):
         raise RuntimeError("tmux and gnome-terminal are required for visible Isaac sessions")
     raw_topic = "/visual_slam/tracking/odometry"
@@ -1124,6 +1168,7 @@ def cmd_vio(cfg: Config, defer_health: bool = False) -> None:
                     message_type="nav_msgs/msg/Odometry",
                 )
         except RuntimeError:
+            require_no_publishers_for_camera_restart(cfg)
             print("Existing Isaac VIO session is not healthy; restarting it...", flush=True)
         else:
             if not defer_health:
@@ -1139,6 +1184,7 @@ def cmd_vio(cfg: Config, defer_health: bool = False) -> None:
             print("- Camera started; keep the drone stationary through spoofing."
                   if defer_health else "- cuVSLAM body odometry ready.")
             return
+    require_no_publishers_for_camera_restart(cfg)
     print("- Opening Terminal 1: Isaac ROS VIO (run_dev.sh → start_vio.sh)...")
     start_visible_isaac_session(cfg, ISAAC_TMUX_VIO, "Isaac ROS VIO")
     deadline = time.monotonic() + 2700.0
@@ -1171,6 +1217,7 @@ def cmd_vio(cfg: Config, defer_health: bool = False) -> None:
         "echo \"=== Using: $(ros2 pkg prefix isaac_ros_visual_slam) ===\" && "
         "cd ${ISAAC_ROS_WS}/src/isaac_ros_common && "
         f"VIO_MODE={selected_camera_mode(cfg)} "
+        f"VIO_CAMERA_SERIAL={shlex.quote(cfg.camera_serial)} "
         f"CAMERA_X_M={cfg.camera_x_m:.17g} "
         f"CAMERA_Y_M={cfg.camera_y_m:.17g} "
         f"CAMERA_Z_M={cfg.camera_z_m:.17g} "
@@ -1200,6 +1247,7 @@ def cmd_vio(cfg: Config, defer_health: bool = False) -> None:
                     or "user interrupted with ctrl-c" in recent
                     or "VIO setup failed" in recent
                     or "VIO IMU FAILED" in recent
+                    or ("requested device with" in recent and "is NOT found" in recent)
                 )
                 if launch_stopped or not tmux_session_exists(ISAAC_TMUX_VIO):
                     raise RuntimeError(
@@ -1255,6 +1303,12 @@ def stop_failed_spoof(cfg: Config, reason: str) -> None:
 
 
 def cmd_gps(cfg: Config) -> None:
+    require_current_cli()
+    if find_proc(cfg, "ev-bridge") or find_proc(cfg, "mavros"):
+        raise RuntimeError("Path B/MAVROS is already running. Stop it before starting Path A.")
+    # This command is also callable directly, without cmd_run/cmd_vio.
+    # Verify the opened device before starting any HIL_GPS publisher.
+    require_camera_ready(cfg, started_only=True)
     setup = cfg.vio_px4_dir / "install/setup.bash"
     if not setup.exists():
         raise RuntimeError(
@@ -1489,10 +1543,16 @@ def cmd_run(
     cfg: Config,
     path_arg: str,
 ) -> None:
+    require_current_cli()
     which = normalize_path(path_arg)
     label = "GPS spoof + VIO GPS" if which == "a" else "external vision"
     print(f"Starting Path {which.upper()} ({label})...\n", flush=True)
 
+    # Reject conflicting paths BEFORE touching the camera/session they depend on.
+    if which == "a" and (find_proc(cfg, "ev-bridge") or find_proc(cfg, "mavros")):
+        raise RuntimeError("Path B/MAVROS is already running. Stop it before starting Path A.")
+    if which == "b" and find_proc(cfg, "gps-bridge"):
+        raise RuntimeError("Path A is already running. Stop it before starting Path B.")
     cmd_vio(cfg, defer_health=(which == "a"))
 
     if which == "b":
@@ -1716,6 +1776,15 @@ def configure_heading(cfg: Config) -> Config:
 def configure_camera_extrinsic(cfg: Config) -> Config:
     _clear()
     print("Configure drone_link → camera_link extrinsic\n")
+    print("Use the rear D456 SDK serial from rs-enumerate-devices, not its USB serial.")
+    serial = prompt_line("Rear D456 serial", cfg.camera_serial)
+    if serial is None:
+        return cfg
+    serial = serial.strip().removeprefix('_')
+    if not serial.isascii() or not serial.isdecimal():
+        print("Invalid serial; automatic selection is disabled.")
+        pause()
+        return cfg
     print("ROS FLU convention (camera position measured from the vehicle origin):")
     print("  +X forward / -X backward")
     print("  +Y left    / -Y right")
@@ -1748,6 +1817,7 @@ def configure_camera_extrinsic(cfg: Config) -> Config:
         return cfg
     cfg = replace(
         cfg,
+        camera_serial=serial,
         camera_x_m=entered[0], camera_y_m=entered[1], camera_z_m=entered[2],
         camera_roll_deg=entered[3], camera_pitch_deg=entered[4],
         camera_yaw_deg=entered[5],
@@ -2002,6 +2072,9 @@ def interactive_main(cfg: Config) -> int:
             continue
 
         try:
+            # Check AFTER the blocking menu prompt: an update may have happened
+            # while waiting for input. Leave/stop actions remain available above.
+            require_current_cli()
             if choice == "run-a":
                 _clear()
                 cmd_run(cfg, "a")

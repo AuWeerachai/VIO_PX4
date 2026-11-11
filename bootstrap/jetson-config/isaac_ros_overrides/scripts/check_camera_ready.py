@@ -8,6 +8,8 @@ from rclpy.qos import qos_profile_sensor_data
 from rcl_interfaces.srv import GetParameters
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu
+from realsense2_camera_msgs.srv import DeviceInfo
+from camera_selection import normalize_serial, verify_identity
 
 
 def main():
@@ -16,7 +18,9 @@ def main():
     parser.add_argument('--timeout', type=float, default=12.0)
     parser.add_argument('--started-only', action='store_true',
                         help='Check selected mode and node availability, not data health')
+    parser.add_argument('--serial', required=True, help='Expected rear D456 SDK serial')
     args = parser.parse_args()
+    serial = normalize_serial(args.serial)
     rclpy.init()
     node = rclpy.create_node('vio_launch_camera_readiness')
     imu = []
@@ -34,11 +38,22 @@ def main():
     subscriptions = [node.create_subscription(Imu, '/imu', got_imu, qos_profile_sensor_data),
                      node.create_subscription(Odometry, '/visual_slam/tracking/odometry', got_odom, qos_profile_sensor_data)]
     client = node.create_client(GetParameters, '/visual_slam_node/get_parameters')
+    identity_client = node.create_client(DeviceInfo, '/device_info')
     deadline = time.monotonic() + args.timeout
     future = None
     fusion = None
+    identity_future = None
+    identity_verified = False
     try:
         while time.monotonic() < deadline:
+            if identity_future is None and identity_client.service_is_ready():
+                identity_future = identity_client.call_async(DeviceInfo.Request())
+            if identity_future is not None and identity_future.done() and not identity_verified:
+                info = identity_future.result()
+                if info is None:
+                    raise RuntimeError('Camera identity service returned no response')
+                verify_identity(serial, info.serial_number, info.device_name)
+                identity_verified = True
             if future is None and client.service_is_ready():
                 req = GetParameters.Request()
                 req.names = ['enable_imu_fusion']
@@ -50,8 +65,8 @@ def main():
                     fusion = result.values[0].bool_value
                 if fusion is not None and fusion != (args.mode == 'vio'):
                     raise RuntimeError('Running camera mode differs from selected mode. Stop all processes, then restart.')
-                if args.started_only and fusion is not None:
-                    print(f'{args.mode.upper()} node started; data health not yet validated.')
+                if args.started_only and fusion is not None and identity_verified:
+                    print(f'{args.mode.upper()} node started; D456 serial {serial} verified; data health not yet validated.')
                     return 0
             now = time.monotonic()
             fresh_odom = odom and now - odom[-1] < 0.5
@@ -62,10 +77,10 @@ def main():
                            and all(0 < b[1]-a[1] < 0.1 for a,b in zip(recent, recent[1:]))
                            and all(s[3] == 'camera_imu_optical_frame' for s in recent)
                            and 7 < sum(s[2] for s in recent)/len(recent) < 12)
-            if fusion is not None and fresh_odom and (args.mode == 'vo' or ordered_imu):
-                print(f'{args.mode.upper()} ready: body odometry fresh; IMU fusion={fusion}.')
+            if identity_verified and fusion is not None and fresh_odom and (args.mode == 'vo' or ordered_imu):
+                print(f'{args.mode.upper()} ready: D456 serial {serial}; body odometry fresh; IMU fusion={fusion}.')
                 return 0
-        raise RuntimeError(f'{args.mode.upper()} not ready: fusion={fusion}, odometry samples={len(odom)}, IMU samples={len(imu)}')
+        raise RuntimeError(f'{args.mode.upper()} not ready: D456 identity verified={identity_verified}, fusion={fusion}, odometry samples={len(odom)}, IMU samples={len(imu)}')
     finally:
         node.destroy_node()
         rclpy.shutdown()

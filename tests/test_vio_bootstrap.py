@@ -21,6 +21,136 @@ def load(name, path):
 
 cli = load('vio_launch_bootstrap_test', ROOT/'scripts/vio-launch/vio_launch.py')
 fixes = load('vio_imu_fixes_test', SCRIPTS/'apply_vio_imu_fixes.py')
+selection = load('vio_camera_selection_test', SCRIPTS/'camera_selection.py')
+
+
+def test_camera_identity_rejects_wrong_serial_and_wrong_model():
+    selection.verify_identity('333422300181', '333422300181', 'Intel_RealSense_D456')
+    for serial, model in [('123', 'Intel_RealSense_D456'),
+                          ('333422300181', 'Intel_RealSense_D435')]:
+        with pytest.raises(RuntimeError, match='Wrong VIO camera'):
+            selection.verify_identity('333422300181', serial, model)
+
+
+@pytest.mark.parametrize('serial', ['', 'auto', '123; touch /tmp/oops', 333422300181])
+def test_camera_selection_refuses_unconfigured_or_invalid_serial(serial):
+    with pytest.raises(ValueError):
+        selection.normalize_serial(serial)
+
+
+def test_camera_selection_only_changes_device_selectors():
+    base = dict(serial_no='', device_type='', usb_port_id='2-1',
+                enable_infra1=True, enable_infra2=True, enable_gyro=False,
+                depth_module=dict(profile='640x360x90', emitter_enabled=0))
+    actual = selection.selected_config(base, '333422300181')
+    assert actual == {**base, 'serial_no': '_333422300181',
+                      'device_type': 'd456', 'usb_port_id': ''}
+    assert base['serial_no'] == ''
+
+
+def test_saved_camera_serial_survives_config_round_trip(tmp_path):
+    cfg = cli.apply_dict(cli.Config(), {'camera_serial': '333422300181'})
+    with patch.object(cli, 'user_config_path', return_value=tmp_path/'config.json'):
+        cli.save_config(cfg)
+        assert cli.load_config().camera_serial == '333422300181'
+
+
+def test_unconfigured_camera_cannot_launch_or_reuse():
+    with patch.object(cli, 'start_visible_isaac_session') as start:
+        with pytest.raises(RuntimeError, match='rear D456 SDK serial'):
+            cli.cmd_vio(cli.Config())
+    start.assert_not_called()
+
+
+def test_stale_cli_cannot_save_configuration(tmp_path):
+    with patch.object(cli, '_LOADED_CLI_HASH', b'outdated'), \
+         patch.object(cli, 'user_config_path', return_value=tmp_path/'config.json'), \
+         patch.object(cli, 'atomic_write_json') as write:
+        with pytest.raises(cli.StaleLauncherError, match='updated while this menu was open'):
+            cli.save_config(cli.Config())
+    write.assert_not_called()
+    assert not (tmp_path/'config.json').exists()
+
+
+def test_stale_cli_cannot_start_managed_process(tmp_path):
+    with patch.object(cli, '_LOADED_CLI_HASH', b'outdated'), \
+         patch.object(cli.subprocess, 'Popen') as start:
+        with pytest.raises(cli.StaleLauncherError):
+            cli.start_managed(cli.Config(state_dir=tmp_path), 'gps-bridge', 'false')
+    start.assert_not_called()
+    assert not (tmp_path/'state.json').exists()
+
+
+def test_stale_cli_cannot_launch_a_path():
+    with patch.object(cli, '_LOADED_CLI_HASH', b'outdated'), \
+         patch.object(cli, 'cmd_vio') as camera, patch.object(cli, 'cmd_gps') as gps:
+        with pytest.raises(cli.StaleLauncherError):
+            cli.cmd_run(cli.Config(), 'a')
+    camera.assert_not_called()
+    gps.assert_not_called()
+
+
+def test_update_while_menu_is_waiting_is_detected_before_dispatch():
+    choices = iter(['run-a', 'detach'])
+    def select(*args, **kwargs):
+        cli._LOADED_CLI_HASH = b'updated during prompt'
+        return next(choices)
+    with patch.object(cli, '_LOADED_CLI_HASH', cli._LOADED_CLI_HASH), \
+         patch.object(cli, 'select_menu', side_effect=select), \
+         patch.object(cli, '_clear'), patch.object(cli, 'pause'), \
+         patch.object(cli, 'cmd_run') as run:
+        assert cli.interactive_main(cli.Config()) == 0
+    run.assert_not_called()
+
+
+@pytest.mark.parametrize('path,active', [('a', 'ev-bridge'), ('a', 'mavros'), ('b', 'gps-bridge')])
+def test_conflicting_path_is_rejected_before_touching_camera(path, active):
+    with patch.object(cli, 'find_proc', side_effect=lambda cfg, name: {'pid': 123} if name == active else None), \
+         patch.object(cli, 'cmd_vio') as camera:
+        with pytest.raises(RuntimeError, match='already running'):
+            cli.cmd_run(cli.Config(), path)
+    camera.assert_not_called()
+
+
+@pytest.mark.parametrize('existing_session', [False, True])
+def test_camera_is_not_restarted_under_active_gps(existing_session):
+    cfg = cli.Config(camera_serial='333422300181')
+    with patch.object(cli.shutil, 'which', return_value='/bin/mock'), \
+         patch.object(cli, 'tmux_session_exists', return_value=existing_session), \
+         patch.object(cli, 'isaac_container_running', return_value=existing_session), \
+         patch.object(cli, 'require_camera_ready', side_effect=RuntimeError('Wrong VIO camera')), \
+         patch.object(cli, 'find_proc', side_effect=lambda cfg, name: {'pid': 123} if name == 'gps-bridge' else None), \
+         patch.object(cli, 'start_visible_isaac_session') as start, \
+         patch.object(cli, 'stop_visible_isaac_sessions') as stop:
+        with pytest.raises(RuntimeError, match='Cannot restart the camera'):
+            cli.cmd_vio(cfg, defer_health=True)
+    start.assert_not_called()
+    stop.assert_not_called()
+
+
+@pytest.mark.parametrize('command', ['cmd_gps', 'cmd_ev_bridge'])
+def test_direct_bridge_commands_cannot_bypass_camera_identity(command):
+    with patch.object(cli, 'find_proc', return_value=None), \
+         patch.object(cli, 'require_camera_ready', side_effect=RuntimeError('Wrong VIO camera')), \
+         patch.object(cli, 'start_managed') as start, \
+         patch.object(cli, 'serial_users') as port_check:
+        with pytest.raises(RuntimeError, match='Wrong VIO camera'):
+            getattr(cli, command)(cli.Config(camera_serial='333422300181'))
+    start.assert_not_called()
+    port_check.assert_not_called()
+
+
+def test_old_launcher_missing_serial_cannot_open_any_camera(tmp_path):
+    import os
+    (tmp_path/'src/isaac_ros_common').mkdir(parents=True)
+    env = {**os.environ, 'ISAAC_ROS_WS': str(tmp_path), 'VIO_MODE': 'vo',
+           'AMENT_PREFIX_PATH': '', 'LD_LIBRARY_PATH': '', 'CMAKE_PREFIX_PATH': ''}
+    env.pop('VIO_CAMERA_SERIAL', None)
+    result = subprocess.run(['bash', str(SCRIPTS/'start_vio.sh')],
+                            env=env, capture_output=True, text=True, timeout=5)
+    assert result.returncode == 2
+    assert 'Leave the old CLI and reopen ~/vio-launch' in result.stderr
+    assert 'No camera was opened' in result.stderr
 
 
 def test_heading_defaults_migrate_saved_compass_without_changing_extrinsics():
@@ -68,7 +198,7 @@ def test_menu_reports_selected_mode(tmp_path):
 
 
 def test_readiness_failure_blocks_reuse(tmp_path):
-    cfg = cli.Config(isaac_ros_dir=tmp_path)
+    cfg = cli.Config(isaac_ros_dir=tmp_path, camera_serial='333422300181')
     with patch.object(cli.shutil, 'which', return_value='/bin/mock'), \
          patch.object(cli, 'tmux_session_exists', return_value=True), \
          patch.object(cli, 'isaac_container_running', return_value=True), \
@@ -96,7 +226,7 @@ def test_shutdown_waits_for_camera_before_killing_terminal():
 
 
 def test_start_failure_saves_terminal_before_cleanup(tmp_path):
-    cfg = cli.Config(state_dir=tmp_path)
+    cfg = cli.Config(state_dir=tmp_path, camera_serial='333422300181')
     with patch.object(cli.shutil, 'which', return_value='/bin/mock'), \
          patch.object(cli, 'tmux_session_exists', return_value=False), \
          patch.object(cli, 'isaac_container_running', return_value=True), \
@@ -162,14 +292,20 @@ def test_camera_launcher_restores_vo_without_loading_imu_overlay():
 
 def test_vo_shell_launch_preserves_extrinsics_and_ignores_old_mode_file(tmp_path):
     import os
+    import shutil
     workspace = tmp_path/'workspace'
     common = workspace/'src/isaac_ros_common'
     (common/'scripts').mkdir(parents=True)
     (common/'scripts/vio_imu_mode').write_text('vio\n')
+    shutil.copy(SCRIPTS/'camera_selection.py', common/'scripts/camera_selection.py')
+    base = workspace/'share/isaac_ros_realsense/config/realsense_stereo.yaml'
+    base.parent.mkdir(parents=True)
+    base.write_text('enable_infra1: true\nenable_infra2: true\nenable_gyro: false\n')
     bin_dir = tmp_path/'bin'
     bin_dir.mkdir()
     recorder = bin_dir/'ros2'
-    recorder.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$VO_TEST_CALLS"\n')
+    recorder.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$VO_TEST_CALLS"\n'
+                        'if [ "$1" = pkg ]; then printf "%s\\n" "$ISAAC_ROS_WS"; fi\n')
     recorder.chmod(0o755)
     calls = tmp_path/'calls'
     env = {**os.environ, 'ISAAC_ROS_WS': str(workspace),
@@ -178,6 +314,7 @@ def test_vo_shell_launch_preserves_extrinsics_and_ignores_old_mode_file(tmp_path
            'CAMERA_X_M': '-0.15', 'CAMERA_Y_M': '0', 'CAMERA_Z_M': '-0.165',
            'CAMERA_ROLL_RAD': '-0.02059', 'CAMERA_PITCH_RAD': '0.5585',
            'CAMERA_YAW_RAD': '3.14159'}
+    env['VIO_CAMERA_SERIAL'] = '333422300181'
     env.pop('VIO_MODE', None)
     result = subprocess.run(['bash', str(SCRIPTS/'start_vio.sh')],
                             env=env, capture_output=True, text=True, timeout=10)
@@ -187,6 +324,8 @@ def test_vo_shell_launch_preserves_extrinsics_and_ignores_old_mode_file(tmp_path
     assert '--x -0.15 --y 0 --z -0.165' in launched
     assert '--yaw 3.14159 --pitch 0.5585 --roll -0.02059' in launched
     assert 'base_frame:=drone_link' in launched
+    assert 'realsense_config_file:=/tmp/vio-realsense-' in launched
+    assert '333422300181' in result.stdout
 
 
 @pytest.mark.parametrize('overrides', [
