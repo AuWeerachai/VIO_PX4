@@ -1127,17 +1127,29 @@ def require_camera_ready(cfg: Config, started_only: bool = False) -> None:
     command = (
         "source /opt/ros/humble/setup.bash && "
         "python3 ${ISAAC_ROS_WS}/src/isaac_ros_common/scripts/check_camera_ready.py "
-        f"{mode} --timeout {3 if started_only else 12}"
+        # Each probe creates a new ROS participant. Identity-service discovery
+        # needs the same budget even when only checking startup, not data health.
+        f"{mode} --timeout 12"
         + f" --serial {shlex.quote(cfg.camera_serial)}"
         + (" --started-only" if started_only else "")
     )
-    result = subprocess.run(
-        ["docker", "exec", "-u", "admin", ISAAC_CONTAINER, "bash", "-lc", command],
-        capture_output=True, text=True, timeout=20,
-    )
-    if result.returncode:
-        raise RuntimeError(result.stdout.strip() or result.stderr.strip() or "Camera readiness check failed")
-    print(f"- {result.stdout.strip()}")
+    for attempt in range(2 if started_only else 1):
+        result = subprocess.run(
+            ["docker", "exec", "-u", "admin", ISAAC_CONTAINER, "bash", "-lc", command],
+            capture_output=True, text=True, timeout=20,
+        )
+        if not result.returncode:
+            print(f"- {result.stdout.strip()}")
+            return
+        error = result.stdout.strip() or result.stderr.strip() or "Camera readiness check failed"
+        # Retry only an unanswered identity request, with a fresh ROS client.
+        # An actual wrong serial/model or fusion-mode mismatch must fail closed.
+        if (started_only and attempt == 0
+                and 'not ready: D456 identity verified=False' in error):
+            print("- Camera identity confirmation timed out; retrying once (camera is not restarted).",
+                  flush=True)
+            continue
+        raise RuntimeError(error)
 
 
 def require_no_publishers_for_camera_restart(cfg: Config) -> None:

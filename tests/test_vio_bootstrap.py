@@ -279,6 +279,35 @@ def test_started_only_probe_does_not_request_full_data_validation(tmp_path):
     with patch.object(cli.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout='started', stderr='')) as run:
         cli.require_camera_ready(cli.Config(isaac_ros_dir=tmp_path), started_only=True)
     assert '--started-only' in run.call_args.args[0][-1]
+    assert '--timeout 12' in run.call_args.args[0][-1]
+
+
+def test_identity_discovery_timeout_retries_once_without_restarting_camera(tmp_path):
+    pending = SimpleNamespace(returncode=1, stdout='Camera readiness failed: VO not ready: D456 identity verified=False, fusion=False', stderr='')
+    success = SimpleNamespace(returncode=0, stdout='VO node started; D456 serial verified', stderr='')
+    with patch.object(cli.subprocess, 'run', side_effect=[pending, success]) as run, \
+         patch.object(cli, 'stop_visible_isaac_sessions') as stop:
+        cli.require_camera_ready(cli.Config(isaac_ros_dir=tmp_path), started_only=True)
+    assert run.call_count == 2
+    stop.assert_not_called()
+
+
+def test_persistent_identity_timeout_still_blocks_gps(tmp_path):
+    pending = SimpleNamespace(returncode=1, stdout='VO not ready: D456 identity verified=False', stderr='')
+    with patch.object(cli.subprocess, 'run', return_value=pending) as run:
+        with pytest.raises(RuntimeError, match='identity verified=False'):
+            cli.require_camera_ready(cli.Config(isaac_ros_dir=tmp_path), started_only=True)
+    assert run.call_count == 2
+
+
+@pytest.mark.parametrize('error', ['Wrong VIO camera: expected D456 serial 333422300181',
+                                  'Running camera mode differs from selected mode',
+                                  'Camera identity service returned no response'])
+def test_real_identity_or_mode_failure_is_not_retried(tmp_path, error):
+    with patch.object(cli.subprocess, 'run', return_value=SimpleNamespace(returncode=1, stdout=error, stderr='')) as run:
+        with pytest.raises(RuntimeError, match=error):
+            cli.require_camera_ready(cli.Config(isaac_ros_dir=tmp_path), started_only=True)
+    assert run.call_count == 1
 
 
 def test_camera_launcher_restores_vo_without_loading_imu_overlay():
