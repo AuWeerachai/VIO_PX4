@@ -44,6 +44,7 @@ from vio_px4_bridge.geo_utils import rotate_vector_by_quaternion_xyzw
 from vio_px4_bridge.geo_utils import wrap_pi
 from vio_px4_bridge.geo_utils import yaw_from_quaternion_xyzw
 from vio_px4_bridge.local_continuity import LocalPoseContinuity
+from vio_px4_bridge.global_origin import GlobalOriginSetup
 from vio_px4_bridge.recovery_yaw import RecoveryYawAgreement
 from vio_px4_bridge.recovery_yaw import timestamp_order
 from vio_px4_bridge.spoof_readiness import SpoofReadiness
@@ -80,7 +81,7 @@ class VioPx4GpsBridge(Node):
         # Home / EKF origin (spoof target and LLA anchor for live VIO)
         self.declare_parameter("home_lat_deg", 40.4433)
         self.declare_parameter("home_lon_deg", -79.9436)
-        self.declare_parameter("home_alt_m", 300.0)
+        self.declare_parameter("home_alt_m", 200.0)
 
         # Spoof phase (internship GpsSpoof analogue)
         self.declare_parameter("spoof_duration_s", 15.0)
@@ -306,7 +307,8 @@ class VioPx4GpsBridge(Node):
         self.phase = Phase.WAITING if self.rc_trigger_enabled else Phase.SPOOF
         self.start_time = None if self.rc_trigger_enabled else time.monotonic()
         self.live_start_time = None
-        self.origin_sent = False
+        self.origin_setup = GlobalOriginSetup(self.home_lat, self.home_lon, self.home_alt)
+        self.px4_armed = None
         self.anchor_ned = None  # first VIO pose in NED; treated as home unless disabled
         self.latest_fix = {
             "lat": self.home_lat,
@@ -484,6 +486,8 @@ class VioPx4GpsBridge(Node):
             "hil_gps_output_active": self.live_output_active,
             "output_block_reason": self.live_output_block_reason,
             "spoof_failure_reason": self.spoof_failure_reason,
+            "global_origin_verified": self.origin_setup.confirmed,
+            "global_origin_altitude_m": self.home_alt,
             "handoff_check_reason": self._handoff_block_reason(),
             "px4_fallback": (
                 "not_needed" if self.live_output_active or navigation == "spoof_active"
@@ -553,6 +557,7 @@ class VioPx4GpsBridge(Node):
             px4_sysid = int(heartbeat.get_srcSystem())
             self.px4_target_sysid = px4_sysid
             self.last_px4_heartbeat_time = time.monotonic()
+            self.px4_armed = bool(int(heartbeat.base_mode) & 128)
             if self.mavlink_sysid != px4_sysid:
                 self._mav.close()
                 raise RuntimeError(
@@ -565,6 +570,7 @@ class VioPx4GpsBridge(Node):
             )
             use_hil_gps = self._read_px4_param(heartbeat, "MAV_USEHILGPS")
             gps_ctrl = self._read_px4_param(heartbeat, "EKF2_GPS_CTRL")
+            height_ref = self._read_px4_param(heartbeat, "EKF2_HGT_REF")
             noaid_tout_us = self._read_px4_param(heartbeat, "EKF2_NOAID_TOUT")
             if use_hil_gps is None:
                 raise RuntimeError("PX4 did not return required parameter MAV_USEHILGPS")
@@ -582,6 +588,15 @@ class VioPx4GpsBridge(Node):
                     f"and GPS yaw is not fused (current={gps_ctrl_bits})"
                 )
             noaid_tout_s = float(noaid_tout_us) * 1e-6
+            if height_ref is None or int(round(height_ref)) not in (0, 2):
+                raise RuntimeError(
+                    "Path A requires EKF2_HGT_REF=0 (barometer) or 2 (rangefinder); "
+                    "bridge altitude is only a global reference, not a height sensor"
+                )
+            self.get_logger().info(
+                f"Height source remains PX4 {'barometer' if int(height_ref) == 0 else 'rangefinder'}; "
+                f"GPS height fusion disabled; global reference altitude={self.home_alt:.1f} m AMSL"
+            )
             self.get_logger().info(
                 "PX4 parameter gates passed: MAV_USEHILGPS=1 "
                 f"EKF2_GPS_CTRL={gps_ctrl_bits} EKF2_NOAID_TOUT={noaid_tout_s:.3f}s"
@@ -654,6 +669,9 @@ class VioPx4GpsBridge(Node):
         while time.monotonic() < deadline:
             msg = self._mav.recv_match(type="PARAM_VALUE", blocking=True, timeout=0.25)
             if msg is None:
+                continue
+            if (msg.get_srcSystem() != heartbeat.get_srcSystem()
+                    or msg.get_srcComponent() != heartbeat.get_srcComponent()):
                 continue
             param_id = msg.param_id
             if isinstance(param_id, bytes):
@@ -1219,6 +1237,14 @@ class VioPx4GpsBridge(Node):
 
     def _handoff_block_reason(self):
         now = time.monotonic()
+        if (self.phase != Phase.LIVE and self.transport == "mavlink"
+                and self.send_set_gps_global_origin):
+            if (self.px4_armed is not False or self.last_px4_heartbeat_time is None
+                    or now - self.last_px4_heartbeat_time > self.heartbeat_timeout_s):
+                return "global origin handoff requires fresh DISARMED PX4 heartbeat"
+            reason = self.origin_setup.reason(now)
+            if reason:
+                return reason
         if not self.have_vio or self.last_vio_time is None or now - self.last_vio_time > self.vio_timeout_s:
             return "accepted VIO odometry not fresh"
         if self.heading_offset_rad is None:
@@ -1538,8 +1564,21 @@ class VioPx4GpsBridge(Node):
                 message_type == "HEARTBEAT"
                 and self.px4_target_sysid is not None
                 and int(msg.get_srcSystem()) == self.px4_target_sysid
+                and int(msg.get_srcComponent()) == self.px4_target_compid
             ):
                 self.last_px4_heartbeat_time = now
+                self.px4_armed = bool(int(msg.base_mode) & 128)
+                continue
+            if message_type == "GPS_GLOBAL_ORIGIN":
+                if (int(msg.get_srcComponent()) == self.px4_target_compid
+                        and self.phase in (Phase.SPOOF, Phase.ALIGNING)):
+                    was_confirmed = self.origin_setup.confirmed
+                    self.origin_setup.observe(now, msg.latitude, msg.longitude, msg.altitude)
+                    if self.origin_setup.confirmed and not was_confirmed:
+                        self.get_logger().info(
+                            f"PX4 global origin verified: {self.home_alt:.1f} m AMSL; "
+                            "height still comes from PX4 rangefinder/barometer"
+                        )
                 continue
             if message_type == "ATTITUDE":
                 # Do not use another component's attitude on the same system.
@@ -1661,6 +1700,16 @@ class VioPx4GpsBridge(Node):
                                         else "waiting_for_activation")
             return
         if self.phase in (Phase.SPOOF, Phase.ALIGNING):
+            if self.transport == "mavlink" and self.send_set_gps_global_origin:
+                self._update_global_origin()
+                if self.origin_setup.failure:
+                    self.spoof_failure_reason = self.origin_setup.failure
+                    self.phase = Phase.WAITING
+                    self.start_time = None
+                    self._set_live_output_state(False, "global_origin_setup_failed")
+                    self.get_logger().error(self.spoof_failure_reason)
+                    self._send_status_text("VIO GPS: origin setup failed; GPS stopped", 4)
+                    return
             reason = self._handoff_block_reason() or "healthy; waiting for spoof timer"
             if reason != self._last_handoff_reason:
                 self.get_logger().info(f"SPOOF_HEALTH_CHECK: {reason}")
@@ -1715,10 +1764,6 @@ class VioPx4GpsBridge(Node):
                 fix["vd"] = 0.0
             self._set_live_output_state(True, "all_health_gates_passed")
 
-        if self.send_set_gps_global_origin and not self.origin_sent:
-            self._send_global_origin()
-            self.origin_sent = True
-
         self._publish_fix(fix)
         self.messages_sent += 1
         if self.messages_sent == 1 or self.messages_sent % 50 == 0:
@@ -1728,20 +1773,33 @@ class VioPx4GpsBridge(Node):
                 f"eph={fix['eph']:.2f}"
             )
 
-    def _send_global_origin(self):
-        if self.transport != "mavlink" or self._mav is None:
+    def _update_global_origin(self):
+        # Never change an origin in LIVE/recovery, or with unknown/armed status.
+        if self.phase not in (Phase.SPOOF, Phase.ALIGNING):
             return
+        now = time.monotonic()
+        fresh = (self.last_px4_heartbeat_time is not None
+                 and now - self.last_px4_heartbeat_time <= self.heartbeat_timeout_s)
+        disarmed = not self.px4_armed if fresh and self.px4_armed is not None else None
+        set_origin, request = self.origin_setup.step(now, disarmed)
         try:
-            # SET_GPS_GLOBAL_ORIGIN (msg id 48)
-            self._mav.mav.set_gps_global_origin_send(
-                self.mavlink_sysid,
-                int(round(self.home_lat * 1e7)),
-                int(round(self.home_lon * 1e7)),
-                int(round(self.home_alt * 1000.0)),
-            )
-            self.get_logger().info("Sent SET_GPS_GLOBAL_ORIGIN (home)")
+            if set_origin:
+                self._mav.mav.set_gps_global_origin_send(
+                    self.px4_target_sysid, *self.origin_setup.target
+                )
+                self.get_logger().info(
+                    f"Setting PX4 global reference (attempt {self.origin_setup.attempts}/5); "
+                    "waiting for readback"
+                )
+            if request:
+                # REQUEST_MESSAGE=512, GPS_GLOBAL_ORIGIN=49. Unlike the periodic
+                # stream, this forces a response even when the origin is unchanged.
+                self._mav.mav.command_long_send(
+                    self.px4_target_sysid, self.px4_target_compid, 512, 0,
+                    49, 0, 0, 0, 0, 0, 0,
+                )
         except Exception as exc:  # noqa: BLE001
-            self.get_logger().warn(f"SET_GPS_GLOBAL_ORIGIN failed: {exc}")
+            self.get_logger().warn(f"Global origin setup transport error: {exc}")
 
     def _publish_fix(self, fix: dict):
         if self.transport == "mavlink":

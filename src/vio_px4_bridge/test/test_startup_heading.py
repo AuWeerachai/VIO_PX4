@@ -122,6 +122,7 @@ def bridge():
     obj.get_logger = Mock(return_value=Mock())
     obj._send_status_text = Mock()
     obj.transport = 'mavlink'
+    obj.send_set_gps_global_origin = False
     obj.px4_target_sysid = obj.px4_target_compid = 1
     obj.inertial_active = False
     obj.rc_trigger_enabled = False

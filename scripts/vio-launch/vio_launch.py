@@ -85,7 +85,7 @@ class Config:
     px4_msgs_setup: Optional[Path] = None
     home_lat: float = 40.4433
     home_lon: float = -79.9436
-    home_alt: float = 300.0
+    home_alt: float = 200.0
     # Jetson↔Cube is typically UART, but a routed UDP MAVLink link also works.
     mavlink_url: str = "/dev/ttyUSB0:921600"
     mavlink_sysid: int = 1

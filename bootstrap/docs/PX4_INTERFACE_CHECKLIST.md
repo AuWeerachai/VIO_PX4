@@ -34,6 +34,28 @@ firmware because message handling and estimator requirements can change.
 - [ ] `EKF2_GPS_CTRL=1`: fuse longitude/latitude only, matching vns-sdk.
   Altitude remains on the configured height source, velocity is not fused, and
   heading remains on the compass.
+- [ ] `EKF2_HGT_REF=2` selects rangefinder, or `0` selects barometer. Path A
+  checks this setting and `EKF2_GPS_CTRL=1` at startup; it does not change them.
+  Keep the chosen sensor enabled and healthy. Do not enable GPS height fusion
+  to establish a global altitude reference.
+- [ ] Global-reference setup runs during spoof **while disarmed**, using the
+  configured home LLA. The default home altitude is now **200 m AMSL**; existing
+  saved Jetson configs retain their value until changed in the home menu.
+  `SET_GPS_GLOBAL_ORIGIN` sets the reference, not a stream of height observations.
+  HIL_GPS still contains its mandatory altitude field; with `EKF2_GPS_CTRL=1`,
+  PX4 does not fuse it as height. This is not terrain elevation or target AGL.
+- [ ] Expect `PX4 global origin verified` before live handoff. The bridge first
+  queries the origin, retries setting it at most five times over ten seconds,
+  and requires two matching PX4 readbacks at least one second apart. Missing or
+  incorrect readback blocks handoff; no origin writes occur during LIVE or
+  quarantine recovery. Stale heartbeat prevents writes; arming during setup
+  aborts it. Complete spoof before arming.
+- [ ] Readback verifies the reference, **not all mission prerequisites**. PX4
+  still needs healthy vertical estimation and valid global altitude. On the
+  inspected firmware, MAVLink `GPS_GLOBAL_ORIGIN` does not expose `alt_valid`.
+  Verify mission readiness while disarmed; a sensor fault remains a PX4 fault,
+  not something the bridge should hide. Never change origin altitude during
+  a flight; review any mission using absolute AMSL altitudes after changing it.
 - [ ] Send at 10 Hz without long gaps. PX4 timestamps receipt locally.
 - [ ] `fix_type=3`, synthetic satellites=40, speed accuracy
   below `EKF2_REQ_SACC`, and EPH/EPV below their configured gates.

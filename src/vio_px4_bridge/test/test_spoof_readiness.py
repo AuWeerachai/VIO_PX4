@@ -117,6 +117,8 @@ def bridge():
     obj = type('HandoffHarness', (), {name: ns[name] for name in names})()
     obj.Phase = ns['Phase']
     obj.phase = obj.Phase.SPOOF
+    obj.transport = 'mavlink'
+    obj.send_set_gps_global_origin = False
     obj.start_time = 0
     obj.spoof_duration_s = 15
     obj.have_vio = True
