@@ -49,6 +49,7 @@ from vio_px4_bridge.recovery_yaw import RecoveryYawAgreement
 from vio_px4_bridge.recovery_yaw import timestamp_order
 from vio_px4_bridge.spoof_readiness import SpoofReadiness
 from vio_px4_bridge.startup_heading import Px4StartupHeading, heading_source
+from vio_px4_bridge.external_yaw import ExternalYaw, rpy
 
 
 class Phase(Enum):
@@ -125,6 +126,11 @@ class VioPx4GpsBridge(Node):
         # to ATTITUDE yaw: PX4 has already applied its heading corrections.
         self.declare_parameter("heading_source", "px4")  # px4 | manual
         self.declare_parameter("manual_heading_deg", 0.0)
+        self.declare_parameter("external_yaw_enabled", False)
+        self.declare_parameter("external_yaw_noise_deg", 5.0)
+        self.declare_parameter("external_yaw_rate_hz", 30.0)
+        self.declare_parameter("external_yaw_max_age_s", 0.2)
+        self.declare_parameter("external_yaw_startup_tolerance_deg", 10.0)
         # Legacy launch parameters accepted but no longer used for alignment.
         self.declare_parameter("mag_declination_source", "table")
         self.declare_parameter("mag_declination_deg", 0.0)
@@ -239,6 +245,8 @@ class VioPx4GpsBridge(Node):
         self.child_to_body_yaw_rad = math.radians(
             float(self.get_parameter("child_to_body_yaw_deg").value)
         )
+        if not all(math.isfinite(v) for v in (self.manual_heading_rad, self.child_to_body_yaw_rad)):
+            raise ValueError("Heading and body alignment angles must be finite")
         self.alignment_sample_count = max(
             5, int(self.get_parameter("alignment_samples").value)
         )
@@ -303,6 +311,24 @@ class VioPx4GpsBridge(Node):
         self.recovery_accuracy_tighten_s = max(
             0.0, float(self.get_parameter("recovery_accuracy_tighten_s").value)
         )
+
+        self.external_yaw = None
+        if bool(self.get_parameter("external_yaw_enabled").value):
+            if self.transport != "mavlink" or self.child_to_body_yaw_rad != 0:
+                raise ValueError("External yaw requires MAVLink and body-frame odometry (child-to-body=0)")
+            if bool(self.get_parameter("use_sim_time").value):
+                raise ValueError("External yaw on hardware cannot use ROS simulated time")
+            self.external_yaw = ExternalYaw(
+                float(self.get_parameter("external_yaw_noise_deg").value),
+                float(self.get_parameter("external_yaw_rate_hz").value),
+                float(self.get_parameter("external_yaw_max_age_s").value),
+            )
+        self.external_yaw_startup_tolerance = math.radians(
+            float(self.get_parameter("external_yaw_startup_tolerance_deg").value))
+        if not math.isfinite(self.external_yaw_startup_tolerance) or not (
+                0 < self.external_yaw_startup_tolerance <= math.radians(20)):
+            raise ValueError("External yaw startup tolerance must be >0 and <=20 degrees")
+        self.external_sample_time = None
 
         self.phase = Phase.WAITING if self.rc_trigger_enabled else Phase.SPOOF
         self.start_time = None if self.rc_trigger_enabled else time.monotonic()
@@ -393,6 +419,10 @@ class VioPx4GpsBridge(Node):
         )
         self.create_timer(0.5, self._check_camera_fusion)
         self.create_timer(1.0 / self.rate_hz, self._tick)
+        if self.external_yaw is not None:
+            # Fast dispatch keeps TIMESYNC replies inside PX4's 10 ms RTT limit.
+            # Measurement rate remains separately limited to 30..50 Hz.
+            self.create_timer(0.005, self._external_yaw_tick)
         if self.status_file:
             self.create_timer(0.5, self._write_status_file)
 
@@ -451,6 +481,14 @@ class VioPx4GpsBridge(Node):
             ),
             "heading_aligned": self.heading_offset_rad is not None,
             "heading_source": self.heading_source,
+            "external_yaw_enabled": self.external_yaw is not None,
+            "external_yaw_messages": 0 if self.external_yaw is None else self.external_yaw.sent,
+            "external_yaw_sigma_deg": (None if self.external_yaw is None else
+                                       math.degrees(math.sqrt(self.external_yaw.variance_floor))),
+            "external_yaw_status": ("disabled" if self.external_yaw is None else
+                                    self._external_yaw_reason() or "ready"),
+            "external_yaw_clock_ready": (False if self.external_yaw is None else
+                                         self.external_yaw.clock.ready(now)),
             "startup_heading_status": (
                 self.startup_heading.reason if self.heading_source == "px4"
                 else "explicit manual heading"
@@ -572,6 +610,25 @@ class VioPx4GpsBridge(Node):
             gps_ctrl = self._read_px4_param(heartbeat, "EKF2_GPS_CTRL")
             height_ref = self._read_px4_param(heartbeat, "EKF2_HGT_REF")
             noaid_tout_us = self._read_px4_param(heartbeat, "EKF2_NOAID_TOUT")
+            ev_ctrl = self._read_px4_param(heartbeat, "EKF2_EV_CTRL")
+            expected_ev_ctrl = 8 if self.external_yaw is not None else 0
+            if ev_ctrl is None or ev_ctrl != expected_ev_ctrl:
+                raise RuntimeError(
+                    f"Path A requires EKF2_EV_CTRL={expected_ev_ctrl}; current={ev_ctrl}. "
+                    "Do not fuse VO position/height twice or leave EV yaw enabled in GPS-only mode.")
+            if self.external_yaw is not None:
+                required = {"EKF2_EV_NOISE_MD": 0,
+                            "EKF2_MAG_TYPE": 5 if self.heading_source == "manual" else 6}
+                if self.px4_armed is not False:
+                    raise RuntimeError("Start GPS + external yaw only while DISARMED")
+                for name, expected in required.items():
+                    value = self._read_px4_param(heartbeat, name)
+                    if value is None or not math.isfinite(value) or value != expected:
+                        raise RuntimeError(f"GPS + external yaw requires {name}={expected}; current={value}")
+                self.get_logger().warn(
+                    "External yaw enabled: EV yaw ONLY, message covariance, no continuous mag fusion. "
+                    "Both position and yaw stop together on quarantine. Bench verification required."
+                )
             if use_hil_gps is None:
                 raise RuntimeError("PX4 did not return required parameter MAV_USEHILGPS")
             if int(round(use_hil_gps)) != 1:
@@ -626,6 +683,8 @@ class VioPx4GpsBridge(Node):
                 "recovery (PX4 position/velocity variance and reset counter included)"
             )
             self.px4_target_compid = heartbeat.get_srcComponent()
+            if self.external_yaw is not None:
+                self._request_mavlink_stream(heartbeat, 111, 50.0)  # TIMESYNC
             if self.heading_source == "px4":
                 self.get_logger().info(
                     "Startup heading uses PX4 ATTITUDE yaw; no bridge compass/declination correction"
@@ -750,7 +809,9 @@ class VioPx4GpsBridge(Node):
             self.get_logger().info(
                 f"VIO_GPS_OUTPUT_RESUMED reason={reason}; PX4 may reselect preferred VIO GPS"
             )
-            self._send_status_text("VIO GPS: live output resumed", 6)
+            self._send_status_text("VIO GPS+yaw: live output resumed" if
+                                   getattr(self, "external_yaw", None) is not None else
+                                   "VIO GPS: live output resumed", 6)
         elif was_active:
             self.get_logger().error(
                 f"VIO_GPS_OUTPUT_STOPPED reason={reason}; waiting for PX4 GPS timeout/fallback"
@@ -761,7 +822,160 @@ class VioPx4GpsBridge(Node):
                 text = "VIO GPS stopped: pose gate; GPS1 fallback"
             else:
                 text = f"VIO GPS stopped: {reason}"
+            if getattr(self, "external_yaw", None) is not None:
+                text = f"VIO GPS+yaw stopped: {reason}"
             self._send_status_text(text, 3)
+
+    def _invalidate_navigation(self, reason):
+        """One latch for both measurement streams; telemetry reception continues."""
+        aid = self.external_yaw
+        changed = aid.input_error != reason
+        aid.input_error = reason
+        if self.phase == Phase.LIVE and changed and reason != "continuity_quarantine":
+            self.continuity.quarantine(reason)
+        if self.phase == Phase.LIVE and not self.continuity_recovering:
+            self.continuity.quarantine(reason)
+            self.continuity_recovering = True
+            self._start_inertial_propagation()
+            self._reset_recovery_agreement()
+        self._set_live_output_state(False, reason)
+
+    def _external_yaw_reason(self):
+        aid = self.external_yaw
+        now = time.monotonic()
+        if self.continuity_recovering:
+            return "continuity_quarantine"
+        if (self.last_px4_heartbeat_time is None or
+                not 0 <= now-self.last_px4_heartbeat_time <= self.heartbeat_timeout_s):
+            return "PX4_heartbeat_stale"
+        if self.heading_offset_rad is None:
+            return "heading_alignment_incomplete"
+        if self.rejected_odom_frame is not None:
+            return "invalid_body_frame"
+        if self.phase != Phase.LIVE:
+            if self.px4_armed is not False:
+                return "external_heading_start_requires_disarmed"
+            if not getattr(self, "external_startup_stationary", False):
+                return "external_heading_start_requires_stationary"
+            reason = self.camera_readiness.reason(now)
+            if reason:
+                return reason
+        return aid.reason(now)
+
+    def _verify_external_yaw_startup(self, speed):
+        aid = self.external_yaw
+        self.external_startup_stationary = speed <= self.alignment_max_speed
+        if not self.external_startup_stationary or aid.pose is None:
+            aid.startup_agreement = 0
+            aid.startup_verified = False
+            return
+        sample = aid.matched_fcu(aid.pose[0], time.monotonic(), self.inertial_max_message_age_s)
+        if sample is None:
+            aid.startup_verified = False
+            return
+        if self.heading_source == "px4":
+            # Initial PX4 reference is not a perfect north measurement either.
+            aid.variance_floor = max(aid.variance_floor, sample.yaw_variance)
+        if self.heading_source == "manual" and aid.sent == 0:
+            return  # need a readback AFTER supplying the manual seed
+        if abs(wrap_pi(sample.yaw-aid.pose[3])) > self.external_yaw_startup_tolerance:
+            aid.startup_agreement = 0
+            aid.startup_verified = False
+        elif aid.startup_evidence != sample.evidence_s:
+            aid.startup_agreement += 1
+        aid.startup_evidence = sample.evidence_s
+        if aid.startup_agreement >= self.recovery_yaw_agreement_samples:
+            aid.startup_verified = True
+
+    def _external_yaw_tick(self):
+        """Fast TIMESYNC service, rate-limited EV; GPS uses the identical gate."""
+        self._poll_mavlink()
+        now = time.monotonic()
+        aid = self.external_yaw
+        request = aid.clock.request(now)
+        if request is not None:
+            self._mav.mav.timesync_send(*request)
+        if aid.generation != aid.clock.generation:
+            self._invalidate_navigation("PX4_clock_reset")
+            aid.generation = aid.clock.generation
+            aid.history.clear()
+        if self.phase == Phase.WAITING:
+            return
+        reason = self._external_yaw_reason()
+        if reason:
+            if self.phase == Phase.LIVE:
+                self._invalidate_navigation(reason)
+            return
+        # During spoofing, GPS is deliberately stationary. EV starts only
+        # after camera validation; this also permits a MANUAL heading seed
+        # with MAG_TYPE=5 before requiring PX4 heading readback for live GPS.
+        eph, epv = self._select_accuracy()
+        packet = aid.packet(now, eph, epv)
+        if packet is not None:
+            try:
+                self._mav.mav.odometry_send(**packet)
+            except Exception as exc:  # transport failure must stop GPS as well
+                self._invalidate_navigation(f"external_yaw_transport_error: {exc}")
+                return
+            aid.mark_sent(now)
+
+    def _matched_recovery_target(self, velocity, raw_yaw):
+        """Time-matched FCU position AND yaw; no output while checks accumulate."""
+        aid = self.external_yaw
+        # Keep existing position/reset/physical guards. They may explicitly
+        # discard translation, but do not permanently latch healthy yaw out.
+        self._inertial_recovery_target()
+        sample = aid.matched_fcu(self.external_sample_time, time.monotonic(),
+                                 self.inertial_max_message_age_s)
+        aid.recovery_pose = None
+        if sample is None:
+            self._reset_recovery_agreement()
+            return None
+        self.inertial_heading_safe = True
+        self.inertial_heading_failure = None
+        yaw_delta = wrap_pi(sample.yaw - self.heading_offset_rad
+                           - self.continuity.recovery_anchor_yaw)
+        rotation = wrap_pi(sample.yaw - raw_yaw)
+        vn, ve, _ = rotate_ned_heading(*velocity, rotation)
+        residual = math.hypot(vn-sample.vn, ve-sample.ve)
+        if not self.recovery_velocity_sample_valid or residual > self.recovery_velocity_agreement_m_s:
+            if self.recovery_velocity_agreement_count:
+                self.get_logger().warn(
+                    f"VIO_RECOVERY_VELOCITY_AGREEMENT_RESET residual_m_s={residual:.3f} "
+                    f"limit_m_s={self.recovery_velocity_agreement_m_s:.3f} time_matched=true")
+            self.recovery_velocity_agreement_count = 0
+        elif sample.evidence_s != self.recovery_velocity_last_timestamp:
+            self.recovery_velocity_agreement_count += 1
+        self.recovery_velocity_last_timestamp = sample.evidence_s
+        yaw_result = self.recovery_yaw_agreement.update(raw_yaw, yaw_delta, sample.evidence_s)
+        self.recovery_yaw_agreement_state = "confirmed" if yaw_result.agreed else "collecting"
+        if yaw_result.event == "disagreement_reset":
+            self.recovery_yaw_agreement_state = "disagreeing"
+            self.get_logger().warn(
+                f"VIO_RECOVERY_YAW_AGREEMENT_RESET residual_deg={math.degrees(yaw_result.residual_rad):.3f} "
+                f"limit_deg={self.recovery_yaw_agreement_deg:.3f} time_matched=true")
+        # Both windows always update; never short-circuit one behind the other.
+        if (self.recovery_velocity_agreement_count < self.recovery_velocity_agreement_samples
+                or not yaw_result.agreed):
+            return None
+        if self.inertial_position_safe:
+            boundary = aid.boundary
+            if boundary is None or boundary.reset_counter != sample.reset_counter:
+                self._reject_position_propagation("time_matched_boundary_unavailable_or_reset")
+            else:
+                self.inertial_displacement_ned = [
+                    sample.north-boundary.north, sample.east-boundary.east, 0.]
+                self.inertial_integrated_duration_s = sample.boot_s-boundary.boot_s
+                if (self.inertial_integrated_duration_s < 0 or
+                        math.hypot(*self.inertial_displacement_ned[:2]) >
+                        self.continuity.max_speed_mps*self.inertial_integrated_duration_s + 1e-6):
+                    self._reject_position_propagation("matched_displacement_limit")
+        self.inertial_yaw_delta = yaw_delta
+        self.inertial_position_uncertainty_m = max(
+            self.inertial_position_uncertainty_m, math.sqrt(sample.position_variance))
+        aid.recovery_pose = sample
+        delta = rotate_ned_heading(*self.inertial_displacement_ned, -self.heading_offset_rad)
+        return delta, yaw_delta
 
     def _reject_position_propagation(self, reason: str):
         """Discard translation only; current FCU heading can still be used."""
@@ -849,6 +1063,15 @@ class VioPx4GpsBridge(Node):
         # doing so shortens the next dt and can manufacture a high yaw rate.
         self.inertial_last_yaw = self.latest_px4_yaw
         self._refresh_recovery_heading()
+        aid = getattr(self, "external_yaw", None)
+        if aid is not None:
+            aid.boundary = (None if aid.pose is None else aid.matched_fcu(
+                aid.pose[0], now, self.inertial_max_message_age_s))
+            if aid.pose is not None:
+                self.inertial_start_time = min(now, aid.pose[0])
+            aid.recovery_pose = None
+            if aid.boundary is None:
+                self._reject_position_propagation("time_matched_boundary_unavailable")
         self.get_logger().warn(
             "VIO_INERTIAL_RECOVERY_STARTED source=PX4_ODOMETRY_position+variance+"
             "reset_counter heading_reference=current_FCU_ATTITUDE gps_output=silent"
@@ -1018,6 +1241,12 @@ class VioPx4GpsBridge(Node):
         """
         now = time.monotonic()
         sample = self.latest_px4_yaw
+        aid = getattr(self, "external_yaw", None)
+        if aid is not None:
+            # The optional yaw path uses FCU ODOMETRY for heading + covariance;
+            # a missing parallel ATTITUDE stream cannot deadlock its recovery.
+            sample = None if not aid.history else (
+                aid.history[-1].received_s, aid.history[-1].boot_s, aid.history[-1].yaw)
         if sample is None or not all(math.isfinite(v) for v in sample):
             self._reject_heading_recovery("attitude_unavailable")
             return False
@@ -1080,6 +1309,14 @@ class VioPx4GpsBridge(Node):
         return local_delta, self.inertial_yaw_delta
 
     def _finish_inertial_propagation(self):
+        aid = getattr(self, "external_yaw", None)
+        if aid is not None:
+            # No timed tightening: stable relative VO does not restore an
+            # independent north reference lost during dead reckoning.
+            aid.variance_floor = max(aid.variance_floor, aid.recovery_pose.yaw_variance)
+            self.get_logger().info(
+                f"VIO_YAW_RECOVERY_APPLIED sigma_deg={math.degrees(math.sqrt(aid.variance_floor)):.2f}; "
+                "retaining inherited PX4 heading uncertainty")
         displacement = tuple(self.inertial_displacement_ned)
         elapsed = time.monotonic() - self.inertial_start_time
         variance = 0.0 if self.latest_px4_odometry is None else max(
@@ -1188,6 +1425,8 @@ class VioPx4GpsBridge(Node):
 
     def _validated_recovery_target(self, local_velocity, raw_vio_yaw):
         """Combine independent checks only at the final recovery decision."""
+        if getattr(self, "external_yaw", None) is not None:
+            return self._matched_recovery_target(local_velocity, raw_vio_yaw)
         target = self._inertial_recovery_target()
         velocity_agrees = self._recovery_velocity_agrees(local_velocity, raw_vio_yaw)
         yaw_agrees = self._recovery_yaw_agrees(raw_vio_yaw)
@@ -1257,17 +1496,38 @@ class VioPx4GpsBridge(Node):
             return "PX4 startup heading missing, stale, or collecting fresh samples"
         if self.continuity_recovering:
             return "pose-jump gate recovering"
+        if getattr(self, "external_yaw", None) is not None:
+            reason = self._external_yaw_reason()
+            if reason:
+                return reason
+            if not self.external_yaw.startup_verified:
+                return "waiting for PX4 heading readback agreement (no forced yaw reset)"
         return self.camera_readiness.reason(now)
 
     def _odom_callback(self, msg: Odometry):
         pos, orientation = msg.pose.pose.position, msg.pose.pose.orientation
         stamp = msg.header.stamp
+        aid = getattr(self, "external_yaw", None)
+        if aid is not None:
+            try:
+                if not msg.header.frame_id:
+                    raise ValueError("invalid_world_frame")
+                self.external_sample_time = aid.sample_time(
+                    stamp.sec + stamp.nanosec * 1e-9,
+                    self.get_clock().now().nanoseconds * 1e-9, time.monotonic())
+                rpy((orientation.w, orientation.x, orientation.y, orientation.z))
+            except ValueError as exc:
+                self._invalidate_navigation(str(exc))
+                return
+            aid.input_error = None
         self.camera_readiness.observe_odom(
             stamp.sec * 1000000000 + stamp.nanosec, time.monotonic(),
             (pos.x, pos.y, pos.z, orientation.x, orientation.y, orientation.z, orientation.w),
             msg.child_frame_id, self.expected_child_frame,
         )
         if msg.child_frame_id != self.expected_child_frame:
+            if aid is not None:
+                self._invalidate_navigation("invalid_body_frame")
             if msg.child_frame_id != self.rejected_odom_frame:
                 self.rejected_odom_frame = msg.child_frame_id
                 self.get_logger().error(
@@ -1302,6 +1562,8 @@ class VioPx4GpsBridge(Node):
             angular.z,
         )
         if not all(math.isfinite(float(value)) for value in values):
+            if aid is not None:
+                self._invalidate_navigation("invalid_odometry")
             self.get_logger().error("Ignoring VIO odometry containing NaN/Inf")
             return
         if self.odom_is_enu:
@@ -1336,6 +1598,7 @@ class VioPx4GpsBridge(Node):
             return
         raw_body_yaw_ned = wrap_pi(
             math.pi * 0.5 - (vio_child_yaw_enu + self.child_to_body_yaw_rad)
+            if self.odom_is_enu else vio_child_yaw_enu + self.child_to_body_yaw_rad
         )
         raw_yaw_rate_ned = -float(angular.z) if self.odom_is_enu else float(angular.z)
         stamp = msg.header.stamp
@@ -1437,6 +1700,13 @@ class VioPx4GpsBridge(Node):
             "epv": epv,
             "ignore_velocity": False,
         }
+        if aid is not None and self.heading_offset_rad is not None:
+            aid.store(self.external_sample_time, (north, east, down),
+                      wrap_pi(continuity.yaw + self.heading_offset_rad),
+                      (orientation.x, orientation.y, orientation.z, orientation.w),
+                      self.odom_is_enu)
+            if self.phase != Phase.LIVE:
+                self._verify_external_yaw_startup(horizontal_speed)
         self.have_vio = True
         self.last_vio_time = time.monotonic()
         if self.vio_stale_warned:
@@ -1560,6 +1830,12 @@ class VioPx4GpsBridge(Node):
             if (self.px4_target_sysid is not None
                     and int(msg.get_srcSystem()) != self.px4_target_sysid):
                 continue
+            if message_type == "TIMESYNC" and getattr(self, "external_yaw", None) is not None:
+                if int(msg.get_srcComponent()) == self.px4_target_compid:
+                    response = self.external_yaw.clock.receive(int(msg.tc1), int(msg.ts1), now)
+                    if response is not None:
+                        self._mav.mav.timesync_send(*response)
+                continue
             if (
                 message_type == "HEARTBEAT"
                 and self.px4_target_sysid is not None
@@ -1598,6 +1874,10 @@ class VioPx4GpsBridge(Node):
                         self._reject_heading_recovery("invalid_px4_attitude_sample")
                 continue
             if message_type == "ODOMETRY":
+                if int(msg.get_srcComponent()) != self.px4_target_compid:
+                    continue
+                if getattr(self, "external_yaw", None) is not None:
+                    self.external_yaw.observe_fcu(msg, now)
                 sample_time = float(msg.time_usec) * 1e-6
                 north, east = float(msg.x), float(msg.y)
                 try:
@@ -1646,6 +1926,13 @@ class VioPx4GpsBridge(Node):
             if (not rising_high or self.phase != Phase.WAITING
                     or self.spoof_failure_reason is not None):
                 continue
+            if (getattr(self, "external_yaw", None) is not None
+                    and not self.external_yaw.clock.ready(now)):
+                self.get_logger().warn(
+                    "External heading time sync not ready. Wait for Status clock=ready, "
+                    "then move RC LOW/MID -> HIGH again; no GPS/heading has started.")
+                self._send_status_text("VIO: time sync warming; retry RC when ready", 4)
+                continue
             self.get_logger().info(
                 f"RC channel {self.rc_channel} pwm={pwm} triggered GPS bootstrap"
             )
@@ -1659,6 +1946,11 @@ class VioPx4GpsBridge(Node):
             self.anchor_ned = None
             self.heading_offset_rad = None
             self.startup_heading.reset()
+            if getattr(self, "external_yaw", None) is not None:
+                self.external_yaw.startup_verified = False
+                self.external_yaw.startup_agreement = 0
+                self.external_yaw.startup_evidence = None
+                self.external_yaw.pose = None
             self.spoof_failure_reason = None
             self._last_handoff_reason = None
             self.phase = Phase.SPOOF
@@ -1718,6 +2010,12 @@ class VioPx4GpsBridge(Node):
         if self.phase == Phase.WAITING:
             self._set_live_output_state(False, "spoof_expired")
             return
+
+        if self.phase == Phase.LIVE and getattr(self, "external_yaw", None) is not None:
+            reason = self._external_yaw_reason()
+            if reason:
+                self._set_live_output_state(False, reason)
+                return
 
         if (
             self.phase == Phase.LIVE

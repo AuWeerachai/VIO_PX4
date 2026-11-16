@@ -4,6 +4,11 @@ Target checked: local `PX4-Autopilot` main at
 `v1.17.0-alpha1-708-g6e418096b7`. Re-check this document after changing PX4
 firmware because message handling and estimator requirements can change.
 
+Optional Path A heading output was separately audited against the Flying-Hand
+v1.0.1 source (`7cfb72feea`). See [GPS + external yaw](PATH_A_EXTERNAL_YAW.md)
+for its exact settings and bench checklist. It is disabled by default and does
+not change Path B or the height source.
+
 ## Common preflight gates
 
 - [ ] Cube and Jetson share a working MAVLink/UART link; the selected `/dev/tty*`
@@ -33,7 +38,8 @@ firmware because message handling and estimator requirements can change.
   rejects non-HIL `HIL_GPS` from a different system ID.
 - [ ] `EKF2_GPS_CTRL=1`: fuse longitude/latitude only, matching vns-sdk.
   Altitude remains on the configured height source, velocity is not fused, and
-  heading remains on the compass.
+  heading remains PX4-owned in GPS-only mode. The optional external-yaw mode
+  uses `EKF2_EV_CTRL=8`; GPS-only Path A requires `EKF2_EV_CTRL=0`.
 - [ ] `EKF2_HGT_REF=2` selects rangefinder, or `0` selects barometer. Path A
   checks this setting and `EKF2_GPS_CTRL=1` at startup; it does not change them.
   Keep the chosen sensor enabled and healthy. Do not enable GPS height fusion

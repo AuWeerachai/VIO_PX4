@@ -167,13 +167,42 @@ def test_heading_defaults_migrate_saved_compass_without_changing_extrinsics():
 def test_heading_menu_no_longer_prompts_for_bridge_declination():
     cfg = cli.Config()
     with patch.object(cli, '_clear'), patch.object(cli, 'pause'), \
-         patch.object(cli, 'prompt_line', side_effect=['px4', '0']) as prompt, \
+         patch.object(cli, 'prompt_line', side_effect=['off', 'px4', '0']) as prompt, \
          patch.object(cli, 'save_config') as save:
         changed = cli.configure_heading(cfg)
     assert changed.heading_source == 'px4'
-    assert prompt.call_count == 2
+    assert prompt.call_count == 3
     assert all('declination' not in call.args[0].lower() for call in prompt.call_args_list)
     save.assert_called_once_with(changed)
+
+
+def test_external_heading_settings_round_trip(tmp_path):
+    with patch.object(cli, 'user_config_path', return_value=tmp_path/'config.json'):
+        cfg = cli.apply_dict(cli.Config(), dict(external_yaw_enabled=True,
+                            external_yaw_noise_deg=8., external_yaw_rate_hz=40.,
+                            external_yaw_max_age_s=.15, external_yaw_startup_tolerance_deg=5.))
+        cli.save_config(cfg)
+        reloaded = cli.load_config()
+        for field in ('external_yaw_enabled', 'external_yaw_noise_deg',
+                      'external_yaw_rate_hz', 'external_yaw_max_age_s',
+                      'external_yaw_startup_tolerance_deg'):
+            assert getattr(cfg, field) == getattr(reloaded, field)
+    assert cli.Config().external_yaw_enabled is False
+
+
+@pytest.mark.parametrize('source', ['px4', 'manual'])
+def test_heading_menu_enables_yaw_without_touching_physical_gates(source):
+    answers = ['on', source, '0'] + (['156'] if source == 'manual' else [])
+    answers += ['5', '30', '.2', '10']
+    cfg = cli.Config()
+    with patch.object(cli, '_clear'), patch.object(cli, 'pause'), \
+         patch.object(cli, 'prompt_line', side_effect=answers), patch.object(cli, 'save_config'):
+        result = cli.configure_heading(cfg)
+    assert result.external_yaw_enabled
+    assert result.heading_source == source
+    assert result.gate_max_speed_m_s == cfg.gate_max_speed_m_s
+    assert result.gate_max_acceleration_m_s2 == cfg.gate_max_acceleration_m_s2
+    assert result.camera_pitch_deg == cfg.camera_pitch_deg
 
 
 def test_default_and_explicit_modes(tmp_path):

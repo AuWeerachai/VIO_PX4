@@ -94,6 +94,7 @@ def bridge():
     obj.vio_timeout_s = 1
     obj.heading_offset_rad = 0
     obj.heading_source = 'px4'
+    obj.external_yaw = None
     obj.startup_heading = SimpleNamespace(offset=0, fresh=lambda now: True)
     obj.continuity_recovering = False
     obj.camera_readiness = Mock()
@@ -177,8 +178,9 @@ def test_actual_startup_rejects_gps_height_fusion_and_wrong_height_reference(
     obj.home_alt = 200
     obj.validate_dual_gps_selection = obj.rc_trigger_enabled = False
     obj.heading_source = 'px4'
+    obj.external_yaw = None
     values = dict(MAV_USEHILGPS=1, EKF2_GPS_CTRL=gps_ctrl, EKF2_HGT_REF=height_ref,
-                  EKF2_NOAID_TOUT=5000000)
+                  EKF2_NOAID_TOUT=5000000, EKF2_EV_CTRL=0)
     obj._read_px4_param.side_effect = lambda heartbeat, name: values[name]
     connection = Mock()
     connection.recv_match.return_value = SimpleNamespace(

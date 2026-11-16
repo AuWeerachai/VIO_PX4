@@ -64,6 +64,12 @@ exclusive; Micro XRCE-DDS is not used.
 
 Settings persist in `~/.config/vio-launch/config.json`.
 
+**Heading alignment** also offers **Send VO heading to PX4 (on/off)** for Path A.
+It defaults to off. When enabled, position and heading share the same stop gate,
+while their recovery checks collect evidence independently. See the
+[setup and bench checklist](../../bootstrap/docs/PATH_A_EXTERNAL_YAW.md) before
+enabling it; the CLI does not change PX4 parameters for you.
+
 Old `heading_source=compass` settings automatically migrate to `px4` when loaded
 (persisted on the next settings save). The bridge also accepts `compass` as a
 deprecated alias for `px4`, with a warning. No bridge declination is added to

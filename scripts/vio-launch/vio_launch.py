@@ -92,6 +92,11 @@ class Config:
     odom_topic: str = "/visual_slam/tracking/odometry"
     heading_source: str = "px4"
     manual_heading_deg: float = 0.0
+    external_yaw_enabled: bool = False
+    external_yaw_noise_deg: float = 5.0
+    external_yaw_rate_hz: float = 30.0
+    external_yaw_max_age_s: float = 0.2
+    external_yaw_startup_tolerance_deg: float = 10.0
     mag_declination_source: str = "table"
     mag_declination_deg: float = 0.0
     child_to_body_yaw_deg: float = 0.0
@@ -183,6 +188,11 @@ def save_config(cfg: Config) -> None:
         "odom_topic": cfg.odom_topic,
         "heading_source": cfg.heading_source,
         "manual_heading_deg": cfg.manual_heading_deg,
+        "external_yaw_enabled": cfg.external_yaw_enabled,
+        "external_yaw_noise_deg": cfg.external_yaw_noise_deg,
+        "external_yaw_rate_hz": cfg.external_yaw_rate_hz,
+        "external_yaw_max_age_s": cfg.external_yaw_max_age_s,
+        "external_yaw_startup_tolerance_deg": cfg.external_yaw_startup_tolerance_deg,
         "mag_declination_source": cfg.mag_declination_source,
         "mag_declination_deg": cfg.mag_declination_deg,
         "child_to_body_yaw_deg": cfg.child_to_body_yaw_deg,
@@ -248,6 +258,11 @@ def apply_dict(cfg: Config, data: dict) -> Config:
         "odom_topic",
         "heading_source",
         "manual_heading_deg",
+        "external_yaw_enabled",
+        "external_yaw_noise_deg",
+        "external_yaw_rate_hz",
+        "external_yaw_max_age_s",
+        "external_yaw_startup_tolerance_deg",
         "mag_declination_source",
         "mag_declination_deg",
         "child_to_body_yaw_deg",
@@ -1371,6 +1386,11 @@ def cmd_gps(cfg: Config) -> None:
         "rc_request_rate_hz": 10.0,
         "rate_hz": 10.0,
         "odom_topic": cfg.odom_topic,
+        "external_yaw_enabled": str(cfg.external_yaw_enabled).lower(),
+        "external_yaw_noise_deg": cfg.external_yaw_noise_deg,
+        "external_yaw_rate_hz": cfg.external_yaw_rate_hz,
+        "external_yaw_max_age_s": cfg.external_yaw_max_age_s,
+        "external_yaw_startup_tolerance_deg": cfg.external_yaw_startup_tolerance_deg,
         "heading_source": cfg.heading_source,
         "manual_heading_deg": cfg.manual_heading_deg,
         "mag_declination_source": cfg.mag_declination_source,
@@ -1406,6 +1426,9 @@ def cmd_gps(cfg: Config) -> None:
     navigation_status.unlink(missing_ok=True)
     proc = start_managed(cfg, "gps-bridge", cmd, startup_check_s=6.0)
     print(f"- Path A connected to PX4 on {cfg.mavlink_url} (pid {proc['pid']}).")
+    if cfg.external_yaw_enabled:
+        print("- Heading time sync warms up before activation (normally about 15 seconds).")
+        print("- If RC is triggered too early, wait for clock ready in Status, then toggle LOW/HIGH again.")
     print("- Waiting for spoof: move RC channel 6 LOW/MID → HIGH.", flush=True)
 
     saw_spoof = False
@@ -1471,6 +1494,12 @@ def show_navigation_status(cfg: Config) -> None:
     print(f"- Connection status: {connection}")
     print(f"- VIO status: {vio_status}")
     print(f"- Pose-jump gate status: {gate_status}")
+    if status.get("external_yaw_enabled"):
+        print(f"- External heading: {status.get('external_yaw_status', 'unknown')}")
+        print("- Heading clock: " + ("ready" if status.get('external_yaw_clock_ready') else "warming/stale"))
+        sigma = status.get("external_yaw_sigma_deg")
+        if sigma is not None:
+            print(f"- Heading uncertainty floor: {float(sigma):.2f} deg (not reduced by waiting)")
     if navigation in ("spoof_active", "waiting_for_rc"):
         print(f"- Spoof health check: {status.get('handoff_check_reason') or 'healthy'}")
     if status.get("spoof_failure_reason"):
@@ -1751,6 +1780,17 @@ def configure_heading(cfg: Config) -> Config:
     print("The bridge does not add declination or calculate compass heading again.")
     print("Verify PX4 heading first; keep the drone stationary during spoofing.")
     print("Alignment stays fixed in normal tracking; recovery uses current PX4 heading.\n")
+    print("Optional Path A heading output: ODOMETRY yaw + HIL_GPS position.")
+    print("One quarantine stops BOTH; barometer/rangefinder height is unchanged.")
+    enabled = prompt_line("Send VO heading to PX4 (on/off)",
+                          "on" if cfg.external_yaw_enabled else "off")
+    if enabled is None:
+        return cfg
+    if enabled.strip().lower() not in ("on", "off"):
+        print("Use on or off.")
+        pause()
+        return cfg
+    enabled = enabled.strip().lower() == "on"
     source = prompt_line("Source (px4/manual)", cfg.heading_source)
     if source is None:
         return cfg
@@ -1765,15 +1805,38 @@ def configure_heading(cfg: Config) -> Config:
     manual = str(cfg.manual_heading_deg)
     if source == "manual":
         manual = prompt_line("Body true heading at alignment (deg clockwise from north)", manual)
+    output_values = (cfg.external_yaw_noise_deg, cfg.external_yaw_rate_hz,
+                     cfg.external_yaw_max_age_s, cfg.external_yaw_startup_tolerance_deg)
+    if enabled:
+        print("PX4: EKF2_EV_CTRL=8, EKF2_EV_NOISE_MD=0, EKF2_GPS_CTRL=1.")
+        print("EKF2_MAG_TYPE=6 for PX4 startup heading, or 5 for a manual heading seed.")
+        print("Manual seed: disarmed startup only. Reboot PX4 if already aligned to a different heading.")
+        print("No forced heading reset; live GPS waits for matching PX4 heading readback.")
+        print("Time sync warms up before heading output. Watch status before triggering spoof.")
+        prompts = ("Heading noise floor deg (1 sigma, 0.1..90)",
+                   "Heading output rate Hz (30..50)",
+                   "Maximum camera sample age s (0.02..0.2)",
+                   "Startup heading readback tolerance deg (>0..20)")
+        output_values = tuple(prompt_line(label, str(value))
+                              for label, value in zip(prompts, output_values))
     try:
         values = tuple(float(x) for x in (mounting, manual))
+        noise, rate, age, tolerance = tuple(float(x) for x in output_values)
         if not all(math.isfinite(x) for x in values):
             raise ValueError("angles must be finite")
+        if not (.1 <= noise <= 90 and 30 <= rate <= 50 and .02 <= age <= .2
+                and 0 < tolerance <= 20):
+            raise ValueError("heading output values outside displayed bounds")
+        if enabled and values[0] != 0:
+            raise ValueError("heading output requires drone_link odometry; child-to-body yaw must be zero")
         cfg = replace(
             cfg,
             heading_source=source,
             child_to_body_yaw_deg=values[0],
             manual_heading_deg=values[1],
+            external_yaw_enabled=enabled, external_yaw_noise_deg=noise,
+            external_yaw_rate_hz=rate, external_yaw_max_age_s=age,
+            external_yaw_startup_tolerance_deg=tolerance,
         )
     except (TypeError, ValueError) as exc:
         print(f"Invalid heading configuration: {exc}")
@@ -1781,6 +1844,8 @@ def configure_heading(cfg: Config) -> Config:
         return cfg
     save_config(cfg)
     print("Saved heading alignment configuration. Restart Path A to apply.")
+    if not enabled:
+        print("GPS-only Path A: set PX4 EKF2_EV_CTRL=0 before use. No PX4 parameter was changed here.")
     pause()
     return cfg
 

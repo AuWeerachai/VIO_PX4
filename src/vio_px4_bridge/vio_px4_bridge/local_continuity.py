@@ -38,6 +38,7 @@ class LocalPoseContinuity:
         self.last_timestamp = self.last_frame_key = None
         self.last_output_position = self.last_output_yaw = None
         self.stable_samples = self.epoch = 0
+        self.pending_quarantine = None
         self.recovery_anchor_position = self.recovery_anchor_yaw = None
         self._clear_suspect()
 
@@ -132,6 +133,15 @@ class LocalPoseContinuity:
             self.recovery_anchor_position = self.last_output_position
             self.recovery_anchor_yaw = self.last_output_yaw
 
+    def quarantine(self, reason):
+        """Latch a missing/invalid input without accepting it as a sample."""
+        if self.last_output_position is None:
+            return
+        self._start_recovery()
+        self.stable_samples = 0
+        self._clear_suspect()
+        self.pending_quarantine = reason
+
     def _set_raw_state(self, sample):
         p, yaw, v, rate, timestamp, frame = sample
         self.last_raw_position, self.last_raw_yaw, self.last_raw_velocity = p, yaw, v
@@ -184,6 +194,10 @@ class LocalPoseContinuity:
         sample = (position, yaw, velocity, yaw_rate, timestamp, frame_key)
         accepted = self._accepted_sample()
         if accepted is None: return self._accept(sample)
+
+        if self.pending_quarantine:
+            force_reanchor_reason = self.pending_quarantine
+            self.pending_quarantine = None
 
         if force_reanchor_reason:
             self._start_recovery()

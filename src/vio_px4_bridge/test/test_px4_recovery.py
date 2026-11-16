@@ -420,7 +420,7 @@ def telemetry(bridge, t, counter, yaw=0., gyro_z=0., attitude_first=True,
     """Feed actual MAVLink dispatch with synchronized ODOMETRY q/body gyro."""
     bridge.clock.now = t
     odom = SimpleNamespace(
-        get_type=lambda: 'ODOMETRY', get_srcSystem=lambda: 1,
+        get_type=lambda: 'ODOMETRY', get_srcSystem=lambda: 1, get_srcComponent=lambda: 1,
         time_usec=round(t*1e6), frame_id=1, child_frame_id=1, estimator_type=8,
         x=north, y=east, vx=vn, vy=ve, vz=0., q=(math.cos(yaw/2), 0., 0., math.sin(yaw/2)),
         rollspeed=0., pitchspeed=0., yawspeed=gyro_z,
