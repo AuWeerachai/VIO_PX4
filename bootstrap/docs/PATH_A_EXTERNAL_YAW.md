@@ -66,8 +66,11 @@ PX4: on**. Existing saved configurations default to off. New settings:
 
 Existing CLI physical limits, recovery message age/gap, yaw agreement limits
 and stable-sample counts remain authoritative. The new option requires
-`drone_link` body odometry and a zero legacy child-to-body yaw correction.
+`drone_link` body odometry. **Initial heading reference** means PX4's estimate
+or a manual true heading of the drone's forward axis, not the camera's axis.
 Extrinsics remain entirely in cuVSLAM; no extra camera rotation is added.
+The CLI has no child-to-body yaw field. Old saved offsets are ignored; a direct
+ROS launch requesting a nonzero legacy `child_to_body_yaw_deg` is rejected.
 
 Set parameters manually while on the ground:
 

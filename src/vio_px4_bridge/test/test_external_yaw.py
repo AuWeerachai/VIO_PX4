@@ -460,3 +460,24 @@ def test_runtime_init_enabled_without_ros_hardware(monkeypatch):
         node.destroy_node()
     finally:
         rclpy.shutdown()
+
+
+@pytest.mark.parametrize('enabled', ['false', 'true'])
+@pytest.mark.parametrize('legacy_yaw', ['1.0', '-180.0'])
+def test_runtime_rejects_second_mounting_rotation_before_opening_transport(monkeypatch, enabled, legacy_yaw):
+    monkeypatch.setenv('ROS_LOCALHOST_ONLY', '1')
+    monkeypatch.setenv('ROS_DOMAIN_ID', '123')
+    import rclpy
+    from vio_px4_bridge.vio_px4_gps_bridge import VioPx4GpsBridge
+    transport = Mock()
+    monkeypatch.setattr(VioPx4GpsBridge, '_init_transport', transport)
+    rclpy.init(args=['--ros-args', '-p', 'external_yaw_enabled:='+enabled,
+                    '-p', 'child_to_body_yaw_deg:='+legacy_yaw])
+    node = VioPx4GpsBridge.__new__(VioPx4GpsBridge)
+    try:
+        with pytest.raises(ValueError, match='camera mounting belongs to cuVSLAM extrinsics'):
+            node.__init__()
+        transport.assert_not_called()
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()

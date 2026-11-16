@@ -50,7 +50,7 @@ The archived IMU tools/cache are not needed for VO and are not deleted.
 | **Path B — External vision** | Body VIO → MAVROS → Cube (`ODOMETRY`) |
 | **FC link** | Pick direct UART/USB serial, UDP networking, or keep the current setting |
 | **Home latitude/longitude** | Horizontal spoof/origin position |
-| **Heading alignment** | Use PX4 estimated heading (default) or explicit manual true heading |
+| **Heading alignment** | Choose the initial heading reference: PX4 estimate (default) or manual true heading |
 | **Camera extrinsic** | Configure the full ROS FLU `drone_link → camera_link` XYZ/RPY transform |
 | **Pose-jump gate limits** | Configure physical rate, timing, and recovery limits |
 | **RViz auto-launch** | Persistently toggle automatic RViz startup; default OFF |
@@ -69,6 +69,13 @@ It defaults to off. When enabled, position and heading share the same stop gate,
 while their recovery checks collect evidence independently. See the
 [setup and bench checklist](../../bootstrap/docs/PATH_A_EXTERNAL_YAW.md) before
 enabling it; the CLI does not change PX4 parameters for you.
+
+Heading means the forward (+X) direction of `drone_link`, not the camera.
+Camera mounting is configured only in **Camera extrinsics** and applied by
+cuVSLAM before publishing body odometry. There is no child-to-body yaw field
+or additional mounting rotation in the bridge. Old saved
+`child_to_body_yaw_deg` settings are ignored and removed on the next save;
+direct ROS launches that request a nonzero legacy offset are rejected.
 
 Old `heading_source=compass` settings automatically migrate to `px4` when loaded
 (persisted on the next settings save). The bridge also accepts `compass` as a

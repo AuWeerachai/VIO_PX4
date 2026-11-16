@@ -135,6 +135,8 @@ class VioPx4GpsBridge(Node):
         self.declare_parameter("mag_declination_source", "table")
         self.declare_parameter("mag_declination_deg", 0.0)
         self.declare_parameter("mag_declination_table_path", "")
+        # Compatibility only: nonzero legacy mounting corrections are rejected.
+        # cuVSLAM applies full extrinsics before publishing the body pose.
         self.declare_parameter("child_to_body_yaw_deg", 0.0)
         self.declare_parameter("mag_roll_offset_deg", 0.0)
         self.declare_parameter("mag_pitch_offset_deg", 0.0)
@@ -242,11 +244,14 @@ class VioPx4GpsBridge(Node):
         self.manual_heading_rad = math.radians(
             float(self.get_parameter("manual_heading_deg").value)
         )
-        self.child_to_body_yaw_rad = math.radians(
-            float(self.get_parameter("child_to_body_yaw_deg").value)
-        )
-        if not all(math.isfinite(v) for v in (self.manual_heading_rad, self.child_to_body_yaw_rad)):
-            raise ValueError("Heading and body alignment angles must be finite")
+        legacy_child_yaw = float(self.get_parameter("child_to_body_yaw_deg").value)
+        if not math.isfinite(self.manual_heading_rad):
+            raise ValueError("Manual heading must be finite")
+        if not math.isfinite(legacy_child_yaw) or legacy_child_yaw != 0.0:
+            raise ValueError(
+                "child_to_body_yaw_deg must be zero: camera mounting belongs to "
+                "cuVSLAM extrinsics; the bridge requires body-frame odometry"
+            )
         self.alignment_sample_count = max(
             5, int(self.get_parameter("alignment_samples").value)
         )
@@ -314,8 +319,8 @@ class VioPx4GpsBridge(Node):
 
         self.external_yaw = None
         if bool(self.get_parameter("external_yaw_enabled").value):
-            if self.transport != "mavlink" or self.child_to_body_yaw_rad != 0:
-                raise ValueError("External yaw requires MAVLink and body-frame odometry (child-to-body=0)")
+            if self.transport != "mavlink":
+                raise ValueError("External yaw requires MAVLink")
             if bool(self.get_parameter("use_sim_time").value):
                 raise ValueError("External yaw on hardware cannot use ROS simulated time")
             self.external_yaw = ExternalYaw(
@@ -1590,15 +1595,14 @@ class VioPx4GpsBridge(Node):
             vn, ve, vd = float(lin.x), float(lin.y), float(lin.z)
 
         try:
-            vio_child_yaw_enu = yaw_from_quaternion_xyzw(
+            vio_body_yaw = yaw_from_quaternion_xyzw(
                 orientation.x, orientation.y, orientation.z, orientation.w
             )
         except ValueError as exc:
             self.get_logger().error(f"Ignoring invalid VIO orientation: {exc}")
             return
         raw_body_yaw_ned = wrap_pi(
-            math.pi * 0.5 - (vio_child_yaw_enu + self.child_to_body_yaw_rad)
-            if self.odom_is_enu else vio_child_yaw_enu + self.child_to_body_yaw_rad
+            math.pi * 0.5 - vio_body_yaw if self.odom_is_enu else vio_body_yaw
         )
         raw_yaw_rate_ned = -float(angular.z) if self.odom_is_enu else float(angular.z)
         stamp = msg.header.stamp

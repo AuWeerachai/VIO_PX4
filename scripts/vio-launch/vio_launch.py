@@ -99,7 +99,6 @@ class Config:
     external_yaw_startup_tolerance_deg: float = 10.0
     mag_declination_source: str = "table"
     mag_declination_deg: float = 0.0
-    child_to_body_yaw_deg: float = 0.0
     # SDK serial from rs-enumerate-devices, NOT the USB ASIC identifier.
     camera_serial: str = ""
     # drone_link -> camera_link extrinsic in ROS FLU coordinates.
@@ -195,7 +194,6 @@ def save_config(cfg: Config) -> None:
         "external_yaw_startup_tolerance_deg": cfg.external_yaw_startup_tolerance_deg,
         "mag_declination_source": cfg.mag_declination_source,
         "mag_declination_deg": cfg.mag_declination_deg,
-        "child_to_body_yaw_deg": cfg.child_to_body_yaw_deg,
         "camera_serial": cfg.camera_serial,
         "camera_x_m": cfg.camera_x_m,
         "camera_y_m": cfg.camera_y_m,
@@ -265,7 +263,6 @@ def apply_dict(cfg: Config, data: dict) -> Config:
         "external_yaw_startup_tolerance_deg",
         "mag_declination_source",
         "mag_declination_deg",
-        "child_to_body_yaw_deg",
         "camera_serial",
         "camera_x_m",
         "camera_y_m",
@@ -305,6 +302,8 @@ def apply_dict(cfg: Config, data: dict) -> Config:
 def load_config(ns: argparse.Namespace | None = None) -> Config:
     cfg = default_config()
     saved = load_saved_overrides()
+    # Legacy child_to_body_yaw_deg is intentionally not loaded: camera mounting
+    # belongs entirely to the cuVSLAM extrinsics, and input is drone_link.
     cfg = apply_dict(cfg, saved)
     # Backward compatibility with the former pitch-only menu setting.
     if "camera_pitch_deg" not in saved and "camera_tilt_deg" in saved:
@@ -890,8 +889,7 @@ def cmd_doctor(cfg: Config) -> int:
             failed += 1
     print(f"\nhorizontal origin: {cfg.home_lat}, {cfg.home_lon}")
     print(f"odom:     {cfg.odom_topic}")
-    print(f"heading:  {heading_label(cfg)}, "
-          f"child-to-body={cfg.child_to_body_yaw_deg} deg")
+    print(f"initial heading reference: {heading_label(cfg)}")
     print(f"checklist: {cfg.vio_px4_dir / 'bootstrap/docs/PX4_INTERFACE_CHECKLIST.md'}")
     print(f"config:   {user_config_path()}")
     return 0 if failed == 0 else 1
@@ -1395,7 +1393,7 @@ def cmd_gps(cfg: Config) -> None:
         "manual_heading_deg": cfg.manual_heading_deg,
         "mag_declination_source": cfg.mag_declination_source,
         "mag_declination_deg": cfg.mag_declination_deg,
-        "child_to_body_yaw_deg": cfg.child_to_body_yaw_deg,
+        "child_to_body_yaw_deg": 0.0,  # body odometry; no second mounting correction
         "expected_child_frame": "drone_link",
         "continuity_max_gap_s": cfg.gate_max_gap_s,
         "continuity_recovery_samples": cfg.gate_recovery_samples,
@@ -1780,6 +1778,8 @@ def configure_heading(cfg: Config) -> Config:
     print("The bridge does not add declination or calculate compass heading again.")
     print("Verify PX4 heading first; keep the drone stationary during spoofing.")
     print("Alignment stays fixed in normal tracking; recovery uses current PX4 heading.\n")
+    print("Heading describes drone_link's forward direction, not the camera direction.")
+    print("Camera mounting is handled only in Camera extrinsics; no extra yaw correction.\n")
     print("Optional Path A heading output: ODOMETRY yaw + HIL_GPS position.")
     print("One quarantine stops BOTH; barometer/rangefinder height is unchanged.")
     enabled = prompt_line("Send VO heading to PX4 (on/off)",
@@ -1791,7 +1791,7 @@ def configure_heading(cfg: Config) -> Config:
         pause()
         return cfg
     enabled = enabled.strip().lower() == "on"
-    source = prompt_line("Source (px4/manual)", cfg.heading_source)
+    source = prompt_line("Initial heading reference (px4/manual)", cfg.heading_source)
     if source is None:
         return cfg
     source = (source or cfg.heading_source).strip().lower()
@@ -1799,9 +1799,6 @@ def configure_heading(cfg: Config) -> Config:
         print("Invalid source; use px4 or manual.")
         pause()
         return cfg
-    mounting = prompt_line(
-        "cuVSLAM child-to-body yaw", str(cfg.child_to_body_yaw_deg)
-    )
     manual = str(cfg.manual_heading_deg)
     if source == "manual":
         manual = prompt_line("Body true heading at alignment (deg clockwise from north)", manual)
@@ -1820,20 +1817,17 @@ def configure_heading(cfg: Config) -> Config:
         output_values = tuple(prompt_line(label, str(value))
                               for label, value in zip(prompts, output_values))
     try:
-        values = tuple(float(x) for x in (mounting, manual))
+        manual_heading = float(manual)
         noise, rate, age, tolerance = tuple(float(x) for x in output_values)
-        if not all(math.isfinite(x) for x in values):
-            raise ValueError("angles must be finite")
+        if not math.isfinite(manual_heading):
+            raise ValueError("manual heading must be finite")
         if not (.1 <= noise <= 90 and 30 <= rate <= 50 and .02 <= age <= .2
                 and 0 < tolerance <= 20):
             raise ValueError("heading output values outside displayed bounds")
-        if enabled and values[0] != 0:
-            raise ValueError("heading output requires drone_link odometry; child-to-body yaw must be zero")
         cfg = replace(
             cfg,
             heading_source=source,
-            child_to_body_yaw_deg=values[0],
-            manual_heading_deg=values[1],
+            manual_heading_deg=manual_heading,
             external_yaw_enabled=enabled, external_yaw_noise_deg=noise,
             external_yaw_rate_hz=rate, external_yaw_max_age_s=age,
             external_yaw_startup_tolerance_deg=tolerance,
@@ -2097,8 +2091,7 @@ def interactive_main(cfg: Config) -> int:
                 MenuItem(
                     "Heading alignment",
                     "heading",
-                    f"{heading_label(cfg)}; "
-                    f"child→body={cfg.child_to_body_yaw_deg}°",
+                    f"Initial reference: {heading_label(cfg)}",
                 ),
                 MenuItem(
                     "Camera extrinsic (ROS FLU XYZ/RPY)",

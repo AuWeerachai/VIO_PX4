@@ -121,7 +121,6 @@ def bridge():
     obj.logged_odom_frames = True
     obj.odom_is_enu = True
     obj.twist_is_body_frame = False
-    obj.child_to_body_yaw_rad = 0.
     obj.anchor_on_first_odom = True
     obj.anchor_ned = None
     obj._update_heading_alignment = Mock()

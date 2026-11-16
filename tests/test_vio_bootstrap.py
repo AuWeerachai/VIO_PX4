@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -164,16 +165,37 @@ def test_heading_defaults_migrate_saved_compass_without_changing_extrinsics():
     assert cli.apply_dict(cfg, {'heading_source': 'manual'}).heading_source == 'manual'
 
 
-def test_heading_menu_no_longer_prompts_for_bridge_declination():
+def test_heading_menu_has_initial_reference_but_no_second_mounting_correction(capsys):
     cfg = cli.Config()
     with patch.object(cli, '_clear'), patch.object(cli, 'pause'), \
-         patch.object(cli, 'prompt_line', side_effect=['off', 'px4', '0']) as prompt, \
+         patch.object(cli, 'prompt_line', side_effect=['off', 'px4']) as prompt, \
          patch.object(cli, 'save_config') as save:
         changed = cli.configure_heading(cfg)
     assert changed.heading_source == 'px4'
-    assert prompt.call_count == 3
-    assert all('declination' not in call.args[0].lower() for call in prompt.call_args_list)
+    assert prompt.call_count == 2
+    labels = [call.args[0] for call in prompt.call_args_list]
+    assert labels[1] == 'Initial heading reference (px4/manual)'
+    assert all('declination' not in label.lower() and 'child-to-body' not in label.lower()
+               for label in labels)
+    assert "drone_link's forward direction" in capsys.readouterr().out
     save.assert_called_once_with(changed)
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+def test_legacy_mounting_correction_is_not_loaded_or_saved(tmp_path, enabled):
+    path = tmp_path/'config.json'
+    saved = dict(child_to_body_yaw_deg=180., external_yaw_enabled=enabled,
+                 camera_x_m=-.26, camera_y_m=.01, camera_z_m=-.165,
+                 camera_roll_deg=.35, camera_pitch_deg=30.5, camera_yaw_deg=180.)
+    path.write_text(json.dumps(saved))
+    with patch.object(cli, 'user_config_path', return_value=path):
+        cfg = cli.load_config()
+        assert not hasattr(cfg, 'child_to_body_yaw_deg')
+        for key, value in saved.items():
+            if key != 'child_to_body_yaw_deg':
+                assert getattr(cfg, key) == value
+        cli.save_config(cfg)
+    assert 'child_to_body_yaw_deg' not in json.loads(path.read_text())
 
 
 def test_external_heading_settings_round_trip(tmp_path):
@@ -192,7 +214,7 @@ def test_external_heading_settings_round_trip(tmp_path):
 
 @pytest.mark.parametrize('source', ['px4', 'manual'])
 def test_heading_menu_enables_yaw_without_touching_physical_gates(source):
-    answers = ['on', source, '0'] + (['156'] if source == 'manual' else [])
+    answers = ['on', source] + (['156'] if source == 'manual' else [])
     answers += ['5', '30', '.2', '10']
     cfg = cli.Config()
     with patch.object(cli, '_clear'), patch.object(cli, 'pause'), \
@@ -203,6 +225,8 @@ def test_heading_menu_enables_yaw_without_touching_physical_gates(source):
     assert result.gate_max_speed_m_s == cfg.gate_max_speed_m_s
     assert result.gate_max_acceleration_m_s2 == cfg.gate_max_acceleration_m_s2
     assert result.camera_pitch_deg == cfg.camera_pitch_deg
+    assert result.camera_yaw_deg == cfg.camera_yaw_deg
+    assert result.manual_heading_deg == (156. if source == 'manual' else cfg.manual_heading_deg)
 
 
 def test_default_and_explicit_modes(tmp_path):

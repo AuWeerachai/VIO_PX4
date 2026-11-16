@@ -139,7 +139,6 @@ ros2 run vio_px4_bridge vio_px4_gps_bridge --ros-args \
   -p satellites:=40 \
   -p horizontal_only_output:=true \
   -p heading_source:=px4 \
-  -p child_to_body_yaw_deg:=0.0 \
   -p rate_hz:=10.0
 ```
 
@@ -163,8 +162,9 @@ fusion is missing, unsupported GPS fusion bits are enabled, the sender system ID
 not match PX4, or exposed dual-GPS selector values contradict the VIO-first
 policy. Firmware without `SENS_GPS_MASK`/`SENS_GPS_PRIME` produces an explicit
 unverified-selection warning and requires inspection before flight. Verify PX4's
-heading before bridge startup. Select PX4 heading and the measured cuVSLAM
-child-to-body yaw in the CLI's **Heading alignment** menu. Review
+heading before bridge startup. Select PX4 as the **Initial heading reference**
+in the CLI's **Heading alignment** menu. Heading uses `drone_link`; configure
+camera mounting only in **Camera extrinsics**, not as a second bridge rotation. Review
 `bootstrap/docs/PX4_INTERFACE_CHECKLIST.md` before hardware testing.
 
 ### cuVSLAM pose-jump continuity
