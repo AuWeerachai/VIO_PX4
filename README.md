@@ -9,3 +9,6 @@ external-vision paths.
 - ROS source is under `src/`.
 - Operator launcher code is under `scripts/vio-launch/`.
 - Runtime architecture documentation is under `docs/`.
+- Recovery / replacement-Jetson setup: [bootstrap checklist](bootstrap/docs/JETSON_RECOVERY.md).
+  Git restores the project layer, not the saved vehicle configuration, PX4 firmware,
+  RTK workspace or recordings. Preserve the NVMe and config before reinstalling.

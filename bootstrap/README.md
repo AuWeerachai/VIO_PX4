@@ -2,12 +2,20 @@
 
 Two ways to feed the Cube+/PX4 EKF from Jetson VIO:
 
-1. **External vision** — cuVSLAM body odometry through MAVROS `ODOMETRY`
-2. **Internship-style GPS (new)** — boot GPS spoof, then VIO projected as GPS via `HIL_GPS`
+1. **Path A: VO-as-GPS** — boot GPS spoof, then VO projected as GPS via `HIL_GPS`
+2. **Path B: External vision** — cuVSLAM body odometry through MAVROS `ODOMETRY`
 
 The internship ArduPilot stack uses MAVLink `GPS_INPUT`. Stock PX4 does **not** fuse that the same way. PX4’s supported inject path is **`HIL_GPS`** with **`MAV_USEHILGPS=1`** (source sysid must match the vehicle, usually `1`).
 
 ## Fresh Jetson setup
+
+For a fresh Jetson, replacement module or post-crash recovery, first read
+[the infrastructure and recovery checklist](docs/JETSON_RECOVERY.md). It covers
+host versus container responsibilities, pinned versions, installation order,
+device permissions, saved settings and acceptance checks. Preserve the original NVMe,
+saved CLI configuration and PX4 artifacts before reinstalling anything.
+Matching JetPack/BSP, host ROS Humble and Docker/NVIDIA runtime are prerequisites,
+not fully installed by these scripts. The RTK workspace is separately restored.
 
 The repository contains the VIO bridges, operator launcher, and project-owned
 Isaac ROS launch overrides. For a Jetson that does not yet have Isaac ROS,
@@ -71,16 +79,24 @@ Run the repository-root entry point; its implementation is versioned under
 
 See `scripts/vio-launch/README.md`.
 
-## 1) External vision through MAVROS
+The optional Path A heading output added in `fcc1222` is **off by default** and
+not yet flight-validated. It is separate from camera IMU fusion. Do not enable
+it as part of restoring the known GPS-only configuration; see
+[external-yaw setup and tests](docs/PATH_A_EXTERNAL_YAW.md) for deliberate testing.
+
+## Path B: External vision through MAVROS
 
 ```bash
 vio-launch run b
 ```
 
 PX4 params (EV):
+
 - Start **without EV yaw fusion** until the deployed cuVSLAM frames and mounting
   transform have been verified. Do not blindly use `EKF2_EV_CTRL = 15`.
-- `EKF2_HGT_REF = Vision`
+- Do not change the height reference to Vision solely to run Path B. Keep the
+  validated aircraft height-source configuration and enable EV height only if
+  that separate fusion mode has been explicitly validated.
 
 Path B starts MAVROS on `/dev/ttyUSB0:921600`, then relays validated body-frame
 cuVSLAM odometry to `/mavros/odometry/out`. Micro XRCE-DDS and `px4_msgs` are not
@@ -88,17 +104,18 @@ part of the Jetson deployment. The relay rejects raw `camera_link` poses; use
 the installed `bootstrap/jetson-config/isaac_ros_overrides/scripts/start_vio.sh` so cuVSLAM
 publishes `child_frame_id=drone_link` directly.
 
-## 2) Internship-style GPS spoof + live VIO GPS (recommended for GPS path)
+## Path A: GPS spoof + live VO-as-GPS
 
 Same *pattern* as vns-sdk `GpsSpoof` → `BasaltGpsBridge`:
 
 1. Wait for the RC channel 6 LOW/MID→HIGH trigger.
-2. Stream static **home** GPS while VIO and independent heading alignment become ready.
-3. Align cuVSLAM yaw using calibrated Cube magnetometer + FC roll/pitch and
-   magnetic declination. FC yaw is deliberately not used.
+2. Stream static **home** GPS while camera health and heading alignment become ready.
+3. Align cuVSLAM yaw to PX4's estimated `ATTITUDE.yaw`; do not add bridge
+   magnetic declination or a separate compass correction.
 4. Sanitize cuVSLAM through a continuous local-pose layer. Translation/yaw
    resets are re-anchored locally and never passed through as vehicle motion.
-5. Send `SET_GPS_GLOBAL_ORIGIN` once.
+5. Establish the configured global origin while disarmed, with bounded retries
+   and PX4 readback verification. This does not enable GPS height fusion.
 6. Hand off only when VIO is fresh and heading alignment is stable; the accepted
    offset is frozen before live VIO → LLA GPS starts.
 
@@ -126,15 +143,15 @@ ros2 run vio_px4_bridge vio_px4_gps_bridge --ros-args \
   -p rate_hz:=10.0
 ```
 
-### PX4 parameters (GPS inject)
+### PX4 parameters (GPS inject, optional external yaw OFF)
 
 | Param | Value | Why |
 |-------|-------|-----|
 | `MAV_USEHILGPS` | `1` | Accept companion `HIL_GPS` |
 | `EKF2_GPS_CTRL` | `1` | Fuse GPS longitude/latitude only, matching vns-sdk |
 | `EKF2_EV_CTRL` | `0` (while testing GPS path) | Avoid fighting EV |
-| `EKF2_HGT_REF` | Baro | PX4 owns height; VIO GPS contributes horizontal position only |
-| `GPS_1_CONFIG` | `201` | Keep physical Here GNSS on GPS1 |
+| `EKF2_HGT_REF` | `0` (barometer) or `2` (rangefinder) | Use the validated aircraft height source; VIO GPS contributes horizontal position only |
+| `GPS_1_CONFIG` | vehicle-specific | Preserve a real receiver if installed; the latest aircraft had no physical GNSS navigation source |
 | `GPS_2_CONFIG` | `0` | VIO arrives over MAVLink, not a second GPS serial driver |
 | `SENS_GPS_MASK` | `0` | Do not blend physical GNSS and VIO |
 | `SENS_GPS_PRIME` | verify on hardware | Instance numbering changes when physical GNSS is absent |
@@ -154,9 +171,10 @@ child-to-body yaw in the CLI's **Heading alignment** menu. Review
 
 Path A maintains a separate continuous local control frame before converting to
 LLA. During normal tracking it passes VIO motion through. A suspicious sample is
-first quarantined and GPS output is paused. If the raw stream returns to the old
-trajectory, that isolated sample is discarded. Only a consistent cluster of new
-samples confirms a cuVSLAM coordinate reset; then the bridge changes the
+first quarantined and GPS output is paused. Returning to the old trajectory does
+not bypass recovery: a consistent candidate and the stable-sample checks are
+still required. A consistent cluster of new samples confirms a cuVSLAM coordinate
+segment; then the bridge changes the
 raw-VIO-to-continuous transform so that:
 
 ```text
@@ -167,17 +185,19 @@ continuous_pose_after_jump = continuous_pose_before_jump
 GPS output pauses for a short stable-sample recovery window. Candidate VIO
 motion cannot modify the trusted anchor. During this GPS-silent interval only,
 the bridge measures horizontal displacement from PX4 `ODOMETRY` and uses its
-position variance and estimator reset counter as safety gates. `ATTITUDE` supplies
-only the short-term yaw change. The bridge uses a difference between two PX4
+position variance and estimator reset counter as safety gates. Fresh `ATTITUDE`
+supplies the current FCU heading for recovery. The bridge uses a difference between two PX4
 local positions, never PX4's absolute/global position, and stops using PX4
 motion as soon as VIO GPS resumes. This avoids a closed position feedback loop.
 If any PX4 propagation guard fails, its displacement is discarded and position
-remains frozen. Heading validation fails closed, so HIL_GPS remains stopped
-until the operator restarts/re-aligns the pipeline. Default
+remains frozen. Position rejection does not permanently block heading recovery:
+fresh FCU heading and camera agreement can allow recovery at the frozen position.
+There is no fixed two-second propagation cutoff in the current implementation;
+freshness, uncertainty and physical guards still apply. Default
 fallback gates are configurable with `continuity_max_gap_s`,
 `continuity_confirmation_samples`, `continuity_recovery_samples`,
 `continuity_max_speed_m_s`, `continuity_max_acceleration_m_s2`, and
-`continuity_max_yaw_rate_deg_s`, `inertial_max_duration_s`,
+`continuity_max_yaw_rate_deg_s`,
 `inertial_max_message_age_s`, `inertial_max_message_gap_s`,
 `inertial_reorder_tolerance_s`,
 `inertial_max_position_uncertainty_m`, `recovery_velocity_agreement_m_s`,
@@ -190,13 +210,14 @@ should be connected as the primary detector once verified on the Jetson.
 
 Continuity transitions are written to the `gps-bridge` log with the prefix
 `VIO_CONTINUITY`. Each gate event includes its reason, measured value, configured
-limit, internal segment number, and outcome (`quarantine_started`, `isolated_outlier_rejected`,
+limit, internal segment number, and outcome (`quarantine_started`,
 `candidate_window_restarted`, `reset_confirmed`, or `recovery_completed`).
 Guarded propagation uses `VIO_INERTIAL_RECOVERY_*` events. This is transition logging,
 not per-frame logging, so it remains useful without rapidly growing the log.
 
-The current vehicle profile sets hard limits of 10 m/s speed and 5 m/s²
-acceleration. The platform is fully actuated, so the gate deliberately does not
+New CLI defaults are 10 m/s speed and 5 m/s² acceleration; the saved vehicle
+profile can differ and must be restored/reviewed separately. The platform is
+fully actuated, so the gate deliberately does not
 infer horizontal motion or acceleration from roll/pitch: valid forward,
 backward, or lateral translation may occur while the body remains approximately
 level.
@@ -220,8 +241,8 @@ checks for an existing serial-port owner and fails rather than competing for it.
 `HIL_GPS` requires altitude and velocity fields on the wire. In the deployed
 horizontal-only mode, altitude is held at the configured origin and velocity is
 zero; `EKF2_GPS_CTRL=1` leaves height and velocity estimation to PX4. Only
-latitude and longitude carry live VIO motion. Horizontal accuracy remains
-0.1 m instead of loosening after the boot phase. The synthetic receiver reports
+latitude and longitude carry live VIO motion. Nominal healthy horizontal accuracy
+is 0.1 m; recovery can retain a larger uncertainty floor. The synthetic receiver reports
 40 satellites, representing a strong but realistic multi-constellation fix. This is
 a binary healthy-source indicator; EPH and PX4 innovations still determine
 measurement weighting and consistency.

@@ -5,40 +5,57 @@ working `teamc-desktop` Jetson Orin Nano on 2026-08-26. It must not track the
 current NVIDIA release: current Isaac ROS documentation has moved beyond this
 ROS 2 Humble system.
 
+For crash recovery, NVMe migration, prerequisites and separately saved vehicle
+configuration, start with [Jetson recovery checklist](JETSON_RECOVERY.md).
+Reviewed 2026-11-16: current camera operation is **stereo VO**, not the IMU experiment.
+
 ## Captured platform
 
 | Component | Proven value |
 |---|---|
-| Jetson Linux / L4T | `36.4.7` (JetPack 6.2.1 family) |
+| Jetson Linux / L4T | Earlier machine notes record `36.4.7`; bootstrap checks the `36.4` family. See version distinction below. |
 | Ubuntu / ROS | Ubuntu 22.04 / ROS 2 Humble |
 | Isaac ROS | `release-3.2` |
 | `isaac_ros_common` | `fcf4d9e17f8f0a7f47f1d22d6a18421ce3768c01` |
 | `isaac_ros_visual_slam` | `e31f4cc1d41a329a01946e5fe63669f8b15da677` |
 | Visual-SLAM NGC asset | `3.1.0` (the asset used by the 3.2 documentation) |
-| Base image / VO librealsense | `v2.55.1` (retained for fallback) |
-| Default VIO librealsense overlay | `v2.56.5`, commit `38a41441971387197193ad3aeae3cefe6a11f2cb` |
+| Active VO / base-image librealsense | `v2.55.1` |
+| Inactive experimental IMU overlay | `v2.56.5`, commit `38a41441971387197193ad3aeae3cefe6a11f2cb`; not built/sourced by current startup |
 | NVIDIA RealSense ROS branch | `release/4.51.1-isaac` |
-| VIO wrapper commit | `c04f43308c00a6f495f14a47cc84cc293047cdff` |
+| Inactive IMU wrapper commit | `c04f43308c00a6f495f14a47cc84cc293047cdff` |
 | Docker image key | `aarch64.ros2_humble.realsense` |
+| MAVROS source | `c655e6343ec81687d51e7185bcba7a651e361fcd` plus project patch; host-side, Path B only |
+
+NVIDIA's official JetPack **6.2.1** image contains L4T **36.4.4**. Do not treat
+the earlier installed-system note `36.4.7` as an official image version or as
+independently reverified hardware. Compare the actual disk's release/package
+inventory and carrier requirements before choosing a flash image. Passing the
+script's family check alone is not compatibility validation.
+[NVIDIA JetPack 6.2.1](https://developer.nvidia.com/embedded/jetpack-sdk-621)
 
 The authoritative machine-readable pins are in
-`bootstrap/jetson-config/isaac_ros_release.env` (base image) and
-`bootstrap/jetson-config/isaac_ros_overrides/scripts/vio_imu_release.env` (VIO overlay).
+`bootstrap/jetson-config/isaac_ros_release.env` (base dependencies),
+`bootstrap/jetson-config/mavros_release.env` (MAVROS) and
+`bootstrap/jetson-config/isaac_ros_overrides/scripts/vio_imu_release.env`
+(inactive experimental IMU overlay). Apt/pip packages and all container layers
+are not fully locked by digest; these pins are not a complete offline image.
 
 ## Why the original setup was difficult to reproduce
 
 The working workspace was assembled across several layers:
 
-1. JetPack supplies the NVIDIA kernel, CUDA host mounts, Docker, and the
-   NVIDIA container runtime.
-2. `isaac_ros_common/run_dev.sh` selects and builds the Humble + RealSense
-   development image.
+1. JetPack supplies the NVIDIA kernel/GPU platform. Docker and its NVIDIA
+   runtime integration must be installed and working on the host.
+2. `isaac_ros_common/scripts/run_dev.sh` selects and builds the Humble +
+   RealSense development image.
 3. A manual edit to NVIDIA's `Dockerfile.realsense` installs
    `isaac_ros_visual_slam`, `isaac_ros_examples`, and `isaac_ros_realsense`.
 4. `isaac_ros_visual_slam` is a nested source checkout inside
    `isaac_ros_common`, rather than a normal sibling repository.
-5. Two manual source changes select 30 FPS, enable IMU by default, and increase
-   the image-jitter threshold to 60 ms.
+5. Historical source patches changed a launch default to 30 FPS, enabled IMU
+   by default and increased the image-jitter threshold to 60 ms. These are not
+   the active runtime settings: our current launch explicitly disables IMU and
+   uses the RealSense stereo configuration (observed at 640x360, 90 Hz).
 6. Custom `start_vio.sh` and `start_rviz.sh` files live inside NVIDIA's checkout.
 7. The NGC interface-spec asset is outside Git.
 
@@ -48,7 +65,12 @@ launch overrides in VIO_PX4.
 
 ## Fresh installation
 
-Start from a Jetson already flashed with the matching JetPack 6.2.x family:
+Start from a Jetson with the reviewed compatible 36.4-family BSP, host ROS
+Humble and working Docker/NVIDIA runtime already provisioned. Follow the
+[fresh-host requirements](JETSON_RECOVERY.md#51-provision-the-host-first),
+including storage, device permissions and the desktop session. `--install-deps`
+installs additional tools; it does not flash the module, install the full base
+platform or recover vehicle-specific configuration:
 
 ```bash
 cd ~/workspaces
@@ -61,18 +83,23 @@ cd VIO_PX4
 The bootstrap performs these operations in order:
 
 1. Refuses non-aarch64 systems and an L4T family other than 36.4.x.
-2. Verifies Docker and the NVIDIA container environment are usable.
+2. Checks that Docker responds. Actual GPU access must also be validated in the
+   container; `docker info` alone does not establish that.
 3. Clones both NVIDIA repositories at the captured commits.
 4. Downloads the pinned NGC visual-SLAM asset.
-5. Applies the captured Docker and cuVSLAM source patches idempotently.
-6. Installs the project-owned body-frame/extrinsic launch scripts.
-7. Builds the VIO/PX4 ROS package and exposes `~/vio-launch`.
-8. Installs the stereo-only VO launcher using the base-image camera driver.
-   IMU fusion is explicitly disabled; no experimental IMU overlay is built or loaded.
-9. Preserves configurable body-to-camera extrinsics and bridge recovery checks.
-10. Checks that IMU fusion is disabled and body odometry is healthy before live GPS
-    output. Path A performs validation during its stationary spoof; Path B
-    checks before starting. An existing IMU-enabled session must be fully stopped.
+5. Calls `bootstrap_jetson.sh`, which installs optional host dependencies,
+   reconstructs/patches MAVROS and builds that host workspace.
+6. Installs project-owned body-frame/extrinsic launch scripts and applies the
+   Docker/cuVSLAM source patches. IMU fusion is explicitly disabled at launch;
+   no experimental IMU overlay is built or loaded.
+7. Builds the VIO/PX4 ROS package and exposes `~/vio-launch` and
+   `~/.local/bin/vio-launch`. Saved CLI values must be restored separately from
+   `~/.config/vio-launch/config.json`.
+
+Camera validation is a **runtime** step, not performed by bootstrap: Path A
+checks camera health during stationary spoofing; Path B checks before starting
+its bridge. Restore body-to-camera extrinsics, serial and recovery settings
+before use. An existing IMU-enabled session must be fully stopped.
 
 `bootstrap_jetson.sh` also reconstructs the standalone
 `~/workspaces/mavros` workspace at the pinned commit recorded in
@@ -80,7 +107,7 @@ The bootstrap performs these operations in order:
 MAVROS remains a sibling dependency rather than being nested in VIO_PX4. It is
 used by Path B; Path A talks MAVLink directly and does not start MAVROS.
 
-The first `./vio-launch` invocation asks `run_dev.sh` to build/pull the large
+The first camera start through `./vio-launch` asks `run_dev.sh` to build/pull the large
 Isaac ROS image. Docker caches unchanged layers, so subsequent launches should
 reuse the image. Changing a relevant Dockerfile invalidates that layer and
 causes a rebuild.
@@ -103,7 +130,10 @@ missing-IMU-calibration warning still requires attention.
 The current launcher ignores old IMU mode-selection files and always uses VO.
 The compatibility helper `~/vio-imu-mode` reports VO and refuses to enable IMU.
 Fully stop existing sessions before launching the restored baseline. A running
-session with the wrong fusion mode or a sourced IMU overlay is rejected.
+session with the wrong fusion mode or an explicitly sourced `.vio-imu` overlay
+is rejected. That check is not a complete library-compatibility audit: do not
+mix the base RealSense driver with newer `realsense2_camera_msgs` from another
+overlay. See [deployment pitfalls](JETSON_RECOVERY.md#7-known-deployment-pitfalls).
 
 Do not copy generated `build/`, `install/`, Docker images, the 11 GB asset
 directory, logs, core dumps, swap files, or RViz-generated frame diagrams into

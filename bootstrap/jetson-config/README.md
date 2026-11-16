@@ -3,6 +3,10 @@
 This directory contains every project-owned override that otherwise lives
 inside the external Isaac ROS workspace.
 
+Replacement hardware / crash recovery: see
+[JETSON_RECOVERY.md](../docs/JETSON_RECOVERY.md). These deployment files do not
+contain the live vehicle configuration, PX4 firmware, RTK installation or bags.
+
 Run from a fresh clone on a Jetson that already has the Isaac ROS cuVSLAM
 workspace:
 
@@ -29,7 +33,8 @@ ${ISAAC_ROS_WS}/src/isaac_ros_common/scripts/check_camera_ready.py
 ${ISAAC_ROS_WS}/src/isaac_ros_common/scripts/.isaac_ros_common-config
 ```
 
-It creates timestamped backups before replacing existing files. The Git copies
+It creates timestamped backups for existing launch-script/helper files before
+replacement; this is not a full workspace/config backup. The Git copies
 under `bootstrap/jetson-config/isaac_ros_overrides/` remain authoritative.
 
 Both large runtime workspaces remain standalone siblings:
@@ -40,8 +45,9 @@ Both large runtime workspaces remain standalone siblings:
 ~/workspaces/VIO_PX4         # this project
 ```
 
-The full bootstrap creates and builds the first two; generated build trees and
-Docker images are intentionally not nested in this repository or committed.
+The full bootstrap creates the first two and builds MAVROS. The Isaac image and
+cuVSLAM overlay are built on camera startup; generated build trees and Docker
+images are intentionally not nested in this repository or committed.
 
 The active launch is stereo-only VO, using the base-image camera driver with
 IMU fusion explicitly disabled. The experimental SDK 2.56.5 overlay is not
