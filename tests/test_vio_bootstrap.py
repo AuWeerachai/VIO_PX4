@@ -23,6 +23,7 @@ def load(name, path):
 cli = load('vio_launch_bootstrap_test', ROOT/'scripts/vio-launch/vio_launch.py')
 fixes = load('vio_imu_fixes_test', SCRIPTS/'apply_vio_imu_fixes.py')
 selection = load('vio_camera_selection_test', SCRIPTS/'camera_selection.py')
+environment = load('vo_environment_test', SCRIPTS/'check_vo_environment.py')
 
 
 def test_camera_identity_rejects_wrong_serial_and_wrong_model():
@@ -104,7 +105,7 @@ def test_update_while_menu_is_waiting_is_detected_before_dispatch():
     run.assert_not_called()
 
 
-@pytest.mark.parametrize('path,active', [('a', 'ev-bridge'), ('a', 'mavros'), ('b', 'gps-bridge')])
+@pytest.mark.parametrize('path,active', [('a', 'ev-bridge'), ('a', 'mavros')])
 def test_conflicting_path_is_rejected_before_touching_camera(path, active):
     with patch.object(cli, 'find_proc', side_effect=lambda cfg, name: {'pid': 123} if name == active else None), \
          patch.object(cli, 'cmd_vio') as camera:
@@ -129,7 +130,7 @@ def test_camera_is_not_restarted_under_active_gps(existing_session):
     stop.assert_not_called()
 
 
-@pytest.mark.parametrize('command', ['cmd_gps', 'cmd_ev_bridge'])
+@pytest.mark.parametrize('command', ['cmd_gps'])
 def test_direct_bridge_commands_cannot_bypass_camera_identity(command):
     with patch.object(cli, 'find_proc', return_value=None), \
          patch.object(cli, 'require_camera_ready', side_effect=RuntimeError('Wrong VIO camera')), \
@@ -210,6 +211,12 @@ def test_external_heading_settings_round_trip(tmp_path):
                       'external_yaw_startup_tolerance_deg'):
             assert getattr(cfg, field) == getattr(reloaded, field)
     assert cli.Config().external_yaw_enabled is False
+
+
+def test_heading_default_is_one_degree_without_overwriting_existing_config():
+    assert cli.Config().external_yaw_noise_deg == 1.
+    assert cli.apply_dict(cli.Config(), {'external_yaw_noise_deg': 5.}).external_yaw_noise_deg == 5.
+    assert cli.Config().external_yaw_max_age_s == .2
 
 
 @pytest.mark.parametrize('source', ['px4', 'manual'])
@@ -305,15 +312,29 @@ def test_readiness_runs_as_camera_user_and_propagates_failure(tmp_path):
     assert 'vo --timeout 12' in run.call_args.args[0][-1]
 
 
-def test_path_a_defers_health_but_path_b_does_not(tmp_path):
+def test_path_a_defers_health_and_removed_path_b_never_touches_camera(tmp_path):
     cfg = cli.Config(isaac_ros_dir=tmp_path)
     with patch.object(cli, 'cmd_vio') as camera, \
          patch.object(cli, 'find_proc', return_value=None), \
-         patch.object(cli, 'cmd_gps'), patch.object(cli, 'cmd_ev_bridge'):
+         patch.object(cli, 'cmd_gps'):
         cli.cmd_run(cfg, 'a')
         camera.assert_called_with(cfg, defer_health=True)
-        cli.cmd_run(cfg, 'b')
-        camera.assert_called_with(cfg, defer_health=False)
+        camera.reset_mock()
+        for name in ('b', 'ev', 'vision', 'external-vision'):
+            with pytest.raises(RuntimeError, match='Path B was removed'):
+                cli.cmd_run(cfg, name)
+        camera.assert_not_called()
+
+
+def test_path_b_has_no_runtime_or_bootstrap_entry_points():
+    assert not hasattr(cli, 'cmd_ev_bridge')
+    assert not hasattr(cli.Config(), 'mavros_dir')
+    assert 'mavros_ev_bridge' not in (ROOT/'src/vio_px4_bridge/setup.py').read_text()
+    assert '<exec_depend>mavros</exec_depend>' not in (ROOT/'src/vio_px4_bridge/package.xml').read_text()
+    assert 'MAVROS' not in (ROOT/'bootstrap/bootstrap_jetson.sh').read_text()
+    assert not (ROOT/'src/vio_px4_bridge/vio_px4_bridge/mavros_ev_bridge.py').exists()
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(['ev-bridge'])
 
 
 def test_failed_spoof_stops_gps_before_camera_and_preserves_evidence(tmp_path):
@@ -380,6 +401,10 @@ def test_vo_shell_launch_preserves_extrinsics_and_ignores_old_mode_file(tmp_path
     (common/'scripts').mkdir(parents=True)
     (common/'scripts/vio_imu_mode').write_text('vio\n')
     shutil.copy(SCRIPTS/'camera_selection.py', common/'scripts/camera_selection.py')
+    # This shell/argument test does not have ROS installed. The actual ABI guard
+    # is tested separately below and against the Jetson image during deployment.
+    (common/'scripts/vo_environment.sh').write_text('true\n')
+    (common/'scripts/check_vo_environment.py').write_text('pass\n')
     base = workspace/'share/isaac_ros_realsense/config/realsense_stereo.yaml'
     base.parent.mkdir(parents=True)
     base.write_text('enable_infra1: true\nenable_infra2: true\nenable_gyro: false\n')
@@ -439,6 +464,75 @@ def test_source_fixes_idempotent_and_keep_other_edits(tmp_path):
     impl.write_text('unknown source')
     with pytest.raises(RuntimeError, match='Unknown'):
         fixes.patched_sources(tmp_path)
+
+
+def test_vo_environment_rejects_mixed_prefixes_and_versions(tmp_path):
+    base = tmp_path/'base'
+    for package in ('realsense2_camera', 'realsense2_camera_msgs'):
+        manifest = base/'share'/package/'package.xml'
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text('<package><version>4.51.1</version></package>')
+    assert environment.validate_packages(base, base, base) == '4.51.1'
+    with pytest.raises(RuntimeError, match='matched base-image'):
+        environment.validate_packages(base, tmp_path/'overlay', base)
+    (base/'share/realsense2_camera_msgs/package.xml').write_text(
+        '<package><version>4.57.6</version></package>')
+    with pytest.raises(RuntimeError, match='versions differ'):
+        environment.validate_packages(base, base, base)
+
+
+def test_vo_environment_checks_native_linkage_not_only_package_names():
+    environment.validate_linkage(
+        'librealsense2_camera_msgs__rosidl_typesupport_cpp.so => '
+        '/opt/ros/humble/lib/librealsense2_camera_msgs__rosidl_typesupport_cpp.so (0xabcd)')
+    with pytest.raises(RuntimeError, match='Incompatible RealSense message library'):
+        environment.validate_linkage(
+            'librealsense2_camera_msgs__rosidl_typesupport_cpp.so => '
+            '/workspaces/isaac_ros-dev/install/realsense2_camera_msgs/lib/typesupport.so (0xabcd)')
+    with pytest.raises(RuntimeError, match='Missing camera dependency'):
+        environment.validate_linkage('librealsense2.so.2.55 => not found')
+
+
+def test_vo_environment_filters_entire_workspace_and_preserves_cuda_paths(tmp_path):
+    import os
+    workspace = tmp_path/'isaac'
+    overlay = workspace/'install/isaac_ros_visual_slam/share/isaac_ros_visual_slam/package.bash'
+    overlay.parent.mkdir(parents=True)
+    overlay.write_text('export VSLAM_OVERLAY_LOADED=yes\n')
+    # Mock only the absent system ROS installation; execute the real filtering
+    # and package-local overlay sourcing code, starting with contaminated paths.
+    command = r'''
+set -eu
+source() {
+  if [[ "$1" == /opt/ros/humble/setup.bash ]]; then
+    export BASE_ROS_LOADED=yes
+  else
+    builtin source "$@"
+  fi
+}
+builtin source "$1"
+[[ "$BASE_ROS_LOADED:$VSLAM_OVERLAY_LOADED" == yes:yes ]]
+[[ "$LD_LIBRARY_PATH" == /usr/local/cuda/lib64:/opt/ros/humble/lib ]]
+[[ "$AMENT_PREFIX_PATH" == /opt/ros/humble ]]
+[[ "$PYTHONPATH" == /opt/ros/humble/python ]]
+[[ $- == *u* ]]
+'''
+    contaminated = str(workspace/'install/realsense2_camera_msgs')
+    env = {**os.environ, 'ISAAC_ROS_WS': str(workspace),
+           'LD_LIBRARY_PATH': f'{contaminated}/lib:/usr/local/cuda/lib64:/opt/ros/humble/lib',
+           'AMENT_PREFIX_PATH': f'{workspace}/install:{contaminated}:/opt/ros/humble',
+           'PYTHONPATH': f'{workspace}/.vio-imu/old/python:/opt/ros/humble/python'}
+    result = subprocess.run(['bash', '-c', command, 'test', str(SCRIPTS/'vo_environment.sh')],
+                            env=env, text=True, capture_output=True)
+    assert result.returncode == 0, result.stderr
+
+
+def test_no_full_workspace_overlay_in_camera_entrypoints():
+    import inspect
+    for function in (cli.cmd_vio, cli.start_rviz_session, cli.require_camera_ready):
+        assert '${ISAAC_ROS_WS}/install/setup.bash' not in inspect.getsource(function)
+    assert 'vo_environment.sh' in inspect.getsource(cli.cmd_vio)
+    assert 'vo_environment.sh' in inspect.getsource(cli.require_camera_ready)
 
 
 def test_builder_cache_does_not_require_ros_or_network(tmp_path):

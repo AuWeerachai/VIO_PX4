@@ -1,7 +1,7 @@
 # VIO_PX4
 
-Jetson Orin Nano cuVSLAM bridge for PX4, supporting VIO-as-GPS and MAVROS
-external-vision paths.
+Jetson Orin Nano cuVSLAM bridge for PX4, supporting VO-as-GPS
+with optional VO heading over direct MAVLink.
 
 - Run the installed system with `./vio-launch`.
 - Camera mode: **VO (stereo only)**. RealSense IMU fusion is disabled; current extrinsics and bridge safety checks are retained.

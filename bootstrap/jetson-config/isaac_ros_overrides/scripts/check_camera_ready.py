@@ -3,6 +3,7 @@
 import argparse
 import math
 import time
+from check_vo_environment import validate as validate_environment
 import rclpy
 from rclpy.qos import qos_profile_sensor_data
 from rcl_interfaces.srv import GetParameters
@@ -21,6 +22,8 @@ def main():
     parser.add_argument('--serial', required=True, help='Expected rear D456 SDK serial')
     args = parser.parse_args()
     serial = normalize_serial(args.serial)
+    # Validate ABI BEFORE calling DeviceInfo, not after a failed identity query.
+    validate_environment()
     rclpy.init()
     node = rclpy.create_node('vio_launch_camera_readiness')
     imu = []

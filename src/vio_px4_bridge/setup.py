@@ -16,12 +16,11 @@ setup(
     zip_safe=True,
     maintainer='au',
     maintainer_email='you@example.com',
-    description='Bridge Isaac ROS VSLAM odometry to PX4 (EV and internship-style GPS).',
+    description='Bridge Isaac ROS VSLAM to PX4 HIL_GPS with optional yaw-only aiding.',
     license='TBD',
     entry_points={
         'console_scripts': [
             'vio_px4_gps_bridge = vio_px4_bridge.vio_px4_gps_bridge:main',
-            'mavros_ev_bridge = vio_px4_bridge.mavros_ev_bridge:main',
         ],
     },
 )

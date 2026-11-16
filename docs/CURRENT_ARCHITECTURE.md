@@ -28,7 +28,7 @@ correction of completed odometry. Translation uses ROS FLU axes (+X forward,
 ```text
 body-frame cuVSLAM odometry
   -> physical-limit and pose-jump continuity gate
-  -> independent compass/declination heading alignment
+  -> fixed heading alignment using PX4 at startup (or a manual reference)
   -> continuous local displacement anchored at configured latitude/longitude
   -> MAVLink HIL_GPS at 10 Hz
   -> PX4 EKF2 horizontal-position fusion
@@ -48,44 +48,42 @@ The bridge converts speed and yaw-rate limits into allowed pose changes using
 the measured timestamp interval between each pair of odometry messages. A
 confirmed coordinate reset increments the internal segment counter. While
 HIL_GPS is silent, the bridge measures guarded PX4 `ODOMETRY` horizontal
-displacement and yaw change for at most two seconds. PX4 position variance and
-the estimator reset counter are checked before that displacement is accepted.
-The recovered raw VIO segment is aligned to the last trusted pose plus only that
-short-term displacement. Before handoff, consecutive VIO/PX4 velocities must
-agree and consecutive relative yaw changes must agree. Absolute post-reset VIO
-yaw is intentionally ignored because a new coordinate epoch may start at any
-angle; its stable relative rotation is mapped onto the last trusted yaw plus
-the guarded PX4 yaw change. Duplicate PX4 attitude samples are not counted.
-PX4 motion packets up to the configured reorder tolerance behind the current
-recovery boundary are dropped without changing the propagation state. Larger
-timestamp regressions reject propagation. Position then remains frozen, but
-heading validation fails closed and HIL_GPS cannot resume automatically.
-Candidate/recovery VIO samples never move the trusted anchor. A failed
-propagation is discarded and requires operator restart/re-alignment. On a
-successful handoff, reported GPS
-accuracy starts at PX4's accumulated horizontal uncertainty and tightens back
-to 0.1 m. All numeric limits are configured in
-`vio-launch`.
+displacement. There is no fixed duration cutoff: telemetry freshness, resets,
+uncertainty, speed and acceleration determine whether translation can be used.
+Both GPS-only and GPS-plus-heading operation match FCU samples to camera
+capture time. The displacement starts at the **last trusted camera capture**,
+not at the later moment a blackout is noticed or the camera returns.
 
-## Path B: external vision through MAVROS
+Before handoff, the camera must form a stable coordinate segment. Velocity and
+relative-yaw agreement windows collect independently, and both must pass.
+Duplicate FCU evidence cannot add another good sample, but the newest camera
+observation can revoke a previous pass. No physical turn is needed to recover.
+The recovered segment is placed at the last trusted output plus the validated
+FCU displacement, with yaw aligned to current time-matched FCU heading.
 
-```text
-body-frame cuVSLAM odometry
-  -> validated frame relay
-  -> /mavros/odometry/out
-  -> MAVROS ODOMETRY
-  -> PX4 EKF2 external-vision fusion
-```
+If position propagation becomes unsafe, its movement is discarded. Recovery
+can still finish at the frozen position once camera/FCU agreement passes;
+reported position uncertainty includes the possible lost movement. Missing
+time-matched heading/velocity evidence keeps output stopped, not permanently
+latched against later healthy telemetry. Neither candidate samples nor bad
+inputs move the trusted output anchor.
 
-Path A directly owns the FC serial port. Path B gives that port to MAVROS. They
-are mutually exclusive. Micro XRCE-DDS, SITL, fake odometry, and
-`test_fmu_vio` are not part of this hardware pipeline.
+Capture timestamps, finite values, the body frame and unit quaternion are
+checked regardless of whether optional heading output is enabled. A camera
+blackout latches full recovery at the configured capture-age limit (200 ms by
+default); one returning good sample cannot bypass recovery. With heading
+enabled, both live measurement streams stop together. Telemetry and TIMESYNC
+continue while navigation measurements are paused.
+
+After handoff, inherited position and heading uncertainty are retained. Stable
+relative VO alone does not justify tightening the global reference back to
+0.1 m or one degree. Numeric gate limits are configured in `vio-launch`.
 
 ## Reproducibility boundary
 
 This Git repository owns:
 
-- both PX4 bridge paths;
+- Path A HIL_GPS and its optional yaw-only ODOMETRY output;
 - the numbered operator CLI;
 - camera/body launch overrides;
 - Jetson bootstrap and dependency checks;

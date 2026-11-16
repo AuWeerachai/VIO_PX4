@@ -24,7 +24,6 @@ Reviewed 2026-11-16: current camera operation is **stereo VO**, not the IMU expe
 | NVIDIA RealSense ROS branch | `release/4.51.1-isaac` |
 | Inactive IMU wrapper commit | `c04f43308c00a6f495f14a47cc84cc293047cdff` |
 | Docker image key | `aarch64.ros2_humble.realsense` |
-| MAVROS source | `c655e6343ec81687d51e7185bcba7a651e361fcd` plus project patch; host-side, Path B only |
 
 NVIDIA's official JetPack **6.2.1** image contains L4T **36.4.4**. Do not treat
 the earlier installed-system note `36.4.7` as an official image version or as
@@ -34,8 +33,7 @@ script's family check alone is not compatibility validation.
 [NVIDIA JetPack 6.2.1](https://developer.nvidia.com/embedded/jetpack-sdk-621)
 
 The authoritative machine-readable pins are in
-`bootstrap/jetson-config/isaac_ros_release.env` (base dependencies),
-`bootstrap/jetson-config/mavros_release.env` (MAVROS) and
+`bootstrap/jetson-config/isaac_ros_release.env` (base dependencies) and
 `bootstrap/jetson-config/isaac_ros_overrides/scripts/vio_imu_release.env`
 (inactive experimental IMU overlay). Apt/pip packages and all container layers
 are not fully locked by digest; these pins are not a complete offline image.
@@ -87,8 +85,7 @@ The bootstrap performs these operations in order:
    container; `docker info` alone does not establish that.
 3. Clones both NVIDIA repositories at the captured commits.
 4. Downloads the pinned NGC visual-SLAM asset.
-5. Calls `bootstrap_jetson.sh`, which installs optional host dependencies,
-   reconstructs/patches MAVROS and builds that host workspace.
+5. Calls `bootstrap_jetson.sh`, which installs optional host dependencies.
 6. Installs project-owned body-frame/extrinsic launch scripts and applies the
    Docker/cuVSLAM source patches. IMU fusion is explicitly disabled at launch;
    no experimental IMU overlay is built or loaded.
@@ -97,15 +94,11 @@ The bootstrap performs these operations in order:
    `~/.config/vio-launch/config.json`.
 
 Camera validation is a **runtime** step, not performed by bootstrap: Path A
-checks camera health during stationary spoofing; Path B checks before starting
-its bridge. Restore body-to-camera extrinsics, serial and recovery settings
+checks camera health during stationary spoofing. Restore body-to-camera extrinsics, serial and recovery settings
 before use. An existing IMU-enabled session must be fully stopped.
 
-`bootstrap_jetson.sh` also reconstructs the standalone
-`~/workspaces/mavros` workspace at the pinned commit recorded in
-`bootstrap/jetson-config/mavros_release.env`, applies the proven Jetson patch, and builds it.
-MAVROS remains a sibling dependency rather than being nested in VIO_PX4. It is
-used by Path B; Path A talks MAVLink directly and does not start MAVROS.
+Path B has been removed. Bootstrap no longer installs, patches or builds
+MAVROS. Existing standalone workspaces are left untouched.
 
 The first camera start through `./vio-launch` asks `run_dev.sh` to build/pull the large
 Isaac ROS image. Docker caches unchanged layers, so subsequent launches should

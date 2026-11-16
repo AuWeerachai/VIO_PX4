@@ -130,6 +130,7 @@ def bridge():
     obj.continuity_recovering = False
     obj.camera_readiness = Mock()
     obj.camera_readiness.reason.return_value = None
+    obj._navigation_reason = Mock(return_value=None)  # tested in test_navigation_safety
     obj.spoof_failure_reason = None
     obj.get_logger = Mock(return_value=Mock())
     obj._send_status_text = Mock()

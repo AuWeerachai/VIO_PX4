@@ -30,6 +30,9 @@ if [[ -z "${VIO_CAMERA_SERIAL:-}" ]]; then
   exit 2
 fi
 
+source ./scripts/vo_environment.sh
+python3 ./scripts/check_vo_environment.py
+
 # Use the driver's SDK serial, not the USB ASIC serial. Never pick the first
 # available camera: the front/arm camera has a different mounting transform.
 camera_config="$(mktemp /tmp/vio-realsense-XXXXXX.yaml)"

@@ -38,7 +38,7 @@ def test_duplicate_px4_attitude_sample_is_not_counted_twice():
     duplicate = gate.update(deg(1.5), deg(1), 2.0)
     assert first.good_samples == 1
     assert duplicate.good_samples == 1
-    assert not duplicate.evaluated
+    assert duplicate.evaluated  # current camera yaw is checked, but not counted twice
     assert not duplicate.agreed
 
 

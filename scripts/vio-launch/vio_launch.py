@@ -78,7 +78,6 @@ class Config:
         default_factory=lambda: Path.home() / "workspaces/VIO_PX4_NEW_PIPELINE"
     )
     ros_setup: Path = field(default_factory=lambda: Path("/opt/ros/humble/setup.bash"))
-    mavros_dir: Path = field(default_factory=lambda: Path.home() / "workspaces/mavros")
     isaac_ros_dir: Path = field(
         default_factory=lambda: Path.home() / "workspaces/isaac_ros-dev"
     )
@@ -93,7 +92,7 @@ class Config:
     heading_source: str = "px4"
     manual_heading_deg: float = 0.0
     external_yaw_enabled: bool = False
-    external_yaw_noise_deg: float = 5.0
+    external_yaw_noise_deg: float = 1.0
     external_yaw_rate_hz: float = 30.0
     external_yaw_max_age_s: float = 0.2
     external_yaw_startup_tolerance_deg: float = 10.0
@@ -219,7 +218,6 @@ def save_config(cfg: Config) -> None:
         "rviz_enabled": cfg.rviz_enabled,
         "vio_px4_dir": str(cfg.vio_px4_dir),
         "ros_setup": str(cfg.ros_setup),
-        "mavros_dir": str(cfg.mavros_dir),
         "isaac_ros_dir": str(cfg.isaac_ros_dir),
     }
     atomic_write_json(path, payload)
@@ -291,7 +289,7 @@ def apply_dict(cfg: Config, data: dict) -> Config:
     ):
         if key in data and data[key] is not None:
             updates[key] = data[key]
-    for key in ("vio_px4_dir", "ros_setup", "mavros_dir", "isaac_ros_dir"):
+    for key in ("vio_px4_dir", "ros_setup", "isaac_ros_dir"):
         if key in data and data[key]:
             updates[key] = expand(str(data[key]))
     if str(updates.get("heading_source", "")).strip().lower() == "compass":
@@ -462,27 +460,78 @@ def write_state(cfg: Config, state: dict) -> None:
     atomic_write_json(cfg.state_file, state)
 
 
-def process_start_ticks(pid: int) -> Optional[int]:
-    """Return Linux process start ticks, used to detect PID reuse."""
+def process_identity(pid: int) -> Optional[tuple[str, int, int, int]]:
+    """State, process group, session, start ticks. Zombies own no running work."""
     try:
         fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
-        if fields[0] == "Z":
-            return None
-        return int(fields[19])
-    except (OSError, IndexError, ValueError):
+        return fields[0], int(fields[2]), int(fields[3]), int(fields[19])
+    except (FileNotFoundError, ProcessLookupError):
         return None
+    # Permission/I/O failures must not be mistaken for a stopped publisher.
+
+
+def process_start_ticks(pid: int) -> Optional[int]:
+    identity = process_identity(pid)
+    return None if identity is None or identity[0] == "Z" else identity[3]
+
+
+def managed_group(proc: dict) -> list[int]:
+    """Find live members of this launcher's private session, even after bash exits.
+
+    A running child retains the group/session IDs. Linux cannot reuse those IDs
+    for a new process until the old group is gone. Start ticks and boot identity
+    prevent signalling an unrelated process from a stale saved record.
+    """
+    pid = int(proc["pid"])
+    ticks = proc.get("startTicks")
+    if pid <= 1 or pid == os.getpgrp():
+        raise RuntimeError("Refusing to manage a non-private process group")
+    if proc.get("bootId") and proc["bootId"] != Path(
+            "/proc/sys/kernel/random/boot_id").read_text().strip():
+        return []
+    leader = process_identity(pid)
+    if leader is not None and ticks is not None and leader[3] != ticks:
+        return []  # PID reused: this is no longer our process.
+    if ticks is None:
+        raise RuntimeError(f"Cannot verify ownership of {proc.get('name', pid)}; "
+                           "missing saved process start time")
+    members = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        identity = process_identity(int(entry.name))
+        if identity is None or identity[0] == "Z" or identity[1] != pid:
+            continue
+        if identity[2] != pid or identity[3] < ticks:
+            raise RuntimeError(f"Cannot verify ownership of process group {pid}")
+        members.append(int(entry.name))
+    return members
 
 
 def managed_alive(proc: dict) -> bool:
-    try:
-        pid = int(proc["pid"])
-    except (KeyError, TypeError, ValueError):
-        return False
-    current_ticks = process_start_ticks(pid)
-    if current_ticks is None:
-        return False
-    saved_ticks = proc.get("startTicks")
-    return saved_ticks is None or current_ticks == saved_ticks
+    return bool(managed_group(proc))
+
+
+def managed_leader_alive(proc: dict) -> bool:
+    """A surviving orphan is a stop target, not a successful bridge startup."""
+    ticks = process_start_ticks(int(proc["pid"]))
+    return ticks is not None and ticks == proc.get("startTicks")
+
+
+def terminate_managed(proc: dict) -> None:
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if not managed_alive(proc):
+            return
+        try:
+            os.killpg(int(proc["pid"]), sig)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + 2.0
+        while managed_alive(proc) and time.monotonic() < deadline:
+            time.sleep(0.05)
+    if managed_alive(proc):
+        raise RuntimeError(f"{proc['name']} process group has not stopped; "
+                           "state retained and replacement startup blocked")
 
 
 def prune_state(cfg: Config) -> list[dict]:
@@ -542,30 +591,28 @@ def start_managed(
             start_new_session=True,
             env=os.environ.copy(),
         )
-    time.sleep(startup_check_s)
-    if proc.poll() is not None:
-        recent = log_file.read_text(errors="replace").strip().splitlines()[-12:]
-        raise RuntimeError(
-            f"{name} failed to start. Recent log:\n" + "\n".join(recent)
-        )
-
+    identity = process_identity(proc.pid)
     managed = {
         "name": name,
         "pid": proc.pid,
-        "startTicks": process_start_ticks(proc.pid),
+        "startTicks": None if identity is None else identity[3],
+        "bootId": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
         "logFile": str(log_file),
         "startedAt": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "command": bash_command,
     }
     try:
+        # Save ownership before waiting: a shell can exit leaving children.
         register_proc(cfg, managed)
     except Exception:
         # Never leave an untracked publisher running if state persistence fails.
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except OSError:
-            pass
+        terminate_managed(managed)
         raise
+    time.sleep(startup_check_s)
+    if proc.poll() is not None:
+        stop_managed(cfg, name)
+        recent = log_file.read_text(errors="replace").strip().splitlines()[-12:]
+        raise RuntimeError(f"{name} failed to start. Recent log:\n" + "\n".join(recent))
     return managed
 
 
@@ -574,22 +621,7 @@ def stop_managed(cfg: Config, name: Optional[str] = None) -> list[str]:
     targets = [p for p in procs if name is None or p["name"] == name]
     stopped: list[str] = []
     for p in targets:
-        pid = int(p["pid"])
-        try:
-            os.killpg(pid, signal.SIGTERM)
-        except OSError:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except OSError:
-                pass
-        deadline = time.monotonic() + 2.0
-        while managed_alive(p) and time.monotonic() < deadline:
-            time.sleep(0.05)
-        if managed_alive(p):
-            try:
-                os.killpg(pid, signal.SIGKILL)
-            except OSError:
-                pass
+        terminate_managed(p)
         stopped.append(p["name"])
     if targets:
         stopped_names = {p["name"] for p in targets}
@@ -619,9 +651,7 @@ def normalize_path(value: str) -> str:
     v = value.lower()
     if v in {"a", "gps", "hil", "internship"}:
         return "a"
-    if v in {"b", "ev", "vision", "external-vision"}:
-        return "b"
-    raise RuntimeError(f"Unknown path '{value}'. Use a|gps or b|ev.")
+    raise RuntimeError(f"Unknown path '{value}'. Only a|gps is supported; Path B was removed.")
 
 
 def validate_mavlink_url(value: str) -> Optional[str]:
@@ -751,39 +781,6 @@ def ensure_isaac_container(cfg: Config, timeout_s: float = 600.0) -> None:
     )
 
 
-def ros_topic_names(cfg: Config) -> set[str]:
-    command = (
-        f"{ros_prefix(cfg, [cfg.vio_px4_dir / 'install/setup.bash'])} && "
-        "ros2 topic list --no-daemon"
-    )
-    try:
-        result = subprocess.run(
-            ["bash", "-lc", command],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("Timed out while checking ROS 2 topics") from exc
-    if result.returncode != 0:
-        raise RuntimeError(
-            "Could not query ROS 2 topics. Confirm ROS is running and start your "
-            "configured PX4↔ROS middleware before using Path B."
-        )
-    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
-
-
-def require_px4_ros_link(cfg: Config) -> None:
-    topics = ros_topic_names(cfg)
-    status_topic = "/fmu/out/vehicle_status"
-    if status_topic not in topics:
-        raise RuntimeError(
-            f"PX4 ROS 2 topic {status_topic} is not available. Start your configured "
-            "PX4↔ROS middleware, then retry Path B."
-        )
-    require_ros_message(cfg, status_topic, "PX4 status", timeout_s=5.0)
-
-
 def require_ros_message(
     cfg: Config,
     topic: str,
@@ -823,35 +820,12 @@ def require_ros_message(
     )
 
 
-def require_mavros_connected(cfg: Config, timeout_s: float = 10.0) -> None:
-    mavros_setup = cfg.mavros_dir / "install/setup.bash"
-    command = (
-        f"{ros_prefix(cfg, [mavros_setup])} && "
-        "ros2 topic echo --no-daemon --once /mavros/state"
-    )
-    try:
-        result = subprocess.run(
-            ["bash", "-lc", command], capture_output=True, text=True,
-            timeout=timeout_s,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("MAVROS did not publish state before timeout") from exc
-    if result.returncode != 0 or "connected: true" not in result.stdout.lower():
-        raise RuntimeError("MAVROS is running but is not connected to the Cube")
-
-
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
 
 def cmd_doctor(cfg: Config) -> int:
-    mavros_workspace_setup = cfg.mavros_dir / "install/setup.bash"
-    mavros_check = subprocess.run(
-        ["bash", "-lc", f"{ros_prefix(cfg, [mavros_workspace_setup])} && ros2 pkg prefix mavros"],
-        capture_output=True,
-        text=True,
-    )
     url_error = validate_mavlink_url(cfg.mavlink_url)
     checks = [
         ("MAVLink configuration", url_error is None, url_error or cfg.mavlink_url),
@@ -860,12 +834,6 @@ def cmd_doctor(cfg: Config) -> int:
             "VIO_PX4 install",
             (cfg.vio_px4_dir / "install/setup.bash").exists(),
             str(cfg.vio_px4_dir),
-        ),
-        (
-            "MAVROS install (Path B)",
-            mavros_check.returncode == 0,
-            (mavros_check.stdout.strip() if mavros_check.returncode == 0
-             else "not found in ROS or workspace overlay"),
         ),
         (
             "Isaac ROS workspace",
@@ -919,59 +887,8 @@ def cmd_status(cfg: Config) -> None:
             latest_state = max(states, key=lambda item: item[0])
             if latest_state[0] >= 0:
                 phase = latest_state[1]
-        elif p.get("name") == "ev-bridge":
-            phase = "MAVROS external-vision relay running"
         print(f"  {p['name']}  {phase}  pid={p['pid']}  since={p['startedAt']}")
         print(f"    log: {p['logFile']}")
-
-
-def cmd_ev_bridge(cfg: Config) -> None:
-    require_current_cli()
-    if find_proc(cfg, "gps-bridge"):
-        raise RuntimeError("Path A is already running. Stop it before starting Path B.")
-    require_camera_ready(cfg)
-    setup = cfg.vio_px4_dir / "install/setup.bash"
-    if not setup.exists():
-        raise RuntimeError(f"Missing {setup} — build vio_px4_bridge first")
-    print(f"Checking live VIO odometry on {cfg.odom_topic}...", flush=True)
-    require_ros_message(cfg, cfg.odom_topic, "VIO odometry", timeout_s=5.0)
-    print("VIO odometry ready.")
-    if not find_proc(cfg, "mavros"):
-        mavros_setup = cfg.mavros_dir / "install/setup.bash"
-        mavros_check = subprocess.run(
-            ["bash", "-lc", f"{ros_prefix(cfg, [mavros_setup])} && ros2 pkg prefix mavros"],
-            capture_output=True,
-            text=True,
-        )
-        if mavros_check.returncode != 0:
-            raise RuntimeError(
-                "MAVROS is not installed. Run bootstrap/bootstrap_jetson.sh --install-deps"
-            )
-        if not cfg.mavlink_url.startswith("/dev/"):
-            raise RuntimeError("Path B currently requires the Jetson serial link")
-        serial_device, _, baud = cfg.mavlink_url.rpartition(":")
-        holders = serial_users(Path(serial_device))
-        if holders:
-            raise RuntimeError(
-                f"{serial_device} is already open by pid(s) {holders}; stop Path A "
-                "or the old MAVROS launcher first"
-            )
-        mavros_cmd = (
-            f"{ros_prefix(cfg, [mavros_setup])} && ros2 launch mavros px4.launch "
-            f"fcu_url:=serial://{serial_device}:{baud}"
-        )
-        mavros_proc = start_managed(cfg, "mavros", mavros_cmd, startup_check_s=3.0)
-        print(f"Started MAVROS pid={mavros_proc['pid']}; waiting for FCU connection...")
-        require_mavros_connected(cfg, timeout_s=10.0)
-    cmd = (
-        f"{ros_prefix(cfg, [setup])} && ros2 run vio_px4_bridge mavros_ev_bridge --ros-args"
-        f" -p {shlex.quote(f'odom_topic:={cfg.odom_topic}')}"
-        " -p expected_child_frame:=drone_link"
-        " -p output_parent_frame:=odom"
-    )
-    proc = start_managed(cfg, "ev-bridge", cmd)
-    print(f"Started EV bridge pid={proc['pid']}")
-    print(f"log: {proc['logFile']}")
 
 
 ISAAC_TMUX_VIO = "vio-launch-isaac-vio"
@@ -1120,7 +1037,6 @@ def start_rviz_session(cfg: Config) -> None:
     time.sleep(3.0)
     tmux_command(
         ISAAC_TMUX_RVIZ,
-        "source ${ISAAC_ROS_WS}/install/setup.bash && "
         "cd ${ISAAC_ROS_WS}/src/isaac_ros_common && ./scripts/start_rviz.sh; exit",
     )
 
@@ -1138,7 +1054,7 @@ def camera_mode_label(cfg: Config) -> str:
 def require_camera_ready(cfg: Config, started_only: bool = False) -> None:
     mode = selected_camera_mode(cfg)
     command = (
-        "source /opt/ros/humble/setup.bash && "
+        "source ${ISAAC_ROS_WS}/src/isaac_ros_common/scripts/vo_environment.sh && "
         "python3 ${ISAAC_ROS_WS}/src/isaac_ros_common/scripts/check_camera_ready.py "
         # Each probe creates a new ROS participant. Identity-service discovery
         # needs the same budget even when only checking startup, not data health.
@@ -1232,13 +1148,13 @@ def cmd_vio(cfg: Config, defer_health: bool = False) -> None:
     time.sleep(2.0)
     tmux_command(
         ISAAC_TMUX_VIO,
-        "cd ${ISAAC_ROS_WS} && source /opt/ros/humble/setup.bash && "
+        "cd ${ISAAC_ROS_WS} && "
+        "source src/isaac_ros_common/scripts/vo_environment.sh && "
         "if [[ -f src/isaac_ros_common/isaac_ros_visual_slam/isaac_ros_visual_slam/package.xml ]]; then "
         "echo '=== Incremental build: isaac_ros_visual_slam ==='; "
         "colcon build --packages-select isaac_ros_visual_slam || exit $?; "
         "else echo '=== Using installed isaac_ros_visual_slam package ==='; fi; "
-        "if [[ -f ${ISAAC_ROS_WS}/install/setup.bash ]]; then "
-        "source ${ISAAC_ROS_WS}/install/setup.bash; fi && "
+        "source src/isaac_ros_common/scripts/vo_environment.sh && "
         "echo \"=== Using: $(ros2 pkg prefix isaac_ros_visual_slam) ===\" && "
         "cd ${ISAAC_ROS_WS}/src/isaac_ros_common && "
         f"VIO_MODE={selected_camera_mode(cfg)} "
@@ -1330,7 +1246,7 @@ def stop_failed_spoof(cfg: Config, reason: str) -> None:
 def cmd_gps(cfg: Config) -> None:
     require_current_cli()
     if find_proc(cfg, "ev-bridge") or find_proc(cfg, "mavros"):
-        raise RuntimeError("Path B/MAVROS is already running. Stop it before starting Path A.")
+        raise RuntimeError("A legacy EV/MAVROS process is already running. Stop it first.")
     # This command is also callable directly, without cmd_run/cmd_vio.
     # Verify the opened device before starting any HIL_GPS publisher.
     require_camera_ready(cfg, started_only=True)
@@ -1443,7 +1359,7 @@ def cmd_gps(cfg: Config) -> None:
                 flush=True,
             )
         if saw_spoof and navigation == "live_vio":
-            print("- 15 s done. VIO takes over. See option 3) Status.", flush=True)
+            print("- 15 s done. VIO takes over. See option 2) Status.", flush=True)
             return
         if status.get("spoof_failure_reason") or (saw_spoof and navigation == "waiting_for_rc"):
             reason = status.get("spoof_failure_reason") or "no healthy heading-aligned VIO handoff"
@@ -1451,119 +1367,172 @@ def cmd_gps(cfg: Config) -> None:
             raise RuntimeError(
                 f"Spoof validation failed: {reason}. GPS and camera stopped."
             )
-        try:
-            os.kill(int(proc["pid"]), 0)
-        except (OSError, ValueError):
+        if not managed_leader_alive(proc):
+            stop_managed(cfg, "gps-bridge")
             raise RuntimeError("GPS bridge stopped during the spoof sequence")
         time.sleep(0.2)
 
 
 def show_navigation_status(cfg: Config) -> None:
     path = cfg.state_dir / "navigation-status.json"
-    print("Navigation status\n")
+    print("Status\n")
     try:
         status = json.loads(path.read_text())
     except FileNotFoundError:
+        print("- Output: unknown (no status)")
         print("- Bridge: not running (no status received)")
-        print("- Navigation: PX4 uses its physical GPS or configured failsafe")
         return
     except (OSError, json.JSONDecodeError) as exc:
+        print("- Output: unknown (status unavailable)")
         print(f"- Status unavailable: {exc}")
         return
 
     age = max(0.0, time.time() - float(status.get("updated_unix_s", 0.0)))
     if age > 2.0:
+        print("- Output: unknown (stale status)")
         print(f"- Bridge: not reporting (last update {age:.1f} s ago)")
-        print("- Navigation: PX4 may use physical GPS, then dead reckoning/failsafe")
         return
 
     navigation = status.get("navigation", "unknown")
-    connection = "connected to PX4" if status.get("px4_connected") else "disconnected from PX4"
-    if navigation == "spoof_active":
-        vio_status = "spoofing"
-    elif status.get("vio_fresh") and not status.get("pose_gate_quarantine"):
-        vio_status = "VIO healthy"
-    else:
-        vio_status = "VIO unhealthy"
-    gate_status = "unhealthy" if status.get("pose_gate_quarantine") else "healthy"
+    connection = "connected" if status.get("px4_connected") else "disconnected"
     vio_age = status.get("vio_age_s")
-    accepted_age = f"{float(vio_age):.2f} s" if vio_age is not None else "unavailable"
+    accepted_age = f"{float(vio_age):.2f} s ago" if vio_age is not None else "unavailable"
 
-    print(f"- Connection status: {connection}")
-    print(f"- VIO status: {vio_status}")
-    print(f"- Pose-jump gate status: {gate_status}")
-    if status.get("external_yaw_enabled"):
-        print(f"- External heading: {status.get('external_yaw_status', 'unknown')}")
-        print("- Heading clock: " + ("ready" if status.get('external_yaw_clock_ready') else "warming/stale"))
-        sigma = status.get("external_yaw_sigma_deg")
-        if sigma is not None:
-            print(f"- Heading uncertainty floor: {float(sigma):.2f} deg (not reduced by waiting)")
+    def output_health(active):
+        if navigation == "waiting_for_rc":
+            return "waiting for RC trigger"
+        if status.get("pose_gate_quarantine"):
+            reason = status.get("pose_gate_reason")
+            if reason in ("position_jump", "yaw_jump", "speed_limit", "acceleration_limit",
+                          "yaw_rate_limit", "frame_changed"):
+                return "pose-jump detected"
+            if reason in ("tracking_gap", "vio_stale", "heading_sample_stale"):
+                return "stale VO"
+            return "quarantined"
+        if active:
+            return "healthy"
+        if navigation == "live_vio" and not status.get("vio_fresh"):
+            return "stale VO"
+        return "blocked"
+
+    yaw_enabled = bool(status.get("external_yaw_enabled"))
+    yaw_active = yaw_enabled and bool(status.get("external_yaw_output_active"))
+    gps_active = navigation == "spoof_active" or bool(status.get("hil_gps_output_active"))
+    gps_state = "ON (spoof)" if navigation == "spoof_active" else "ON" if gps_active else "OFF"
+    yaw_state = "ON" if yaw_active else "OFF" if yaw_enabled else "disabled"
+    print(f"- Output: GPS {gps_state} | Heading {yaw_state} | PX4 {connection}")
+
+    gps_health = output_health(gps_active)
+    if navigation == "spoof_active":
+        gps_health = "spoofing"
+        remaining = status.get("spoof_remaining_s")
+        if remaining is not None:
+            gps_health += f" ({float(remaining):.1f} s left)"
+    lat, lon, eph = (status.get(key) for key in
+                     ("hil_gps_lat_deg", "hil_gps_lon_deg", "hil_gps_eph_m"))
+    gps_age = status.get("hil_gps_sample_age_s")
+    gps_row = [f"- {'HIL_GPS:':<12}{gps_health}"]
+    if lat is not None and lon is not None and eph is not None:
+        prefix = "" if gps_active else "last sent "
+        gps_age_text = "unavailable" if gps_age is None else f"{float(gps_age)*1000:.0f} ms"
+        gps_row.extend([f"{prefix}{float(lat):.7f}, {float(lon):.7f}",
+                        ("hAcc", f"{float(eph):.2f}", "m"), f"age {gps_age_text}"])
+    elif "hil_gps_lat_deg" in status:
+        gps_row.append("not sent yet")
+    else:
+        gps_row.append("sent values unavailable (restart bridge)")
+    rows = [gps_row]
+    if yaw_enabled:
+        yaw_health = output_health(yaw_active)
+        yaw_row = [f"- {'VO heading:':<12}{yaw_health}"]
+        heading = status.get("external_yaw_heading_deg")
+        variance = status.get("external_yaw_variance_rad2")
+        if heading is not None and variance is not None:
+            heading_text = f"{round(float(heading), 1) % 360:.1f}°"
+            sample_age = status.get("external_yaw_sample_age_s")
+            age_text = "age unavailable" if sample_age is None else f"age {float(sample_age)*1000:.0f} ms"
+            prefix = "" if yaw_active else "last sent "
+            # Use the covariance attached to that sent sample, not a pending setting.
+            variance = float(variance)
+            sigma_deg = (math.degrees(math.sqrt(variance))
+                         if math.isfinite(variance) and variance >= 0 else None)
+            uncertainty = ("yaw std", f"{sigma_deg:.2f}", "°") if sigma_deg is not None else (
+                "yaw std", "unavailable", "")
+            yaw_row.extend([f"{prefix}{heading_text}", uncertainty, age_text])
+        elif "external_yaw_heading_deg" in status:
+            yaw_row.append("not sent yet")
+        else:
+            yaw_row = ["- VO heading: unavailable (restart the bridge after updating)"]
+        rows.append(yaw_row)
+    # Align uncertainty labels, decimal points, and units inside their shared
+    # column. The raw rad² covariance remains unchanged in the status snapshot.
+    uncertainty_rows = [row for row in rows if len(row) > 2]
+    if uncertainty_rows:
+        label_width = max(len(row[2][0]) for row in uncertainty_rows)
+        number_width = max(len(row[2][1]) for row in uncertainty_rows)
+        for row in uncertainty_rows:
+            label, number, unit = row[2]
+            row[2] = f"{label:<{label_width}} {number:>{number_width}} {unit}".rstrip()
+    # Pad shared columns together, including longer recovery labels/last values.
+    # Never truncate coordinates, uncertainty, age, or a warning to force a fit.
+    widths = [max((len(row[i]) for row in rows if i < len(row)), default=0)
+              for i in range(max(map(len, rows)))]
+    for row in rows:
+        print(" | ".join(cell.ljust(widths[i]) if i < len(row) - 1 else cell
+                         for i, cell in enumerate(row)))
+    if not gps_active and not yaw_active:
+        print(f"- Last trusted VO: {accepted_age}")
+
+    # Keep routine clock/health details out of the healthy view. The full
+    # diagnostic snapshot remains in navigation-status.json.
+    blocked = []
+    if (not status.get("hil_gps_output_active")
+            and navigation not in ("spoof_active", "waiting_for_rc")):
+        blocked.append(status.get("output_block_reason") or "GPS output stopped")
+    if yaw_enabled and not yaw_active and navigation != "waiting_for_rc":
+        reason = status.get("external_yaw_status")
+        if reason and reason not in ("ready", "disabled"):
+            blocked.append(reason)
+        if not status.get("external_yaw_clock_ready"):
+            blocked.append("heading clock warming/stale")
     if navigation in ("spoof_active", "waiting_for_rc"):
-        print(f"- Spoof health check: {status.get('handoff_check_reason') or 'healthy'}")
+        check = status.get("handoff_check_reason")
+        if check and check != "healthy":
+            print(f"- Startup check: {check}")
     if status.get("spoof_failure_reason"):
         print(f"- Spoof failed: {status['spoof_failure_reason']}")
     if float(status.get("frozen_position_uncertainty_m", 0.0)) > 0:
-        print("- Global position uncertainty: movement was discarded during recovery; "
-              "verify/reset origin before relying on tight GPS accuracy")
+        print("- Position warning: movement discarded; verify/reset origin.")
     inherited = float(status.get("inherited_position_uncertainty_m", 0.0))
     if inherited > 0:
-        print(f"- Position uncertainty inherited from PX4: at least {inherited:.2f} m")
+        print(f"- Position uncertainty: ≥{inherited:.2f} m (from PX4)")
     if status.get("inertial_recovery_active"):
         if "recovery_position_safe" in status:
-            if status["recovery_position_safe"]:
-                print("- Position recovery: following guarded PX4 position; no time cutoff")
-            else:
-                print("- Position recovery: frozen; movement discarded "
-                      f"({status.get('inertial_recovery_failure') or 'unknown reason'})")
-            if status.get("recovery_heading_safe"):
-                print("- Heading recovery: using current FCU heading; checking camera stability")
-            else:
-                print("- Heading recovery: waiting for fresh FCU heading "
-                      f"({status.get('recovery_heading_failure') or 'unknown reason'})")
-            velocity_count = int(status.get("recovery_velocity_agreement_count", 0))
-            print(f"- Recovery velocity agreement: {velocity_count}/"
-                  f"{cfg.recovery_velocity_agreement_samples}")
-        elif (status.get("inertial_recovery_safe")
-                and status.get("inertial_fallback_to_frozen_pose")):
-            print("- Recovery: displacement timed out; position frozen; "
-                  "checking fresh PX4 yaw and stable VIO before resuming")
-        elif status.get("inertial_recovery_safe"):
-            print(
-                "- Inertial recovery: active and guarded "
-                f"(N={float(status.get('inertial_displacement_n_m', 0.0)):+.2f} m, "
-                f"E={float(status.get('inertial_displacement_e_m', 0.0)):+.2f} m)"
-            )
+            position_safe = bool(status["recovery_position_safe"])
+            heading_safe = bool(status.get("recovery_heading_safe"))
         else:
-            print(
-                "- PX4 propagation: rejected; position is frozen and HIL_GPS "
-                "stays stopped because heading cannot be verified "
-                f"({status.get('inertial_recovery_failure') or 'unknown reason'})"
-            )
+            # Older bridges report one combined safety flag.
+            heading_safe = bool(status.get("inertial_recovery_safe"))
+            position_safe = heading_safe and not status.get("inertial_fallback_to_frozen_pose")
+        position = "following PX4" if position_safe else "frozen"
+        heading_reference = "ready" if heading_safe else "waiting for FCU"
+        print(f"- Recovery: position {position} | heading {heading_reference}")
+        if not position_safe:
+            print(f"- Position frozen: {status.get('inertial_recovery_failure') or 'unknown reason'}")
+        if not heading_safe:
+            blocked.append(status.get("recovery_heading_failure") or "fresh FCU heading needed")
+        velocity_count = int(status.get("recovery_velocity_agreement_count", 0))
         yaw_state = status.get("recovery_yaw_agreement_state", "unknown")
         yaw_count = int(status.get("recovery_yaw_agreement_count", 0))
-        yaw_residual = status.get("recovery_yaw_residual_deg")
-        residual_text = (
-            "not evaluated" if yaw_residual is None
-            else f"{float(yaw_residual):+.1f} deg"
-        )
-        print(
-            f"- Recovery yaw-change agreement: {yaw_state} "
-            f"({yaw_count}/{cfg.recovery_yaw_agreement_samples}, "
-            f"residual={residual_text})"
-        )
-        reordered = (
-            int(status.get("inertial_reordered_odometry_drops", 0))
-            + int(status.get("inertial_reordered_yaw_drops", 0))
-        )
-        if reordered:
-            print(f"- Slightly late PX4 messages ignored: {reordered}")
-    print(f"- Last accepted VIO sample: {accepted_age} ago")
-    remaining = status.get("spoof_remaining_s")
-    if remaining is not None:
-        print(f"- Spoof remaining: {float(remaining):.1f} s")
-    if not status.get("hil_gps_output_active") and navigation != "spoof_active":
-        print(f"- Output blocked: {status.get('output_block_reason', 'unknown')}")
-        print(f"- Fallback: {status.get('px4_fallback')}")
+        yaw_note = " (disagreeing)" if yaw_state == "disagreeing" else ""
+        if yaw_state == "waiting_for_time_sync":
+            yaw_note = " (waiting for clock sync)"
+        elif yaw_state == "waiting_for_time_matched_fcu":
+            yaw_note = " (waiting for matching FCU sample)"
+        print(f"- Recovery checks: velocity {velocity_count}/{cfg.recovery_velocity_agreement_samples}"
+              f" | yaw {yaw_count}/{cfg.recovery_yaw_agreement_samples}{yaw_note}")
+    if blocked:
+        print("- Blocked: " + "; ".join(dict.fromkeys(blocked)))
 
 
 def watch_navigation_status(cfg: Config) -> None:
@@ -1571,7 +1540,7 @@ def watch_navigation_status(cfg: Config) -> None:
     while True:
         _clear()
         show_navigation_status(cfg)
-        print("\nUpdates every 0.5 s. Press Enter to return...", flush=True)
+        print("\nRefresh: 0.5 s | Enter: back", flush=True)
         readable, _, _ = select.select([sys.stdin], [], [], 0.5)
         if readable:
             sys.stdin.readline()
@@ -1584,28 +1553,14 @@ def cmd_run(
 ) -> None:
     require_current_cli()
     which = normalize_path(path_arg)
-    label = "GPS spoof + VIO GPS" if which == "a" else "external vision"
-    print(f"Starting Path {which.upper()} ({label})...\n", flush=True)
+    print(f"Starting Path {which.upper()} (GPS spoof + VIO GPS)...\n", flush=True)
 
-    # Reject conflicting paths BEFORE touching the camera/session they depend on.
-    if which == "a" and (find_proc(cfg, "ev-bridge") or find_proc(cfg, "mavros")):
-        raise RuntimeError("Path B/MAVROS is already running. Stop it before starting Path A.")
-    if which == "b" and find_proc(cfg, "gps-bridge"):
-        raise RuntimeError("Path A is already running. Stop it before starting Path B.")
-    cmd_vio(cfg, defer_health=(which == "a"))
-
-    if which == "b":
-        if find_proc(cfg, "gps-bridge"):
-            raise RuntimeError("Path A is already running. Stop it before starting Path B.")
-        if not find_proc(cfg, "ev-bridge"):
-            cmd_ev_bridge(cfg)
-        print("\nPath B started (local EV → Cube).")
-    else:
-        if find_proc(cfg, "ev-bridge"):
-            raise RuntimeError("Path B is already running. Stop it before starting Path A.")
-        if not find_proc(cfg, "gps-bridge"):
-            cmd_gps(cfg)
-        # cmd_gps reports success only after receiving a PX4 heartbeat.
+    # Migration guard: do not compete with a publisher left by an older CLI.
+    if find_proc(cfg, "ev-bridge") or find_proc(cfg, "mavros"):
+        raise RuntimeError("A legacy EV/MAVROS process is already running. Stop it first.")
+    cmd_vio(cfg, defer_health=True)
+    if not find_proc(cfg, "gps-bridge"):
+        cmd_gps(cfg)
 
 
 def cmd_logs(cfg: Config, name: str, lines: int = 40, full: bool = False) -> None:
@@ -1782,6 +1737,7 @@ def configure_heading(cfg: Config) -> Config:
     print("Camera mounting is handled only in Camera extrinsics; no extra yaw correction.\n")
     print("Optional Path A heading output: ODOMETRY yaw + HIL_GPS position.")
     print("One quarantine stops BOTH; barometer/rangefinder height is unchanged.")
+    print("Camera capture-age protection applies with heading ON or OFF (also in Pose-jump limits).")
     enabled = prompt_line("Send VO heading to PX4 (on/off)",
                           "on" if cfg.external_yaw_enabled else "off")
     if enabled is None:
@@ -1810,7 +1766,9 @@ def configure_heading(cfg: Config) -> Config:
         print("Manual seed: disarmed startup only. Reboot PX4 if already aligned to a different heading.")
         print("No forced heading reset; live GPS waits for matching PX4 heading readback.")
         print("Time sync warms up before heading output. Watch status before triggering spoof.")
-        prompts = ("Heading noise floor deg (1 sigma, 0.1..90)",
+        print("The heading noise setting is a minimum, not a fixed accuracy claim.")
+        print("PX4 reference uncertainty is retained at startup/recovery; it does not reset to 1 degree.")
+        prompts = ("Minimum heading uncertainty deg (1 sigma, 0.1..90)",
                    "Heading output rate Hz (30..50)",
                    "Maximum camera sample age s (0.02..0.2)",
                    "Startup heading readback tolerance deg (>0..20)")
@@ -1899,7 +1857,7 @@ def configure_camera_extrinsic(cfg: Config) -> Config:
         f"xyz=({entered[0]:+g}, {entered[1]:+g}, {entered[2]:+g}) m, "
         f"rpy=({entered[3]:+g}, {entered[4]:+g}, {entered[5]:+g})°."
     )
-    print("The new extrinsic takes effect the next time Path A or Path B starts cuVSLAM.")
+    print("The new extrinsic takes effect the next time cuVSLAM is started.")
     pause()
     return cfg
 
@@ -1918,6 +1876,8 @@ def configure_pose_gate(cfg: Config) -> Config:
              cfg.gate_max_yaw_rate_deg_s, float, 0.0),
         )),
         ("Timing", (
+            ("capture_age", "Maximum camera capture age s (0.02..0.2, GPS and yaw)",
+             cfg.external_yaw_max_age_s, float, 0.0),
             ("gap", "Maximum tracking gap s", cfg.gate_max_gap_s, float, 0.0),
         )),
         ("Coordinate-reset recovery", (
@@ -1945,8 +1905,6 @@ def configure_pose_gate(cfg: Config) -> Config:
              cfg.recovery_yaw_agreement_deg, float, 0.0),
             ("yaw_samples", "Consecutive unique PX4 yaw-agreement samples",
              cfg.recovery_yaw_agreement_samples, int, 0),
-            ("accuracy_tighten", "Seconds to tighten GPS accuracy back to 0.1 m",
-             cfg.recovery_accuracy_tighten_s, float, -1.0),
         )),
     )
     values: dict[str, float | int] = {}
@@ -1965,6 +1923,8 @@ def configure_pose_gate(cfg: Config) -> Config:
                 if value <= minimum:
                     raise ValueError(f"{label} must be greater than {minimum:g}")
                 values[key] = value
+        if not .02 <= values["capture_age"] <= .2:
+            raise ValueError("Camera capture age must be 0.02..0.2 s")
     except ValueError as exc:
         print(f"Invalid gate configuration: {exc}")
         pause()
@@ -1975,6 +1935,7 @@ def configure_pose_gate(cfg: Config) -> Config:
         gate_max_acceleration_m_s2=float(values["acceleration"]),
         gate_max_yaw_rate_deg_s=float(values["yaw_rate"]),
         gate_max_gap_s=float(values["gap"]),
+        external_yaw_max_age_s=float(values["capture_age"]),
         gate_confirmation_samples=int(values["confirmation"]),
         gate_recovery_samples=int(values["recovery"]),
         inertial_max_message_age_s=float(values["inertial_age"]),
@@ -1985,7 +1946,6 @@ def configure_pose_gate(cfg: Config) -> Config:
         recovery_velocity_agreement_samples=int(values["velocity_samples"]),
         recovery_yaw_agreement_deg=float(values["yaw_agreement"]),
         recovery_yaw_agreement_samples=int(values["yaw_samples"]),
-        recovery_accuracy_tighten_s=float(values["accuracy_tighten"]),
     )
     save_config(cfg)
     print("\nSaved pose-jump gate limits.")
@@ -2002,6 +1962,7 @@ def configure_pose_gate(cfg: Config) -> Config:
         "it does not require uninterrupted heading during the disturbance."
     )
     print("The new limits take effect the next time Path A starts.")
+    print("Recovery uncertainty is retained; stable VO alone cannot remove global reference error.")
     pause()
     return cfg
 
@@ -2034,7 +1995,7 @@ def pick_log(cfg: Config) -> None:
     # Only show logs that exist for components used by the hardware paths.
     names = [
         name
-        for name in ("gps-bridge", "ev-bridge")
+        for name in ("gps-bridge",)
         if (cfg.log_dir / f"{name}.log").is_file()
     ]
     if not names:
@@ -2070,10 +2031,6 @@ def interactive_main(cfg: Config) -> int:
                 MenuItem(
                     "Path A — GPS spoof → live VIO (global)",
                     "run-a",
-                ),
-                MenuItem(
-                    "Path B — External vision (local)",
-                    "run-b",
                 ),
                 MenuItem("Status", "nav-status"),
                 MenuItem("", "h2", disabled=True),
@@ -2149,10 +2106,6 @@ def interactive_main(cfg: Config) -> int:
                 _clear()
                 cmd_run(cfg, "a")
                 pause()
-            elif choice == "run-b":
-                _clear()
-                cmd_run(cfg, "b")
-                pause()
             elif choice == "link":
                 cfg = configure_link(cfg)
             elif choice == "home":
@@ -2195,7 +2148,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = p.add_subparsers(dest="command")
     sub.add_parser("tui", help="Open interactive menu (default)")
-    sub.add_parser("ev-bridge")
     sub.add_parser("vio")
     sub.add_parser("gps")
 
@@ -2218,9 +2170,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return interactive_main(cfg)
 
     try:
-        if args.command == "ev-bridge":
-            cmd_ev_bridge(cfg)
-        elif args.command == "vio":
+        if args.command == "vio":
             cmd_vio(cfg)
         elif args.command == "gps":
             cmd_gps(cfg)

@@ -1,8 +1,13 @@
 # Path A: optional VO heading alongside HIL_GPS
 
-Implemented locally; not deployed or flight-validated. Default **OFF** preserves
-GPS-only operation. No PX4 firmware patch, parameter write, arming command,
-camera change, or second serial connection is part of this change.
+Default **OFF** preserves GPS-only operation. Optional heading output has been
+ground-checked on Jetson; see [the validation record](VALIDATION_2026_11_16.md)
+for the exact tested version and limitations. The temporary fixed-uncertainty
+change was withdrawn before deployment. Local updates retain reference
+uncertainty and add the sent-heading/variance Status display; they have not yet
+been activated on the aircraft.
+No PX4 firmware patch, parameter write, arming command, or second serial
+connection is part of this bridge change.
 
 ## Independent inputs, one stop decision
 
@@ -26,9 +31,16 @@ measurements and continue. A valid old pose is never re-stamped and sent as a
 new heading observation. Staleness is detected at the configured age limit;
 PX4 still has buffered measurements and its own source-loss timeout.
 
+Disabling optional yaw transmission does not disable camera validity checks,
+the capture-age watchdog or time-matched FCU recovery. GPS-only mode runs the
+same protections and TIMESYNC service but sends no EV ODOMETRY. The age limit
+is also exposed in the CLI's Pose-jump gate settings.
+
 Recovery checks are evaluated independently: velocity disagreement does not
 prevent the relative-yaw window from collecting evidence, and vice versa.
 Both must pass the final decision, along with the full local stability window.
+Reusing an FCU sample cannot add agreement credit; the current camera sample
+is nevertheless checked and can revoke an earlier pass.
 No turning is required: stable stationary samples are valid evidence. There
 is no fixed two-second recovery cutoff and no single-good-sample shortcut.
 
@@ -40,12 +52,26 @@ once per recovery, not on every subsequent live sample. Existing position
 reset/uncertainty/physical limits still discard unsafe translation and fall
 back to the frozen anchor with enlarged position uncertainty.
 
-The recovered yaw uncertainty is conservatively derived from PX4's body-angle
-variances (trace divided by cos(pitch)^2). That uncertainty becomes a persistent
-lower bound; neither a timer nor steady relative tracking makes it disappear.
-The existing inherited position-uncertainty floor also remains. This prevents
-an immediate claim of baseline accuracy, but does not make the recovered
-reference independent of the EKF: PX4/VO correlation still needs validation.
+The bridge retains the conservative uncertainty inherited when adopting PX4's
+initial heading or a recovery heading. PX4 body-angle variances are converted
+to a yaw bound using their trace divided by cos(pitch)^2. The configured heading
+standard deviation (default **1 degree**) is a minimum, not a fixed accuracy
+claim. A larger inherited variance persists; neither a timer nor a quiet camera
+automatically resets it to one degree. A manual startup reference uses the
+configured uncertainty initially, but subsequent PX4-assisted recovery still
+inherits PX4 uncertainty.
+
+During normal tracking, VO tracks relative turns without continuously following
+PX4's heading or covariance. Inheritance happens at reference adoption, not as
+a continuous feedback of the EKF's covariance into every new observation.
+All freshness, time-matching, stability and velocity/yaw-change agreement guards
+remain. The inherited **position** uncertainty is unchanged.
+
+This is a conservative reference-uncertainty floor, not a calibrated model of
+all subsequent VO drift. The bridge does not yet consume cuVSLAM pose covariance
+to estimate additional yaw-error growth. Precise relative turns do not prove
+the absence of an absolute north offset. Recovery remains correlated with PX4
+and cannot independently verify that absolute reference.
 
 Raw cuVSLAM epoch changes are **not** forwarded as ODOMETRY reset-counter
 changes. The bridge has already repaired them. In this firmware a changed EV
@@ -59,10 +85,38 @@ PX4: on**. Existing saved configurations default to off. New settings:
 
 | Setting | Default | Meaning |
 |---|---:|---|
-| Heading noise floor | 5 degrees | One-sigma floor; not a claim of true-north accuracy |
+| Minimum heading uncertainty | 1 degree | One-sigma minimum; inherited reference uncertainty can raise it |
 | Heading output rate | 30 Hz | 30–50 Hz; never duplicate a camera sample |
 | Maximum camera sample age | 0.2 s | Capture age, not callback-arrival age |
 | Startup readback tolerance | 10 degrees | PX4 vs seeded VO heading, before live handoff |
+
+**Status (option 2)** places GPS/heading output states and PX4 connection first,
+then matching **HIL_GPS** and **VO heading** rows (health, last sent value,
+uncertainty, age). The GPS row shows transmitted latitude/longitude and
+horizontal accuracy in metres, not a covariance; MAVLink rounding is reflected.
+Live GPS age follows the accepted camera capture, not repeated publication.
+Spoof age follows static-fix generation. A failed write cannot refresh either
+row, and unavailable ages/older status formats are not replaced by guesses.
+
+The display shows the last VO heading successfully written to the
+MAVLink connection, in degrees clockwise from north (the `drone_link` forward
+direction). It also shows that sample's age and `yaw std` in degrees (one sigma),
+calculated as `degrees(sqrt(last_sent_variance_rad2))`. Uncertainty labels,
+numeric decimal points and units align with the HIL_GPS `hAcc` column.
+This is the actual last sent uncertainty, including any inherited reference
+floor, not a repeat of the configured noise setting. It may increase at reference
+adoption, but does not decrease merely with time. Raw rad² variance remains in
+the status JSON and outgoing MAVLink; this is a display-only unit conversion.
+A 1-degree minimum standard deviation corresponds to `0.000304617 rad²`.
+Yaw-only uncertainty is one scalar (a 1-by-1 covariance),
+so a full attitude covariance matrix is not displayed. This is the covariance
+reported by the bridge, not PX4's final EKF variance or proof of fusion.
+
+During quarantine, timing loss or stale output, the value is explicitly marked
+**last sent** with the blocking health state, not presented as a current healthy heading. Before the
+first successful send it says **not sent yet**. An updated CLI reading an older
+bridge snapshot asks for a bridge restart rather than inventing a heading.
+This display does not change the 200 ms capture-age gate or send any data.
 
 Existing CLI physical limits, recovery message age/gap, yaw agreement limits
 and stable-sample counts remain authoritative. The new option requires
@@ -79,28 +133,40 @@ Set parameters manually while on the ground:
 | `MAV_USEHILGPS` | `1` | Existing GPS injection |
 | `EKF2_GPS_CTRL` | `1` | Horizontal GPS position only |
 | `EKF2_EV_CTRL` | `8` | EV yaw only; rejects duplicate position/height fusion |
-| `EKF2_EV_NOISE_MD` | `0` | Honour reported covariance, including recovery uncertainty |
+| `EKF2_EV_NOISE_MD` | `0` | Use reported covariance, subject to firmware noise floors |
 | `EKF2_MAG_TYPE` | `6` for PX4 seed; `5` for manual seed | Init-only compass, or no compass fusion |
 | `EKF2_HGT_REF` | Keep `0` or `2` | Existing barometer/rangefinder height source |
 
 The bridge reads and verifies these; it does not change them. GPS-only Path A
 now verifies `EKF2_EV_CTRL=0` as well. Disabling the CLI feature therefore also
-requires restoring this parameter. Path B and Path A remain mutually exclusive.
+requires restoring this parameter. Path B has been removed.
 
 Keep EKF innovation gates and failsafes at validated aircraft values. Review
 `EKF2_EV_DELAY`: capture timestamps are preserved; do not blindly reuse a delay
 calibrated for the old MAVROS pipeline. Verify `EKF2_EV_QMIN` permits quality 100.
-`EKF2_EVA_NOISE` can further reduce heading weight; the CLI noise is a floor,
-not a guarantee of final estimator weight. The audited firmware's yaw control
-also takes a maximum with `ev_att_noise` directly, while EKF2's receiver layer
-squares that parameter. This implementation does not change that firmware
-behavior or silently reduce its noise floor.
+`EKF2_EVA_NOISE` can further reduce heading weight; the reported covariance is
+not a guarantee of final estimator weight. In audited firmware `7cfb72fe`,
+`EKF2.cpp` squares the parameter when receiving EV, but
+`EKF/aid_sources/external_vision/ev_yaw_control.cpp` then compares the resulting
+variance with the unsquared `ev_att_noise` value. With parameter `0.1`, that
+creates a `0.1 rad²` floor (about **18.1 degrees** standard deviation), even
+when the bridge sends `1 degree² = 0.000304617 rad²`. Ground readback confirmed
+`estimator_aid_src_ev_yaw.observation_variance=0.10000` before this change.
+
+Thus reducing the bridge uncertainty alone does **not** make this firmware fuse
+at one-degree observation noise. The firmware's standard-deviation/variance
+units need a separately reviewed fix, and its `EKF2_EVA_NOISE` parameter range
+also needs review (current minimum `0.05 rad` is about `2.86 degrees`). Do not
+work around these issues with undocumented below-range parameter values.
+This bridge change does not modify/flash firmware or write PX4 parameters.
 
 ### Initial heading
 
 **PX4 seed:** verify true heading before launch. The existing stationary
 alignment collects PX4 yaw, then freezes the alignment for normal VO tracking.
-PX4 uncertainty is carried into the new heading output.
+The bridge carries the adopted PX4 reference uncertainty into its heading
+output, subject to the configured minimum. It does not discard it simply
+because the reported heading looks correct.
 
 **Manual seed:** enter the vehicle's true heading clockwise from north. Set
 `EKF2_MAG_TYPE=5` and start with PX4 disarmed; normally reboot PX4 first if it
@@ -129,6 +195,14 @@ conservative local checks, **not proof** PX4 has accepted every exchange.
 Confirm `timesync_status` and EV sample timestamps on hardware before flight.
 They must show plausible delay, no boot/Unix epoch mismatch and no repeated
 time-jump resets. A busy Jetson/UART may fail these checks; do not bypass them.
+
+On FTDI USB serial adapters, inspect
+`/sys/bus/usb-serial/devices/ttyUSB0/latency_timer` (use the actual device name).
+The default 16 ms receive buffering conflicts with the 10 ms RTT limit. While
+disarmed, run `bash bootstrap/configure_fcu_serial_latency.sh /dev/ttyUSB0` to
+set 1 ms buffering and install an adapter-serial-specific udev rule. Verify the
+actual PX4 `timesync_status` afterwards. Do not relax the clock gate to mask a
+slow transport. Other serial driver types need their own verified configuration.
 
 ## What happens while both inputs are silent?
 
@@ -160,7 +234,8 @@ aircraft's actual fallback configuration.
   yaw behavior from QGC's satellite count alone.
 - [ ] Repeat a 30–90 s loss, restore a stationary view, then walk/turn. Check
   recovery without a compulsory turn or restart, no duplicate yaw correction,
-  and retained uncertainty. Also test missing/stale FCU telemetry and resets.
+  retained heading and position uncertainty. Also test
+  missing/stale FCU telemetry and resets.
 - [ ] Verify RTL/Mission/position-loss behavior separately on this aircraft.
 
 Local regression tests exercise production callback/gate/recovery methods,

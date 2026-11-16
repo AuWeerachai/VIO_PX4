@@ -132,31 +132,21 @@ class FcuPose:
     evidence_s: float  # actual FCU sample time; extrapolation is not new evidence
 
 
-class ExternalYaw:
-    def __init__(self, noise_deg=5., rate_hz=30., max_age_s=.2):
-        if (not all(math.isfinite(x) for x in (noise_deg, rate_hz, max_age_s))
-                or not .1 <= noise_deg <= 90 or not 30 <= rate_hz <= 50
-                or not .02 <= max_age_s <= .2):
-            raise ValueError("EV yaw needs noise 0.1..90 deg, rate 30..50 Hz, age 0.02..0.2 s")
-        self.noise_variance = math.radians(noise_deg) ** 2
-        self.variance_floor = self.noise_variance
-        self.rate_hz, self.max_age_s = rate_hz, max_age_s
+class NavigationTiming:
+    """Capture validation and matched FCU history, independent of yaw output."""
+    def __init__(self, max_age_s=.2):
+        if not math.isfinite(max_age_s) or not .02 <= max_age_s <= .2:
+            raise ValueError("Camera capture age must be 0.02..0.2 s")
+        self.max_age_s = max_age_s
         self.clock = ClockSync()
         self.history = deque(maxlen=100)
-        self.pose = None
-        self.last_sent = None
-        self.last_send_time = None
-        self.next_send_time = None
         self.last_ros_clock_offset = None
         self.last_ros_stamp = None
+        self.trusted_capture_s = None
         self.input_error = None
         self.generation = 0
         self.boundary = None
         self.recovery_pose = None
-        self.startup_verified = False
-        self.startup_agreement = 0
-        self.startup_evidence = None
-        self.sent = 0
 
     def observe_fcu(self, msg, now):
         """Only the caller's verified autopilot component may enter here."""
@@ -245,6 +235,31 @@ class ExternalYaw:
             raise ValueError(reason)
         return ros_stamp_s+offset
 
+
+class ExternalYaw(NavigationTiming):
+    """Optional transmitter; disabling it does not disable navigation checks."""
+    def __init__(self, noise_deg=1., rate_hz=30., max_age_s=.2):
+        super().__init__(max_age_s)
+        if (not all(math.isfinite(x) for x in (noise_deg, rate_hz))
+                or not .1 <= noise_deg <= 90 or not 30 <= rate_hz <= 50):
+            raise ValueError("EV yaw needs noise 0.1..90 deg, rate 30..50 Hz")
+        self.noise_variance = math.radians(noise_deg) ** 2
+        self.variance_floor = self.noise_variance
+        self.rate_hz = rate_hz
+        self.pose = None
+        self.last_sent = None
+        self.last_send_time = None
+        self.last_output = None
+        self.next_send_time = None
+        self.startup_verified = False
+        self.startup_agreement = 0
+        self.startup_evidence = None
+        self.sent = 0
+
+    @property
+    def reported_variance(self):
+        return max(self.noise_variance, self.variance_floor)
+
     def store(self, sample_s, position, yaw, q_xyzw, enu):
         if not all(math.isfinite(v) for v in (*position, yaw, sample_s)):
             raise ValueError("nonfinite corrected pose")
@@ -275,7 +290,7 @@ class ExternalYaw:
             covariance[index] = position_sigma**2
         covariance[11] = height_sigma**2
         for index in (15, 18, 20):
-            covariance[index] = max(self.noise_variance, self.variance_floor)
+            covariance[index] = self.reported_variance
         # LOCAL_NED pose, BODY_FRD orientation; velocities unused (NaN).
         # reset_counter stays zero: the bridge repairs raw VO epochs itself.
         return dict(time_usec=int(stamp*1e6), frame_id=1, child_frame_id=12,
@@ -288,8 +303,25 @@ class ExternalYaw:
     def mark_sent(self, now):
         self.last_sent = self.pose[0]
         self.last_send_time = now
+        self.last_output = (self.pose[0], self.pose[3], self.reported_variance)
         period = 1/self.rate_hz
         self.next_send_time = (now+period if self.next_send_time is None or
                               now-self.next_send_time >= period else
                               self.next_send_time+period)
         self.sent += 1
+
+    def output_status(self, now, output_allowed):
+        """Read-only snapshot of the last transmitted heading, not a candidate.
+
+        A successful serial write is not proof of PX4 fusion. Preserve the last
+        value through quarantine but explicitly mark it as paused, never live.
+        """
+        if self.last_output is None:
+            return dict(external_yaw_heading_deg=None, external_yaw_variance_rad2=None,
+                        external_yaw_sample_age_s=None, external_yaw_output_active=False)
+        stamp, yaw, variance = self.last_output
+        age = now - stamp
+        return dict(external_yaw_heading_deg=math.degrees(yaw) % 360.,
+                    external_yaw_variance_rad2=variance,
+                    external_yaw_sample_age_s=age,
+                    external_yaw_output_active=bool(output_allowed and 0 <= age <= self.max_age_s))

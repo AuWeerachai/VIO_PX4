@@ -13,6 +13,7 @@ from vio_px4_bridge.geo_utils import (
 )
 from vio_px4_bridge.recovery_yaw import RecoveryYawAgreement, timestamp_order
 from vio_px4_bridge.local_continuity import LocalPoseContinuity
+from vio_px4_bridge.external_yaw import NavigationTiming, rpy
 
 
 def test_velocity_frame_is_independent_of_position_frame():
@@ -44,6 +45,7 @@ def bridge():
              '_update_px4_odometry', '_fail_inertial_propagation',
              '_reject_position_propagation', '_reject_heading_recovery',
              '_validated_recovery_target', '_reset_recovery_agreement',
+             '_invalidate_navigation', '_navigation_reason',
              '_refresh_recovery_heading',
              '_poll_mavlink',
              '_recovery_velocity_agrees', '_tick', '_odom_callback',
@@ -52,7 +54,7 @@ def bridge():
                         type_ignores=[])
     clock = SimpleNamespace(now=10.0)
     clock.monotonic = lambda: clock.now
-    ns = dict(time=clock, math=math, wrap_pi=wrap_pi,
+    ns = dict(time=clock, math=math, wrap_pi=wrap_pi, rpy=rpy,
               rotate_ned_heading=rotate_ned_heading, timestamp_order=timestamp_order,
               Odometry=SimpleNamespace, enu_offset_to_ned=enu_offset_to_ned,
               yaw_from_quaternion_xyzw=yaw_from_quaternion_xyzw,
@@ -100,7 +102,14 @@ def bridge():
     obj.frozen_position_uncertainty_m = 0.0
     obj._poll_mavlink = Mock()
     obj.poll_real = type(obj)._poll_mavlink.__get__(obj)
-    obj.transport = 'mavlink'
+    # These low-level tests exercise the legacy propagation/ATTITUDE helpers.
+    # test_external_yaw binds ALL production methods and covers the common
+    # time-matched MAVLink path with optional heading both on and off.
+    obj.transport = 'ros2'
+    obj.navigation_timing = NavigationTiming()
+    obj.navigation_timing.trusted_capture_s = 10.
+    obj.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(
+        nanoseconds=round(obj.clock.now*1e9)))
     obj.px4_target_sysid = 1
     obj.px4_target_compid = 1
     obj._maybe_end_spoof_by_timer = Mock()
@@ -248,6 +257,8 @@ def test_full_frozen_recovery_then_gps_resumption(bridge, variance, reset):
     bridge._finish_inertial_propagation()
     bridge.continuity_recovering = False
     bridge.last_vio_time = bridge.clock.now
+    bridge.navigation_timing.trusted_capture_s = bridge.clock.now
+    bridge.navigation_timing.input_error = None
     bridge._tick()
     bridge._publish_fix.assert_called_once()
     assert bridge._publish_fix.call_args.args[0]['eph'] > .1
@@ -429,7 +440,12 @@ def telemetry(bridge, t, counter, yaw=0., gyro_z=0., attitude_first=True,
         time_boot_ms=round(t*1000), roll=0., pitch=0., yaw=yaw)
     queue = [attitude, odom, None] if attitude_first else [odom, attitude, None]
     bridge._mav = SimpleNamespace(recv_match=Mock(side_effect=queue))
-    bridge.poll_real()
+    transport = bridge.transport
+    bridge.transport = 'mavlink'
+    try:
+        bridge.poll_real()
+    finally:
+        bridge.transport = transport
 
 
 @pytest.mark.parametrize('heading_reset', [False, True])

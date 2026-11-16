@@ -1,9 +1,8 @@
 # VIO_PX4 Bridge (ROS 2 Humble)
 
-Two ways to feed the Cube+/PX4 EKF from Jetson VIO:
-
-1. **Path A: VO-as-GPS** — boot GPS spoof, then VO projected as GPS via `HIL_GPS`
-2. **Path B: External vision** — cuVSLAM body odometry through MAVROS `ODOMETRY`
+**Path A: VO-as-GPS** — boot GPS spoof, then VO projected as GPS via `HIL_GPS`.
+Optional yaw-only `ODOMETRY` uses the same direct MAVLink connection. Path B
+has been removed; MAVROS is no longer a runtime or bootstrap dependency.
 
 The internship ArduPilot stack uses MAVLink `GPS_INPUT`. Stock PX4 does **not** fuse that the same way. PX4’s supported inject path is **`HIL_GPS`** with **`MAV_USEHILGPS=1`** (source sysid must match the vehicle, usually `1`).
 
@@ -45,18 +44,16 @@ creates backups of existing Isaac launch scripts, installs the versioned
 overrides, builds `vio_px4_bridge`, and creates both `~/vio-launch` and
 `~/.local/bin/vio-launch`.
 
-The deployment keeps NVIDIA Isaac ROS and MAVROS as standalone sibling
-workspaces rather than vendoring their generated build trees:
+The deployment keeps NVIDIA Isaac ROS as a standalone sibling workspace
+rather than vendoring its generated build tree:
 
 ```text
 ~/workspaces/isaac_ros-dev
-~/workspaces/mavros
 ~/workspaces/VIO_PX4
 ```
 
-The full bootstrap creates both dependency workspaces at the pinned, proven
-revisions. Path A uses `isaac_ros-dev` but owns MAVLink directly; Path B uses
-both `isaac_ros-dev` and MAVROS.
+The full bootstrap creates the Isaac dependency workspace at the pinned
+revisions. Path A owns MAVLink directly.
 
 See `bootstrap/jetson-config/README.md` for the installed paths. Generated ROS build trees,
 logs, bags, credentials, and Docker images are intentionally not stored in Git.
@@ -83,26 +80,6 @@ The optional Path A heading output added in `fcc1222` is **off by default** and
 not yet flight-validated. It is separate from camera IMU fusion. Do not enable
 it as part of restoring the known GPS-only configuration; see
 [external-yaw setup and tests](docs/PATH_A_EXTERNAL_YAW.md) for deliberate testing.
-
-## Path B: External vision through MAVROS
-
-```bash
-vio-launch run b
-```
-
-PX4 params (EV):
-
-- Start **without EV yaw fusion** until the deployed cuVSLAM frames and mounting
-  transform have been verified. Do not blindly use `EKF2_EV_CTRL = 15`.
-- Do not change the height reference to Vision solely to run Path B. Keep the
-  validated aircraft height-source configuration and enable EV height only if
-  that separate fusion mode has been explicitly validated.
-
-Path B starts MAVROS on `/dev/ttyUSB0:921600`, then relays validated body-frame
-cuVSLAM odometry to `/mavros/odometry/out`. Micro XRCE-DDS and `px4_msgs` are not
-part of the Jetson deployment. The relay rejects raw `camera_link` poses; use
-the installed `bootstrap/jetson-config/isaac_ros_overrides/scripts/start_vio.sh` so cuVSLAM
-publishes `child_frame_id=drone_link` directly.
 
 ## Path A: GPS spoof + live VO-as-GPS
 

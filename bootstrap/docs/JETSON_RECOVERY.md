@@ -57,7 +57,6 @@ a diagnosis of the replacement Jetson's current condition.
 | cuVSLAM assets | NGC Visual SLAM asset **3.1.0**, including the interface-spec JSON |
 | Camera driver | Base-image librealsense **2.55.1**, NVIDIA wrapper **release/4.51.1-isaac**; experimental IMU overlay is inactive |
 | Container | `aarch64.ros2_humble.realsense` image key; `run_dev.sh`, mounted workspace, project-owned Docker/source/launch patches |
-| MAVROS | Separate host workspace, commit `c655e6343ec81687d51e7185bcba7a651e361fcd` plus our patch; only Path B uses it at runtime |
 | Camera | Rear D456 on USB 3, both infrared streams, explicit SDK serial and measured body-to-camera extrinsics |
 | Bridge | This repo, built `vio_px4_bridge`, ROS Python/messages, `pymavlink`, serial permissions |
 | FC link | Inspected link `/dev/ttyUSB0:921600`; verify the device on replacement hardware; Path A owns it exclusively |
@@ -83,7 +82,7 @@ builds, downloaded assets, Docker cache, recordings and the arm application;
 
 | Location | Responsibility |
 |---|---|
-| Jetson host | JetPack/kernel/GPU support, Docker, ROS Humble, `vio-launch`, bridge and its serial connection; MAVROS only for Path B |
+| Jetson host | JetPack/kernel/GPU support, Docker, ROS Humble, `vio-launch`, bridge and its serial connection |
 | Isaac ROS container | RealSense driver, cuVSLAM, ROS Humble, source-overlay build and optional RViz |
 | Mounted `isaac_ros-dev` workspace | Persistent NVIDIA source, project overrides, assets and generated overlay; visible inside the container as `/workspaces/isaac_ros-dev` |
 | PX4 flight controller | Flight firmware, sensor fusion, height source, control and failsafes; not installed by Jetson bootstrap |
@@ -107,8 +106,7 @@ PX4 ATTITUDE -> bridge startup heading and GPS-silent recovery
 
 Stereo-only **VO** is intentional. Do not enable the older RealSense IMU
 experiment during recovery. No Micro XRCE-DDS or MAVROS is used in Path A.
-MAVROS is a separate dependency for Path B; the current bootstrap nevertheless
-creates/builds its workspace for both-path deployment.
+Path B has been removed; bootstrap no longer installs or builds MAVROS.
 
 Commit `fcc1222` also adds **optional VO heading over MAVLink ODOMETRY**, default
 off. Leave it off when restoring GPS-only operation. Enabling it requires a
@@ -219,14 +217,13 @@ prove its component packages are missing; inspect the installed components.
 |---|---|
 | Must exist before bootstrap | Compatible OS/BSP/GPU stack, host Humble and ROS apt repository, Docker/NVIDIA runtime, user/device/display access |
 | `bootstrap_isaac_ros.sh --install-deps` | Installs Git/Git LFS/curl/tar; checks architecture, L4T and Docker; retrieves pinned Common/VSLAM sources and NGC asset; calls the project installer |
-| `bootstrap_jetson.sh --install-deps` | Installs pip, colcon, GeographicLib tools, tmux, gnome-terminal, MAVROS apt dependencies and `pymavlink`; retrieves EGM96-5 geoid data if missing |
-| Project installation, with or without `--install-deps` | Clones/patches/builds MAVROS; installs Isaac launch helpers and Docker/VSLAM patches; builds the host bridge; creates launcher symlinks |
+| `bootstrap_jetson.sh --install-deps` | Installs pip, colcon, tmux, gnome-terminal and `pymavlink` |
+| Project installation, with or without `--install-deps` | Installs Isaac launch helpers and Docker/VSLAM patches; builds the host bridge; creates launcher symlinks |
 | First camera launch | Builds/pulls the Isaac image as needed, builds the cuVSLAM workspace overlay inside it, then runs the selected camera launch |
 | Not provided | OS flashing, PX4 firmware/parameter changes, saved vehicle config, RTK/arm stack, network/remote-access setup or recovery of recordings |
 
-The MAVROS apt packages supply dependencies; the separately patched source
-workspace is still built. The full bootstrap builds MAVROS even for a user who
-plans to use only Path A. It does not install or start Micro XRCE-DDS.
+MAVROS and Micro XRCE-DDS are not dependencies of this deployment.
+Existing legacy workspaces are not deleted by bootstrap.
 
 Also verify host serial support with `python3 -c 'import serial'`. If missing,
 install Ubuntu's `python3-serial` package. Importing `pymavlink` alone does not
@@ -252,15 +249,15 @@ Read the selected commit's release/setup notes before running the last command;
 the branch may have advanced beyond the recorded runtime baseline.
 
 This full bootstrap checks the host/L4T prerequisites, clones pinned NVIDIA
-sources, downloads assets, then calls `bootstrap_jetson.sh`. The latter patches
-and builds MAVROS, installs our Isaac overrides, patches the Dockerfile/cuVSLAM
+sources, downloads assets, then calls `bootstrap_jetson.sh`. The latter
+installs our Isaac overrides, patches the Dockerfile/cuVSLAM
 source, builds the bridge, and creates `~/vio-launch` and
 `~/.local/bin/vio-launch`. The first camera launch may download/build the image;
 later launches reuse caches and incrementally build the cuVSLAM overlay.
 
 If compatible Isaac sources/assets are already present, use only
-`./bootstrap/bootstrap_jetson.sh --install-deps`. Existing mismatched NVIDIA or
-MAVROS checkouts are rejected rather than overwritten. Backups precede selected
+`./bootstrap/bootstrap_jetson.sh --install-deps`. Existing mismatched NVIDIA
+checkouts are rejected rather than overwritten. Backups precede selected
 override replacements. **Neither script is a dry run**; even without
 `--install-deps`, cloning, patching, copying and builds can occur.
 
@@ -271,7 +268,6 @@ the sibling layout:
 ```text
 ~/workspaces/VIO_PX4
 ~/workspaces/isaac_ros-dev
-~/workspaces/mavros
 ~/gnss-validation                 # separately restored RTK tooling
 ~/vio-launch                     # launcher link, not a second source copy
 ```
@@ -389,17 +385,33 @@ compatibility problem, not a VO gate setting. Package names alone are not enough
 to prove compatibility. Check the selected package prefixes/versions and, if
 needed, the libraries actually loaded by the camera process.
 
-Current startup rejects an explicitly sourced `.vio-imu` overlay, but that guard
-does **not** catch every way to mix libraries through a normal workspace
-`install/` or `LD_LIBRARY_PATH`. A fresh build must not inherit those experimental
-artifacts. Preserve them in a backup rather than copying them into the new
-runtime. This documentation does not claim that runtime guard has been expanded.
+Camera, RViz and readiness shells now use `vo_environment.sh`: it removes the
+Isaac workspace's inherited install paths, sources the base image, then sources
+only the package-local cuVSLAM overlay. It does not delete cached builds or
+source the whole workspace. `check_vo_environment.py` checks driver/message
+prefixes, versions, native library linkage and the Python `DeviceInfo` layout
+before hardware startup or any identity-service request. A mismatch fails closed.
+Preserve old experimental artifacts outside the selected runtime. When copying
+launcher overrides to a Jetson, include both new environment helpers.
+
+Unit tests of CLI sequencing are not camera integration tests. After deployment,
+verify repeated cold and warm starts using the real D456, repeat the identity
+service requests, check actual loaded libraries, stereo images and body odometry,
+and observe startup under the intended load. For optional heading, separately
+verify PX4 receipt **and fusion**; a transmitted-message counter is insufficient.
 
 Use `lsusb -t` to check the D456 link (USB 3 should report at least `5000M`), and
 inspect the SDK-reported serial. Test enumeration with the camera pipeline
 stopped; do not start a second driver/viewer against an active navigation camera.
 Keep the arm's separate camera selection explicit as well. The two applications
 must also be tested together for RAM/GPU/USB load on the actual replacement.
+
+For optional heading over an FTDI FC adapter, run
+`bash bootstrap/configure_fcu_serial_latency.sh /dev/ttyUSB0` while disarmed,
+substituting the actual FC device. It installs a 1 ms buffering rule scoped to
+that adapter's serial, not every USB serial device. The default 16 ms buffering
+can violate PX4's 10 ms time-sync RTT limit. Record the rule and adapter identity
+in the deployment backup; verify `timesync_status` and actual EV yaw fusion.
 
 ## 8. Save an installation record and know what is verified
 
@@ -408,7 +420,7 @@ large binaries in Git:
 
 - Module/carrier identity, `/etc/nv_tegra_release`, relevant installed NVIDIA/ROS
   package versions and storage layout.
-- Full VIO_PX4/Common/VSLAM/MAVROS commit IDs and any local patches.
+- Full VIO_PX4/Common/VSLAM commit IDs and any local patches.
 - Docker image IDs/digests and, if offline recovery is required, image archives.
 - Camera SDK serial, camera firmware/driver versions and verified stream setup.
 - Saved launcher configuration and exact PX4 firmware artifact/hash plus params.

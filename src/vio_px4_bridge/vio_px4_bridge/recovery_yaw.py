@@ -67,15 +67,10 @@ class RecoveryYawAgreement:
             self._set_baseline(vio_yaw, px4_yaw_delta, px4_timestamp)
             return RecoveryYawResult(False, False, None, 0, "baseline_started")
 
-        # VIO normally runs faster than PX4 ATTITUDE. Do not count the same
-        # independent PX4 sample multiple times merely because VIO updated.
-        if px4_timestamp == self.last_px4_timestamp:
-            return RecoveryYawResult(
-                self.good_samples >= self.required_samples,
-                False,
-                self.last_residual_rad,
-                self.good_samples,
-            )
+        # A reused FCU sample is not NEW agreement evidence, but the current
+        # camera observation can still revoke agreement. Never reuse a cached
+        # pass without evaluating the latest paired yaw changes.
+        new_evidence = px4_timestamp != self.last_px4_timestamp
         if px4_timestamp < self.last_px4_timestamp:
             self.reset()
             self._set_baseline(vio_yaw, px4_yaw_delta, px4_timestamp)
@@ -88,10 +83,11 @@ class RecoveryYawAgreement:
         self.last_residual_rad = residual
 
         if abs(residual) <= self.max_residual_rad:
-            self.good_samples += 1
+            if new_evidence:
+                self.good_samples += 1
             event = (
                 "agreement_confirmed"
-                if self.good_samples == self.required_samples else None
+                if new_evidence and self.good_samples == self.required_samples else None
             )
             return RecoveryYawResult(
                 self.good_samples >= self.required_samples,

@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: bootstrap_jetson.sh [--install-deps] [--isaac-ws PATH] [--mavros-ws PATH]
+Usage: bootstrap_jetson.sh [--install-deps] [--isaac-ws PATH]
 
 Prepare a Jetson that already has an Isaac ROS cuVSLAM workspace. This installs
 project-owned Isaac launch overrides, builds vio_px4_bridge, and creates
@@ -14,12 +14,10 @@ EOF
 
 INSTALL_DEPS=false
 ISAAC_WS="${ISAAC_ROS_WS:-$HOME/workspaces/isaac_ros-dev}"
-MAVROS_WS="$HOME/workspaces/mavros"
 while (($#)); do
   case "$1" in
     --install-deps) INSTALL_DEPS=true; shift ;;
     --isaac-ws) ISAAC_WS="${2:?--isaac-ws requires a path}"; shift 2 ;;
-    --mavros-ws) MAVROS_WS="${2:?--mavros-ws requires a path}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -30,15 +28,6 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 ISAAC_SCRIPTS="$ISAAC_WS/src/isaac_ros_common/scripts"
 ISAAC_COMMON="$ISAAC_WS/src/isaac_ros_common"
 ISAAC_VSLAM="$ISAAC_COMMON/isaac_ros_visual_slam"
-MAVROS_SRC="$MAVROS_WS/src/mavros"
-MAVROS_RELEASE_FILE="$SCRIPT_DIR/jetson-config/mavros_release.env"
-
-[[ -r "$MAVROS_RELEASE_FILE" ]] || {
-  echo "Missing MAVROS release manifest: $MAVROS_RELEASE_FILE" >&2
-  exit 1
-}
-# shellcheck disable=SC1090
-source "$MAVROS_RELEASE_FILE"
 
 [[ -f /opt/ros/humble/setup.bash ]] || {
   echo "ROS 2 Humble is required at /opt/ros/humble." >&2
@@ -57,12 +46,8 @@ source "$MAVROS_RELEASE_FILE"
 if $INSTALL_DEPS; then
   sudo apt-get update
   sudo apt-get install -y \
-    python3-pip python3-colcon-common-extensions geographiclib-tools tmux gnome-terminal \
-    ros-humble-mavros ros-humble-mavros-extras
+    python3-pip python3-colcon-common-extensions tmux gnome-terminal
   python3 -m pip install --user --upgrade pymavlink
-  if [[ ! -f /usr/share/GeographicLib/geoids/egm96-5.pgm ]]; then
-    sudo geographiclib-get-geoids egm96-5
-  fi
 fi
 
 python3 -c 'import pymavlink' 2>/dev/null || {
@@ -74,36 +59,6 @@ command -v gnome-terminal >/dev/null || {
   echo "Missing gnome-terminal; re-run with --install-deps." >&2
   exit 1
 }
-
-mkdir -p "$MAVROS_WS/src"
-if [[ ! -d "$MAVROS_SRC/.git" ]]; then
-  git clone "$MAVROS_REPOSITORY" "$MAVROS_SRC"
-  git -C "$MAVROS_SRC" checkout --detach "$MAVROS_COMMIT"
-else
-  mavros_commit="$(git -C "$MAVROS_SRC" rev-parse HEAD)"
-  if [[ "$mavros_commit" != "$MAVROS_COMMIT" ]]; then
-    echo "Existing MAVROS is $mavros_commit; expected $MAVROS_COMMIT." >&2
-    echo "Refusing to rewrite an existing MAVROS workspace." >&2
-    exit 1
-  fi
-fi
-
-mavros_patch="$SCRIPT_DIR/jetson-config/mavros_overrides/proven_jetson.patch"
-if git -C "$MAVROS_SRC" apply --reverse --check "$mavros_patch" 2>/dev/null; then
-  echo "MAVROS source already matches the proven Jetson patch."
-elif git -C "$MAVROS_SRC" apply --check "$mavros_patch"; then
-  git -C "$MAVROS_SRC" apply "$mavros_patch"
-  echo "Installed the proven Jetson MAVROS patch."
-else
-  echo "MAVROS does not match the pinned source; refusing to patch it." >&2
-  exit 1
-fi
-
-set +u
-source /opt/ros/humble/setup.bash
-set -u
-cd "$MAVROS_WS"
-colcon build
 
 backup_stamp="$(date +%Y%m%d-%H%M%S)"
 install_override() {
@@ -121,7 +76,7 @@ install_override \
 install_override \
   "$SCRIPT_DIR/jetson-config/isaac_ros_overrides/scripts/start_rviz.sh" \
   "$ISAAC_SCRIPTS/start_rviz.sh"
-for helper in check_camera_ready.py camera_selection.py; do
+for helper in check_camera_ready.py camera_selection.py vo_environment.sh check_vo_environment.py; do
   install_override "$SCRIPT_DIR/jetson-config/isaac_ros_overrides/scripts/$helper" "$ISAAC_SCRIPTS/$helper"
 done
 install_override "$SCRIPT_DIR/jetson-config/isaac_ros_overrides/scripts/vio-imu-mode" "$HOME/vio-imu-mode"
@@ -159,9 +114,21 @@ fi
 
 set +u
 source /opt/ros/humble/setup.bash
-source "$MAVROS_WS/install/setup.bash"
 set -u
 cd "$REPO_DIR"
+# Incremental ament_python installs do not remove files deleted from source.
+# Retire only the old Path B artifacts; never erase a workspace/build tree.
+# Run deployment while stopped, as required for replacing the bridge itself.
+python_version="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+for obsolete in \
+  "$REPO_DIR/build/vio_px4_bridge/build/lib/vio_px4_bridge/mavros_ev_bridge.py" \
+  "$REPO_DIR/install/vio_px4_bridge/lib/vio_px4_bridge/mavros_ev_bridge" \
+  "$REPO_DIR/install/vio_px4_bridge/lib/python$python_version/site-packages/vio_px4_bridge/mavros_ev_bridge.py"; do
+  if [[ -e "$obsolete" || -L "$obsolete" ]]; then
+    mv -- "$obsolete" "${obsolete}.retired-path-b-${backup_stamp}"
+    echo "Retired old Path B artifact (backup kept): $obsolete"
+  fi
+done
 colcon build --packages-select vio_px4_bridge
 
 ln -sfn "$REPO_DIR/scripts/vio-launch/vio-launch" "$HOME/vio-launch"
@@ -172,7 +139,6 @@ echo
 echo "Jetson bootstrap complete."
 echo "Repository:      $REPO_DIR"
 echo "Isaac workspace: $ISAAC_WS"
-echo "MAVROS workspace: $MAVROS_WS"
 echo "Launcher:        $HOME/vio-launch"
 echo
 echo "Start with: ~/vio-launch"
