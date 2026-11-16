@@ -130,6 +130,66 @@ def test_clock_reset_stops_both_even_with_heading_disabled(navigation):
     assert b.navigation_timing.generation == b.navigation_timing.clock.generation
 
 
+@pytest.mark.parametrize('initial_reset,new_reset', [(0, 1), (255, 0)])
+def test_delayed_camera_cannot_recover_using_heading_before_fcu_reset(
+        navigation, initial_reset, new_reset):
+    """190ms-old camera data must wait for a match in the NEW FCU epoch.
+
+    Two-sample agreement windows are permitted settings. Previously those
+    windows passed using old buffered FCU poses after its yaw reset by 90deg.
+    """
+    b = navigation
+    b.continuity = LocalPoseContinuity(confirmation_samples=3, recovery_samples=10)
+    feed(b, 10., reset=initial_reset)
+    b._odom_callback(vio_message(10., 0.))
+    b._invalidate_navigation('review_blackout')
+    for i in range(1, 20):
+        feed(b, 10+i*.05, reset=initial_reset)
+    clear_sends(b)
+    for i in range(98, 161):
+        now = round(10+i*.01, 2)
+        if i % 5 == 0:
+            feed(b, now, reset=new_reset if now >= 11. else initial_reset,
+                 yaw=math.pi/2 if now >= 11. else 0.)
+        else:
+            b.clock.now = now
+            synchronize(b.navigation_timing, now)
+            b.last_px4_heartbeat_time = now
+        capture = round(now-.19, 2)
+        b._odom_callback(vio_message(capture, 100.))
+        outputs(b)
+        if capture < 11.:
+            assert b.continuity_recovering, 'recovered using pre-reset heading'
+            silence(b)
+        if not b.continuity_recovering:
+            break
+    assert not b.continuity_recovering, 'fresh post-reset data must allow recovery'
+    assert b.navigation_timing.recovery_pose.reset_counter == new_reset
+    assert b.navigation_timing.recovery_pose.boot_s >= b.recovery_reset_stamp
+    assert b.continuity.last_output_yaw == pytest.approx(math.pi/2)
+    assert b._publish_fix.call_count == 1
+    assert b._mav.mav.odometry_send.call_count == int(b.external_yaw is not None)
+
+
+def test_reset_timestamp_rejects_old_match_even_if_counter_matches(navigation):
+    b = navigation
+    feed(b, 10.)
+    b._odom_callback(vio_message(10., 0.))
+    b._invalidate_navigation('review_blackout')
+    for i in range(1, 20):
+        feed(b, 10+i*.05)
+    feed(b, 11., reset=1, yaw=.4)
+    feed(b, 11.05, reset=0, yaw=.8)
+    b.external_sample_time = 10.90
+    # This buffered sample and the latest one happen to have the same counter,
+    # but there have been two resets between them. Require post-reset TIME too.
+    assert b._matched_recovery_target((0., 0., 0.), 0.) is None
+    assert b.recovery_yaw_agreement_state == 'waiting_for_post_reset_fcu'
+    assert b.navigation_timing.recovery_pose is None
+    assert b.recovery_velocity_agreement_count == 0
+    assert b.recovery_yaw_agreement.good_samples == 0
+
+
 def test_first_rc_high_still_triggers_gps_only_startup(bridge):
     b = bridge
     b.external_yaw = None

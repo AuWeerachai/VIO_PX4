@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import fcntl
 import hashlib
 import json
 import math
@@ -19,8 +20,11 @@ import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
+from functools import wraps
 from pathlib import Path
 from typing import Optional
 
@@ -437,24 +441,87 @@ def pause(msg: str = "Press Enter to continue...") -> None:
 # ---------------------------------------------------------------------------
 
 
+_PROCESS_LOCKS = threading.local()
+
+
+@contextmanager
+def process_operation(cfg: Config):
+    """Serialize complete process transactions across CLI instances.
+
+    Reentrant only within the owning thread/process. The stable lock file must
+    never be unlinked: replacing it would let another CLI lock a different inode.
+    Nonblocking acquisition reports contention instead of hanging a terminal.
+    The descriptor is not inherited by executed ROS/Docker processes.
+    """
+    key = (os.getpid(), cfg.state_dir.resolve())
+    if not hasattr(_PROCESS_LOCKS, "held"):
+        _PROCESS_LOCKS.held = set()
+    if key in _PROCESS_LOCKS.held:
+        yield
+        return
+    cfg.state_dir.mkdir(parents=True, exist_ok=True)
+    with (cfg.state_dir / "process-manager.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(
+                "Another vio-launch process operation is in progress. "
+                "No changes made by this request; retry when it finishes.") from exc
+        _PROCESS_LOCKS.held.add(key)
+        try:
+            yield
+        finally:
+            _PROCESS_LOCKS.held.remove(key)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def serialized_process_operation(function):
+    @wraps(function)
+    def locked(cfg, *args, **kwargs):
+        with process_operation(cfg):
+            return function(cfg, *args, **kwargs)
+    return locked
+
+
 def ensure_dirs(cfg: Config) -> None:
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     cfg.log_dir.mkdir(parents=True, exist_ok=True)
 
 
+@serialized_process_operation
 def read_state(cfg: Config) -> dict:
     ensure_dirs(cfg)
-    if not cfg.state_file.exists():
-        return {"procs": []}
     try:
         state = json.loads(cfg.state_file.read_text())
-        if not isinstance(state, dict) or not isinstance(state.get("procs", []), list):
-            return {"procs": []}
+        if not isinstance(state, dict) or not isinstance(state.get("procs"), list):
+            raise ValueError("expected an object containing a procs list")
+        names, pids = set(), set()
+        for proc in state["procs"]:
+            if (not isinstance(proc, dict)
+                    or not isinstance(proc.get("name"), str) or not proc["name"]
+                    or type(proc.get("pid")) is not int or proc["pid"] <= 1
+                    or type(proc.get("startTicks")) is not int or proc["startTicks"] < 0
+                    or ("bootId" in proc and
+                        (not isinstance(proc["bootId"], str) or not proc["bootId"]))):
+                raise ValueError("invalid process ownership record")
+            if proc["name"] in names or proc["pid"] in pids:
+                raise ValueError("duplicate process ownership records")
+            names.add(proc["name"])
+            pids.add(proc["pid"])
         return state
-    except (OSError, json.JSONDecodeError, TypeError):
+    except FileNotFoundError:
+        # A genuinely new installation has no state yet. Unreadable, empty or
+        # malformed existing files are NOT evidence that publishers are stopped.
         return {"procs": []}
+    except (OSError, ValueError, TypeError) as exc:
+        raise RuntimeError(
+            f"Cannot verify managed process state in {cfg.state_file}: {exc}. "
+            "Processes may still be running. Start/stop/restart is blocked; "
+            "repair the state file or its permissions before retrying. "
+            "Do not delete it to bypass this check.") from exc
 
 
+@serialized_process_operation
 def write_state(cfg: Config, state: dict) -> None:
     ensure_dirs(cfg)
     atomic_write_json(cfg.state_file, state)
@@ -518,6 +585,11 @@ def managed_leader_alive(proc: dict) -> bool:
     return ticks is not None and ticks == proc.get("startTicks")
 
 
+def same_managed_process(first: dict, second: dict) -> bool:
+    return all(first.get(key) == second.get(key)
+               for key in ("name", "pid", "startTicks", "bootId"))
+
+
 def terminate_managed(proc: dict) -> None:
     for sig in (signal.SIGTERM, signal.SIGKILL):
         if not managed_alive(proc):
@@ -534,6 +606,7 @@ def terminate_managed(proc: dict) -> None:
                            "state retained and replacement startup blocked")
 
 
+@serialized_process_operation
 def prune_state(cfg: Config) -> list[dict]:
     state = read_state(cfg)
     alive = [p for p in state.get("procs", []) if managed_alive(p)]
@@ -553,17 +626,17 @@ def find_proc(cfg: Config, name: str) -> Optional[dict]:
     return next((p for p in prune_state(cfg) if p["name"] == name), None)
 
 
+@serialized_process_operation
 def register_proc(cfg: Config, proc: dict) -> None:
     state = read_state(cfg)
-    procs = [
-        p
-        for p in state.get("procs", [])
-        if p.get("name") != proc["name"] and managed_alive(p)
-    ]
+    procs = [p for p in state["procs"] if managed_alive(p)]
+    if any(p["name"] == proc["name"] for p in procs):
+        raise RuntimeError(f"{proc['name']} already running; refusing to overwrite ownership")
     procs.append(proc)
     write_state(cfg, {"procs": procs})
 
 
+@serialized_process_operation
 def start_managed(
     cfg: Config,
     name: str,
@@ -616,9 +689,16 @@ def start_managed(
     return managed
 
 
-def stop_managed(cfg: Config, name: Optional[str] = None) -> list[str]:
+@serialized_process_operation
+def stop_managed(cfg: Config, name: Optional[str] = None, *,
+                 expected_proc: Optional[dict] = None) -> list[str]:
     procs = prune_state(cfg)
     targets = [p for p in procs if name is None or p["name"] == name]
+    if expected_proc is not None and any(
+            not same_managed_process(p, expected_proc) for p in targets):
+        raise RuntimeError(
+            "The original bridge was replaced by another launch. "
+            "The replacement process was left running.")
     stopped: list[str] = []
     for p in targets:
         terminate_managed(p)
@@ -1090,6 +1170,7 @@ def require_no_publishers_for_camera_restart(cfg: Config) -> None:
             "No camera restart was performed.")
 
 
+@serialized_process_operation
 def cmd_vio(cfg: Config, defer_health: bool = False) -> None:
     require_current_cli()
     print(f"- Selected camera mode: {camera_mode_label(cfg)}")
@@ -1226,8 +1307,16 @@ def cmd_vio(cfg: Config, defer_health: bool = False) -> None:
           if defer_health else "- cuVSLAM body odometry ready.")
 
 
-def stop_failed_spoof(cfg: Config, reason: str) -> None:
+@serialized_process_operation
+def stop_failed_spoof(cfg: Config, reason: str, *,
+                      expected_proc: Optional[dict] = None) -> None:
     """GPS has already stopped in the bridge; stop it before camera teardown."""
+    if expected_proc is not None:
+        current = find_proc(cfg, "gps-bridge")
+        if current is None or not same_managed_process(current, expected_proc):
+            raise RuntimeError(
+                "The original GPS bridge is no longer managed by this launch. "
+                "Replacement processes and camera were left untouched.")
     print(f"- Spoof validation failed: {reason}", flush=True)
     stop_managed(cfg, "gps-bridge")
     # Save the camera evidence before the owning terminal/container is removed.
@@ -1243,8 +1332,12 @@ def stop_failed_spoof(cfg: Config, reason: str) -> None:
     print("- GPS bridge and cuVSLAM/RViz sessions stopped. Start Path A again to retry.", flush=True)
 
 
-def cmd_gps(cfg: Config) -> None:
+@serialized_process_operation
+def start_gps_bridge(cfg: Config) -> dict:
+    """Keep preflight, status cleanup and publisher registration one transaction."""
     require_current_cli()
+    if find_proc(cfg, "gps-bridge"):
+        raise RuntimeError("gps-bridge already running. Stop it first.")
     if find_proc(cfg, "ev-bridge") or find_proc(cfg, "mavros"):
         raise RuntimeError("A legacy EV/MAVROS process is already running. Stop it first.")
     # This command is also callable directly, without cmd_run/cmd_vio.
@@ -1338,7 +1431,14 @@ def cmd_gps(cfg: Config) -> None:
     )
     navigation_status = cfg.state_dir / "navigation-status.json"
     navigation_status.unlink(missing_ok=True)
-    proc = start_managed(cfg, "gps-bridge", cmd, startup_check_s=6.0)
+    return start_managed(cfg, "gps-bridge", cmd, startup_check_s=6.0)
+
+
+def cmd_gps(cfg: Config) -> None:
+    proc = start_gps_bridge(cfg)
+    navigation_status = cfg.state_dir / "navigation-status.json"
+    # Do not hold the operation lock while waiting for the operator's RC switch.
+    # Another terminal must remain able to stop the pipeline during this wait.
     print(f"- Path A connected to PX4 on {cfg.mavlink_url} (pid {proc['pid']}).")
     if cfg.external_yaw_enabled:
         print("- Heading time sync warms up before activation (normally about 15 seconds).")
@@ -1347,6 +1447,9 @@ def cmd_gps(cfg: Config) -> None:
 
     saw_spoof = False
     while True:
+        if not managed_leader_alive(proc):
+            stop_managed(cfg, "gps-bridge", expected_proc=proc)
+            raise RuntimeError("GPS bridge stopped during the spoof sequence")
         try:
             status = json.loads(navigation_status.read_text())
         except (FileNotFoundError, OSError, json.JSONDecodeError):
@@ -1363,13 +1466,10 @@ def cmd_gps(cfg: Config) -> None:
             return
         if status.get("spoof_failure_reason") or (saw_spoof and navigation == "waiting_for_rc"):
             reason = status.get("spoof_failure_reason") or "no healthy heading-aligned VIO handoff"
-            stop_failed_spoof(cfg, reason)
+            stop_failed_spoof(cfg, reason, expected_proc=proc)
             raise RuntimeError(
                 f"Spoof validation failed: {reason}. GPS and camera stopped."
             )
-        if not managed_leader_alive(proc):
-            stop_managed(cfg, "gps-bridge")
-            raise RuntimeError("GPS bridge stopped during the spoof sequence")
         time.sleep(0.2)
 
 
@@ -1529,6 +1629,8 @@ def show_navigation_status(cfg: Config) -> None:
             yaw_note = " (waiting for clock sync)"
         elif yaw_state == "waiting_for_time_matched_fcu":
             yaw_note = " (waiting for matching FCU sample)"
+        elif yaw_state == "waiting_for_post_reset_fcu":
+            yaw_note = " (waiting for post-reset FCU match)"
         print(f"- Recovery checks: velocity {velocity_count}/{cfg.recovery_velocity_agreement_samples}"
               f" | yaw {yaw_count}/{cfg.recovery_yaw_agreement_samples}{yaw_note}")
     if blocked:
@@ -1598,6 +1700,7 @@ def cmd_logs(cfg: Config, name: str, lines: int = 40, full: bool = False) -> Non
     print("\n".join(session[-lines:]))
 
 
+@serialized_process_operation
 def cmd_stop(cfg: Config, name: Optional[str] = None) -> None:
     stopped = stop_managed(cfg, name)
     if name is None:
@@ -1612,6 +1715,7 @@ def cmd_stop(cfg: Config, name: Optional[str] = None) -> None:
     print(f"Stopped: {', '.join(stopped)}")
 
 
+@serialized_process_operation
 def cmd_shutdown(cfg: Config) -> None:
     """Stop this pipeline and its Isaac ROS container/session."""
     cmd_stop(cfg)

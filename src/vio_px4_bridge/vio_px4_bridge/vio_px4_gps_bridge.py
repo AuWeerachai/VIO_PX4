@@ -1000,15 +1000,28 @@ class VioPx4GpsBridge(Node):
         aid = self.navigation_timing
         # Keep existing position/reset/physical guards. They may explicitly
         # discard translation, but do not permanently latch healthy yaw out.
-        self._inertial_recovery_target()
+        aid.recovery_pose = None
+        if self._inertial_recovery_target() is None:
+            self._reset_recovery_agreement()
+            return None
         sample = aid.matched_fcu(self.external_sample_time, time.monotonic(),
                                  self.inertial_max_message_age_s)
-        aid.recovery_pose = None
         if sample is None:
             self._reset_recovery_agreement()
             self.recovery_yaw_agreement_state = (
                 "waiting_for_time_matched_fcu" if aid.clock.ready(time.monotonic())
                 else "waiting_for_time_sync")
+            return None
+        # A delayed camera capture can still match buffered poses from BEFORE
+        # the latest FCU reset. Those poses are individually valid but no longer
+        # define the current heading reference. Do not count them as recovery
+        # evidence or feed the old reference back to PX4. The time check also
+        # handles reset-counter wraparound/repeated resets during one loss.
+        if (sample.reset_counter != aid.history[-1].reset_counter
+                or (self.recovery_reset_stamp is not None
+                    and sample.boot_s < self.recovery_reset_stamp)):
+            self._reset_recovery_agreement()
+            self.recovery_yaw_agreement_state = "waiting_for_post_reset_fcu"
             return None
         self.inertial_heading_safe = True
         self.inertial_heading_failure = None
