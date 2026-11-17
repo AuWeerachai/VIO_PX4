@@ -219,6 +219,26 @@ def test_heading_default_is_one_degree_without_overwriting_existing_config():
     assert cli.Config().external_yaw_max_age_s == .2
 
 
+@pytest.mark.parametrize('menu', ['heading', 'pose_gate'])
+@pytest.mark.parametrize('age,accepted', [(.5, True), (.501, False)])
+def test_camera_age_override_in_both_menus(menu, age, accepted):
+    cfg = cli.Config()
+    def answer(label, current):
+        return str(age) if 'camera' in label.lower() and 'age' in label.lower() else current
+    if menu == 'heading':
+        from dataclasses import replace
+        cfg = replace(cfg, external_yaw_enabled=True)
+    with patch.object(cli, '_clear'), patch.object(cli, 'pause'), \
+         patch.object(cli, 'prompt_line', side_effect=answer), \
+         patch.object(cli, 'save_config') as save:
+        result = getattr(cli, 'configure_heading' if menu == 'heading' else 'configure_pose_gate')(cfg)
+    assert result.external_yaw_max_age_s == (age if accepted else cfg.external_yaw_max_age_s)
+    assert result.gate_max_speed_m_s == cfg.gate_max_speed_m_s
+    assert result.gate_max_acceleration_m_s2 == cfg.gate_max_acceleration_m_s2
+    assert result.external_yaw_startup_tolerance_deg == cfg.external_yaw_startup_tolerance_deg
+    assert save.call_count == int(accepted)
+
+
 @pytest.mark.parametrize('source', ['px4', 'manual'])
 def test_heading_menu_enables_yaw_without_touching_physical_gates(source):
     answers = ['on', source] + (['156'] if source == 'manual' else [])

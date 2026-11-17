@@ -21,8 +21,10 @@ def navigation(request, bridge):
 @pytest.mark.parametrize('fault', ['position', 'yaw', 'nan', 'angular_nan', 'frame',
                                   'world_frame', 'zero_q', 'nonunit_q', 'old',
                                   'future', 'duplicate', 'regression'])
-def test_all_bad_camera_inputs_latch_shared_quarantine(navigation, fault):
+@pytest.mark.parametrize('capture_age', [.2, .5])
+def test_all_bad_camera_inputs_latch_shared_quarantine(navigation, fault, capture_age):
     b = navigation
+    b.navigation_timing.max_age_s = capture_age
     feed(b, 10.)
     b._odom_callback(vio_message(10., 0.))
     outputs(b)
@@ -45,6 +47,28 @@ def test_all_bad_camera_inputs_latch_shared_quarantine(navigation, fault):
     outputs(b)
     assert b.continuity_recovering
     assert b.navigation_timing.trusted_capture_s == 10.
+    silence(b)
+
+
+def test_half_second_limit_accepts_delayed_data_but_still_stops_both(navigation):
+    b = navigation
+    b.navigation_timing.max_age_s = .5
+    feed(b, 10.)
+    b._odom_callback(vio_message(10., 0.))
+    outputs(b)
+    clear_sends(b)
+    feed(b, 10.30)
+    b._odom_callback(vio_message(10.01, 0.))  # 290 ms old, not relabelled as fresh
+    outputs(b)
+    assert not b.continuity_recovering
+    assert b.navigation_timing.trusted_capture_s == pytest.approx(10.01)
+    assert b._publish_fix.call_count == 1
+    if b.external_yaw is not None:
+        assert b._mav.mav.odometry_send.call_args.kwargs['time_usec'] == 10010000
+    feed(b, 10.52)  # accepted capture is now more than 500 ms old
+    clear_sends(b)
+    outputs(b)
+    assert b.continuity_recovering
     silence(b)
 
 
@@ -131,14 +155,16 @@ def test_clock_reset_stops_both_even_with_heading_disabled(navigation):
 
 
 @pytest.mark.parametrize('initial_reset,new_reset', [(0, 1), (255, 0)])
+@pytest.mark.parametrize('capture_delay', [.19, .45])
 def test_delayed_camera_cannot_recover_using_heading_before_fcu_reset(
-        navigation, initial_reset, new_reset):
-    """190ms-old camera data must wait for a match in the NEW FCU epoch.
+        navigation, initial_reset, new_reset, capture_delay):
+    """Delayed camera data must wait for a match in the NEW FCU epoch.
 
     Two-sample agreement windows are permitted settings. Previously those
     windows passed using old buffered FCU poses after its yaw reset by 90deg.
     """
     b = navigation
+    b.navigation_timing.max_age_s = .5 if capture_delay > .2 else .2
     b.continuity = LocalPoseContinuity(confirmation_samples=3, recovery_samples=10)
     feed(b, 10., reset=initial_reset)
     b._odom_callback(vio_message(10., 0.))
@@ -146,7 +172,7 @@ def test_delayed_camera_cannot_recover_using_heading_before_fcu_reset(
     for i in range(1, 20):
         feed(b, 10+i*.05, reset=initial_reset)
     clear_sends(b)
-    for i in range(98, 161):
+    for i in range(98, 201):
         now = round(10+i*.01, 2)
         if i % 5 == 0:
             feed(b, now, reset=new_reset if now >= 11. else initial_reset,
@@ -155,7 +181,7 @@ def test_delayed_camera_cannot_recover_using_heading_before_fcu_reset(
             b.clock.now = now
             synchronize(b.navigation_timing, now)
             b.last_px4_heartbeat_time = now
-        capture = round(now-.19, 2)
+        capture = round(now-capture_delay, 2)
         b._odom_callback(vio_message(capture, 100.))
         outputs(b)
         if capture < 11.:

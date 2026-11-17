@@ -29,6 +29,30 @@ def synchronize(aid, now):
     aid.clock.last_good = now
 
 
+@pytest.mark.parametrize('helper', [NavigationTiming, ExternalYaw])
+def test_half_second_capture_limit_is_explicit_and_preserves_timestamp(helper):
+    aid = helper(max_age_s=.5)
+    assert aid.sample_time(100., 100.5, 10.5) == pytest.approx(10.)
+    with pytest.raises(ValueError, match='stale_or_future'):
+        helper(max_age_s=.5).sample_time(100., 100.501, 10.501)
+    with pytest.raises(ValueError, match='stale_or_future'):
+        helper(max_age_s=.5).sample_time(100.01, 100., 10.)
+    # Existing installations keep their conservative default until selected.
+    assert helper().max_age_s == .2
+    for invalid in (.019, .501, 1., math.nan, math.inf):
+        with pytest.raises(ValueError, match='0.02..0.5'):
+            helper(max_age_s=invalid)
+
+
+def test_half_second_heading_packet_keeps_real_capture_time_and_expires():
+    aid = ExternalYaw(max_age_s=.5)
+    synchronize(aid, 10.5)
+    aid.store(10., (0, 0, 0), 0., (0, 0, 0, 1), True)
+    packet = aid.packet(10.5, .1, 1.)
+    assert packet['time_usec'] == 10000000
+    assert aid.packet(10.501, .1, 1.) is None
+
+
 def fcu(t, north=0., yaw=0., vn=0., yaw_variance=.01, reset=0, component=1):
     covariance = [0.] * 21
     covariance[0] = covariance[6] = .25

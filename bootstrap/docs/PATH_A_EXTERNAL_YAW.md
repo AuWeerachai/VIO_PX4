@@ -87,8 +87,15 @@ PX4: on**. Existing saved configurations default to off. New settings:
 |---|---:|---|
 | Minimum heading uncertainty | 1 degree | One-sigma minimum; inherited reference uncertainty can raise it |
 | Heading output rate | 30 Hz | 30–50 Hz; never duplicate a camera sample |
-| Maximum camera sample age | 0.2 s | Capture age, not callback-arrival age |
+| Maximum camera sample age | 0.2 s | Selectable 0.02–0.5 s; capture age, not callback-arrival age |
 | Startup readback tolerance | 10 degrees | PX4 vs seeded VO heading, before live handoff |
+
+A 0.5 s camera-age override must be explicitly saved and needs a Path A restart.
+It affects both GPS and yaw, including GPS-only operation, but does not alter
+the physical jump gates, PX4-motion freshness limits, or recovery checks. It
+does not clear inherited uncertainty or change PX4 delay/buffer settings.
+Validate delayed-data behavior on the ground before flight; allowing more age
+does not make the camera faster or guarantee that PX4 fuses every sample.
 
 **Status (option 2)** places GPS/heading output states and PX4 connection first,
 then matching **HIL_GPS** and **VO heading** rows (health, last sent value,

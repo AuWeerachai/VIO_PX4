@@ -1,5 +1,6 @@
 """Use disposable private process groups; never touch ROS, Docker or serial."""
 import multiprocessing
+import errno
 import os
 from pathlib import Path
 import select
@@ -13,6 +14,12 @@ from unittest.mock import patch
 import pytest
 
 from test_vio_bootstrap import cli
+
+
+def no_login_popen(popen, args, **kwargs):
+    """Keep the actual supervisor, but never source the user's login scripts."""
+    assert args[-3:-1] == ['bash', '-lc']
+    return popen([*args[:-3], 'bash', '--noprofile', '--norc', '-c', args[-1]], **kwargs)
 
 
 def _paused_launcher(state_dir, entered, release, result):
@@ -31,7 +38,7 @@ def _paused_launcher(state_dir, entered, release, result):
     try:
         with patch.object(cli, 'find_proc', side_effect=paused_find), \
              patch.object(cli.subprocess, 'Popen', side_effect=lambda args, **kw:
-                          popen(['bash', '--noprofile', '--norc', '-c', args[-1]], **kw)):
+                          no_login_popen(popen, args, **kw)):
             record = cli.start_managed(cfg, 'gps-bridge', 'sleep 60', .05)
         result.put(('ok', record))
     except Exception as exc:
@@ -50,7 +57,7 @@ def test_two_cli_processes_cannot_start_or_overwrite_the_same_bridge(tmp_path):
     try:
         assert entered.wait(10), 'launcher did not reach the critical section'
         with patch.object(cli.subprocess, 'Popen', side_effect=lambda args, **kw:
-                          popen(['bash', '--noprofile', '--norc', '-c', args[-1]], **kw)):
+                          no_login_popen(popen, args, **kw)):
             with pytest.raises(RuntimeError, match='Another vio-launch'):
                 extra = cli.start_managed(cfg, 'gps-bridge', 'sleep 60', .05)
         # A status refresh/prune or stop must not overwrite the same transaction.
@@ -143,6 +150,17 @@ def test_failed_stop_keeps_record_and_does_not_claim_success(owned_group):
             cli.stop_managed(cfg)
     assert cli.read_state(cfg)['procs'] == [record]
     assert cli.managed_alive(record)
+
+
+def test_full_disk_after_verified_stop_does_not_block_camera_teardown(owned_group):
+    cfg, record, parent, child = owned_group
+    with patch.object(cli, 'atomic_write_json', side_effect=OSError(errno.ENOSPC, 'full')), \
+         patch.object(cli, 'stop_visible_isaac_sessions') as camera:
+        cli.cmd_stop(cfg)
+        camera.assert_called_once()
+    assert not cli.managed_alive(record)
+    assert cli.read_state(cfg)['procs'] == [record]  # recoverable, not lost/corrupted
+    assert cli.prune_state(cfg) == []
 
 
 def test_old_startup_watcher_cannot_stop_replacement_or_its_camera(owned_group):
@@ -263,7 +281,7 @@ def test_start_registers_ownership_and_zombie_is_not_healthy(tmp_path):
     popen = subprocess.Popen
     # Do not source the user's ROS login profile in a disposable process test.
     with patch.object(cli.subprocess, 'Popen', side_effect=lambda args, **kw:
-                      popen(['bash', '--noprofile', '--norc', '-c', args[-1]], **kw)):
+                      no_login_popen(popen, args, **kw)):
         with pytest.raises(RuntimeError, match='failed to start'):
             cli.start_managed(cfg, 'test-short-lived', 'exit 0', startup_check_s=.2)
     assert cli.read_state(cfg)['procs'] == []
@@ -278,7 +296,7 @@ def test_startup_failure_cleans_up_a_surviving_child(tmp_path):
     command = f'{shlex.quote(sys.executable)} -c {shlex.quote(parent)}'
     popen = subprocess.Popen
     with patch.object(cli.subprocess, 'Popen', side_effect=lambda args, **kw:
-                      popen(['bash', '--noprofile', '--norc', '-c', args[-1]], **kw)):
+                      no_login_popen(popen, args, **kw)):
         with pytest.raises(RuntimeError, match='failed to start'):
             cli.start_managed(cfg, 'test-orphan', command, startup_check_s=.5)
     pids = [int(line) for line in (cfg.log_dir/'test-orphan.log').read_text().splitlines()

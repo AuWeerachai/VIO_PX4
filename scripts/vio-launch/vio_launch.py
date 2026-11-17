@@ -22,6 +22,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from functools import wraps
@@ -442,6 +443,72 @@ def pause(msg: str = "Press Enter to continue...") -> None:
 
 
 _PROCESS_LOCKS = threading.local()
+_STARTUPS = threading.local()
+
+
+class StartupCancelled(RuntimeError):
+    pass
+
+
+class ProcessOperationBusy(RuntimeError):
+    pass
+
+
+def startup_generation(cfg: Config):
+    path = cfg.state_dir / "startup-generation.json"
+    try:
+        value = json.loads(path.read_text())
+        if not isinstance(value, dict) or not isinstance(value.get("generation"), str):
+            raise ValueError("invalid cancellation generation")
+        return value["generation"]
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"Cannot verify startup cancellation state: {path}: {exc}") from exc
+
+
+def check_startup_current(cfg: Config) -> None:
+    key = (os.getpid(), cfg.state_dir.resolve())
+    active = getattr(_STARTUPS, "active", {})
+    if key in active and startup_generation(cfg) != active[key]:
+        raise StartupCancelled("Startup cancelled by Stop all. No further launch actions performed.")
+
+
+@contextmanager
+def startup_operation(cfg: Config):
+    """One starter at a time, without excluding Stop all during readiness waits."""
+    key = (os.getpid(), cfg.state_dir.resolve())
+    if not hasattr(_STARTUPS, "active"):
+        _STARTUPS.active = {}
+    if key in _STARTUPS.active:
+        check_startup_current(cfg)
+        yield
+        return
+    cfg.state_dir.mkdir(parents=True, exist_ok=True)
+    with (cfg.state_dir / "startup.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ProcessOperationBusy(
+                "Another vio-launch startup is in progress. Stop all can cancel it.") from exc
+        try:
+            with process_operation(cfg):
+                generation = uuid.uuid4().hex
+                atomic_write_json(cfg.state_dir / "startup-generation.json",
+                                  {"generation": generation})
+                _STARTUPS.active[key] = generation
+            yield
+        finally:
+            _STARTUPS.active.pop(key, None)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def serialized_startup(function):
+    @wraps(function)
+    def guarded(cfg, *args, **kwargs):
+        with startup_operation(cfg):
+            return function(cfg, *args, **kwargs)
+    return guarded
 
 
 @contextmanager
@@ -454,6 +521,7 @@ def process_operation(cfg: Config):
     The descriptor is not inherited by executed ROS/Docker processes.
     """
     key = (os.getpid(), cfg.state_dir.resolve())
+    check_startup_current(cfg)
     if not hasattr(_PROCESS_LOCKS, "held"):
         _PROCESS_LOCKS.held = set()
     if key in _PROCESS_LOCKS.held:
@@ -464,11 +532,12 @@ def process_operation(cfg: Config):
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            raise RuntimeError(
+            raise ProcessOperationBusy(
                 "Another vio-launch process operation is in progress. "
                 "No changes made by this request; retry when it finishes.") from exc
         _PROCESS_LOCKS.held.add(key)
         try:
+            check_startup_current(cfg)
             yield
         finally:
             _PROCESS_LOCKS.held.remove(key)
@@ -637,33 +706,29 @@ def register_proc(cfg: Config, proc: dict) -> None:
 
 
 @serialized_process_operation
-def start_managed(
+def spawn_managed(
     cfg: Config,
     name: str,
     bash_command: str,
-    startup_check_s: float = 0.75,
-) -> dict:
+) -> tuple[subprocess.Popen, dict]:
     require_current_cli()
     existing = find_proc(cfg, name)
     if existing:
         raise RuntimeError(f"{name} already running (pid {existing['pid']}). Stop it first.")
     ensure_dirs(cfg)
     log_file = cfg.log_dir / f"{name}.log"
-    if log_file.exists() and log_file.stat().st_size > 5 * 1024 * 1024:
-        # Bound unattended log growth. Keep one previous log for diagnosis.
-        os.replace(log_file, log_file.with_suffix(".log.1"))
-    with log_file.open("a", encoding="utf-8") as log:
-        log.write(f"\n===== {time.strftime('%Y-%m-%dT%H:%M:%S')} start {name} =====\n")
-        log.write(f"$ {bash_command}\n")
-        log.flush()
-        proc = subprocess.Popen(
-            ["bash", "-lc", bash_command],
-            stdin=subprocess.DEVNULL,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            env=os.environ.copy(),
-        )
+    runner = _CLI_FILE.with_name("managed_process.py")
+    proc = subprocess.Popen(
+        [sys.executable, "-u", str(runner), "--log", str(log_file), "--name", name,
+         "--", "bash", "-lc", bash_command],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        # No inherited terminal/SSH pipes: leaving the CLI must return even
+        # though this supervisor and its publisher continue in their session.
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        env=os.environ.copy(),
+    )
     identity = process_identity(proc.pid)
     managed = {
         "name": name,
@@ -681,12 +746,29 @@ def start_managed(
         # Never leave an untracked publisher running if state persistence fails.
         terminate_managed(managed)
         raise
-    time.sleep(startup_check_s)
-    if proc.poll() is not None:
-        stop_managed(cfg, name)
-        recent = log_file.read_text(errors="replace").strip().splitlines()[-12:]
-        raise RuntimeError(f"{name} failed to start. Recent log:\n" + "\n".join(recent))
-    return managed
+    return proc, managed
+
+
+def start_managed(cfg: Config, name: str, bash_command: str,
+                  startup_check_s: float = 0.75) -> dict:
+    proc, managed = spawn_managed(cfg, name, bash_command)
+    # Ownership is already saved. Stop all may cancel/terminate this process
+    # during the check; do not keep the state lock while waiting for readiness.
+    deadline = time.monotonic() + startup_check_s
+    while proc.poll() is None and time.monotonic() < deadline:
+        check_startup_current(cfg)
+        time.sleep(min(.05, max(0., deadline-time.monotonic())))
+    with process_operation(cfg):
+        exit_code = proc.poll()
+        if exit_code is not None or not managed_leader_alive(managed):
+            stop_managed(cfg, name, expected_proc=managed)
+            log_file = Path(managed["logFile"])
+            try:
+                recent = log_file.read_text(errors="replace").strip().splitlines()[-12:]
+            except OSError as exc:
+                recent = [f"Log unavailable: {exc}"]
+            raise RuntimeError(f"{name} failed to start (exit code {exit_code}). Recent log:\n" + "\n".join(recent))
+        return managed
 
 
 @serialized_process_operation
@@ -706,7 +788,15 @@ def stop_managed(cfg: Config, name: Optional[str] = None, *,
     if targets:
         stopped_names = {p["name"] for p in targets}
         remaining = [p for p in procs if p.get("name") not in stopped_names]
-        write_state(cfg, {"procs": remaining})
+        try:
+            write_state(cfg, {"procs": remaining})
+        except OSError as exc:
+            if exc.errno != errno.ENOSPC:
+                raise
+            # The groups are verified stopped. Retain their old ownership
+            # records for a later prune, but do not block camera teardown.
+            print("Warning: disk is full; stopped-process records retained until space is available.",
+                  file=sys.stderr)
     return stopped
 
 
@@ -767,7 +857,7 @@ ISAAC_CONTAINER = "isaac_ros_dev-aarch64-container"
 def isaac_container_running() -> bool:
     result = subprocess.run(
         ["docker", "inspect", "-f", "{{.State.Running}}", ISAAC_CONTAINER],
-        capture_output=True, text=True, check=False,
+        capture_output=True, text=True, check=False, timeout=5,
     )
     return result.returncode == 0 and result.stdout.strip() == "true"
 
@@ -998,9 +1088,14 @@ def jetson_desktop_env() -> dict[str, str]:
 
 def tmux_command(session: str, command: str) -> None:
     subprocess.run(
-        ["tmux", "send-keys", "-t", session, "-l", command], check=True
+        ["tmux", "send-keys", "-t", session, "-l", command], check=True, timeout=5
     )
-    subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], check=True)
+    subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], check=True, timeout=5)
+
+
+def startup_tmux_command(cfg: Config, session: str, command: str) -> None:
+    with process_operation(cfg):
+        tmux_command(session, command)
 
 
 def tmux_session_exists(session: str) -> bool:
@@ -1021,9 +1116,10 @@ def tmux_recent_output(session: str, lines: int = 80) -> str:
 
 
 def start_visible_isaac_session(cfg: Config, session: str, title: str) -> None:
-    replacing_vio_owner = session == ISAAC_TMUX_VIO and tmux_session_exists(session)
-    subprocess.run(["tmux", "kill-session", "-t", session], check=False,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    with process_operation(cfg):
+        replacing_vio_owner = session == ISAAC_TMUX_VIO and tmux_session_exists(session)
+        subprocess.run(["tmux", "kill-session", "-t", session], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
     if replacing_vio_owner:
         # run_dev.sh owns an auto-removed Docker container. Killing its terminal
         # begins asynchronous container teardown. Starting another run_dev.sh
@@ -1031,25 +1127,27 @@ def start_visible_isaac_session(cfg: Config, session: str, title: str) -> None:
         # with "No such container". Wait for teardown to finish first.
         deadline = time.monotonic() + 45.0
         while isaac_container_running() and time.monotonic() < deadline:
+            check_startup_current(cfg)
             time.sleep(0.5)
         if isaac_container_running():
             raise RuntimeError(
                 "Previous Isaac container did not stop after its VIO session closed. "
                 "Use option 8, wait a few seconds, then retry."
             )
-    subprocess.run(["tmux", "new-session", "-d", "-s", session], check=True)
-    env = jetson_desktop_env()
-    subprocess.Popen(
-        ["gnome-terminal", "--window", "--title", title, "--",
-         "tmux", "attach-session", "-t", session],
-        env=env, start_new_session=True,
-    )
-    run_dev_dir = cfg.isaac_ros_dir / "src/isaac_ros_common"
-    tmux_command(
-        session,
-        f"export ISAAC_ROS_WS={shlex.quote(str(cfg.isaac_ros_dir))}; "
-        f"cd {shlex.quote(str(run_dev_dir))} && ./scripts/run_dev.sh",
-    )
+    with process_operation(cfg):
+        env = jetson_desktop_env()
+        subprocess.run(["tmux", "new-session", "-d", "-s", session], check=True, timeout=5)
+        subprocess.Popen(
+            ["gnome-terminal", "--window", "--title", title, "--",
+             "tmux", "attach-session", "-t", session],
+            env=env, start_new_session=True,
+        )
+        run_dev_dir = cfg.isaac_ros_dir / "src/isaac_ros_common"
+        tmux_command(
+            session,
+            f"export ISAAC_ROS_WS={shlex.quote(str(cfg.isaac_ros_dir))}; "
+            f"cd {shlex.quote(str(run_dev_dir))} && ./scripts/run_dev.sh",
+        )
 
 
 def stop_visible_isaac_sessions() -> None:
@@ -1110,13 +1208,15 @@ def stop_rviz_session() -> None:
         )
 
 
+@serialized_startup
 def start_rviz_session(cfg: Config) -> None:
-    stop_rviz_session()
+    with process_operation(cfg):
+        stop_rviz_session()
     print("- Opening Terminal 2: Isaac ROS RViz (run_dev.sh → start_rviz.sh)...")
     start_visible_isaac_session(cfg, ISAAC_TMUX_RVIZ, "Isaac ROS RViz")
     time.sleep(3.0)
-    tmux_command(
-        ISAAC_TMUX_RVIZ,
+    startup_tmux_command(
+        cfg, ISAAC_TMUX_RVIZ,
         "cd ${ISAAC_ROS_WS}/src/isaac_ros_common && ./scripts/start_rviz.sh; exit",
     )
 
@@ -1132,6 +1232,7 @@ def camera_mode_label(cfg: Config) -> str:
 
 
 def require_camera_ready(cfg: Config, started_only: bool = False) -> None:
+    check_startup_current(cfg)
     mode = selected_camera_mode(cfg)
     command = (
         "source ${ISAAC_ROS_WS}/src/isaac_ros_common/scripts/vo_environment.sh && "
@@ -1147,6 +1248,7 @@ def require_camera_ready(cfg: Config, started_only: bool = False) -> None:
             ["docker", "exec", "-u", "admin", ISAAC_CONTAINER, "bash", "-lc", command],
             capture_output=True, text=True, timeout=20,
         )
+        check_startup_current(cfg)
         if not result.returncode:
             print(f"- {result.stdout.strip()}")
             return
@@ -1170,7 +1272,7 @@ def require_no_publishers_for_camera_restart(cfg: Config) -> None:
             "No camera restart was performed.")
 
 
-@serialized_process_operation
+@serialized_startup
 def cmd_vio(cfg: Config, defer_health: bool = False) -> None:
     require_current_cli()
     print(f"- Selected camera mode: {camera_mode_label(cfg)}")
@@ -1189,10 +1291,13 @@ def cmd_vio(cfg: Config, defer_health: bool = False) -> None:
                     cfg, raw_topic, "existing cuVSLAM body odometry", 6.0,
                     message_type="nav_msgs/msg/Odometry",
                 )
+        except (StartupCancelled, ProcessOperationBusy):
+            raise
         except RuntimeError:
             require_no_publishers_for_camera_restart(cfg)
             print("Existing Isaac VIO session is not healthy; restarting it...", flush=True)
         else:
+            check_startup_current(cfg)
             if not defer_health:
                 require_camera_ready(cfg)
             print("- Existing cuVSLAM session reused; health will be checked during spoofing."
@@ -1211,24 +1316,27 @@ def cmd_vio(cfg: Config, defer_health: bool = False) -> None:
     start_visible_isaac_session(cfg, ISAAC_TMUX_VIO, "Isaac ROS VIO")
     deadline = time.monotonic() + 2700.0
     while not isaac_container_running():
+        check_startup_current(cfg)
         recent = tmux_recent_output(ISAAC_TMUX_VIO)
         if (
             "Error response from daemon: No such container" in recent
             or "Container isaac_ros_dev-aarch64-container is not running" in recent
         ):
-            stop_visible_isaac_sessions()
+            with process_operation(cfg):
+                stop_visible_isaac_sessions()
             raise RuntimeError(
                 "Isaac run_dev.sh failed while attaching to a stale container. "
                 "The stale session was cleaned up; start the path again."
             )
         if time.monotonic() >= deadline:
-            stop_visible_isaac_sessions()
+            with process_operation(cfg):
+                stop_visible_isaac_sessions()
             raise RuntimeError("Isaac container did not start within 45 minutes")
         time.sleep(1.0)
     # The keystrokes remain queued until run_dev.sh presents the admin shell.
     time.sleep(2.0)
-    tmux_command(
-        ISAAC_TMUX_VIO,
+    startup_tmux_command(
+        cfg, ISAAC_TMUX_VIO,
         "cd ${ISAAC_ROS_WS} && "
         "source src/isaac_ros_common/scripts/vo_environment.sh && "
         "if [[ -f src/isaac_ros_common/isaac_ros_visual_slam/isaac_ros_visual_slam/package.xml ]]; then "
@@ -1252,6 +1360,7 @@ def cmd_vio(cfg: Config, defer_health: bool = False) -> None:
     try:
         odom_deadline = time.monotonic() + 2700.0
         while True:
+            check_startup_current(cfg)
             try:
                 if defer_health:
                     require_camera_ready(cfg, started_only=True)
@@ -1261,7 +1370,10 @@ def cmd_vio(cfg: Config, defer_health: bool = False) -> None:
                         message_type="nav_msgs/msg/Odometry",
                     )
                 break
+            except (StartupCancelled, ProcessOperationBusy):
+                raise
             except RuntimeError as exc:
+                check_startup_current(cfg)
                 recent = tmux_recent_output(ISAAC_TMUX_VIO, lines=120)
                 launch_stopped = (
                     "process has finished cleanly" in recent
@@ -1280,6 +1392,7 @@ def cmd_vio(cfg: Config, defer_health: bool = False) -> None:
                     raise RuntimeError(
                         f"No body odometry arrived on {raw_topic} within 45 minutes"
                     ) from exc
+        check_startup_current(cfg)
         if not defer_health:
             require_camera_ready(cfg)
         if cfg.rviz_enabled:
@@ -1289,7 +1402,12 @@ def cmd_vio(cfg: Config, defer_health: bool = False) -> None:
             print("- RViz auto-launch is OFF; continuing without RViz.")
         if not defer_health:
             print("- cuVSLAM is publishing vehicle-body odometry directly (drone_link).")
+    except (StartupCancelled, ProcessOperationBusy):
+        # Stop all owns teardown. An old startup must never kill or relaunch
+        # sessions after its cancellation, including a subsequent new launch.
+        raise
     except Exception as exc:
+        check_startup_current(cfg)
         # Capture evidence before closing the auto-removed container/terminal.
         recent = tmux_recent_output(ISAAC_TMUX_VIO, lines=200)
         log_note = ""
@@ -1300,7 +1418,8 @@ def cmd_vio(cfg: Config, defer_health: bool = False) -> None:
             log_note = f"\nCamera startup log: {failure_log}"
         except OSError:
             pass  # Do not hide the actual startup error if storage is full.
-        stop_visible_isaac_sessions()
+        with process_operation(cfg):
+            stop_visible_isaac_sessions()
         tail = "\n".join(recent.splitlines()[-30:])
         raise RuntimeError(f"{exc}{log_note}\nRecent camera output:\n{tail}") from exc
     print("- Camera started; health validation will run during spoofing. Keep the drone stationary."
@@ -1332,9 +1451,9 @@ def stop_failed_spoof(cfg: Config, reason: str, *,
     print("- GPS bridge and cuVSLAM/RViz sessions stopped. Start Path A again to retry.", flush=True)
 
 
-@serialized_process_operation
+@serialized_startup
 def start_gps_bridge(cfg: Config) -> dict:
-    """Keep preflight, status cleanup and publisher registration one transaction."""
+    """Own startup across preflight; lock only state mutations, not readiness."""
     require_current_cli()
     if find_proc(cfg, "gps-bridge"):
         raise RuntimeError("gps-bridge already running. Stop it first.")
@@ -1430,10 +1549,12 @@ def start_gps_bridge(cfg: Config) -> dict:
         f" {param_args}"
     )
     navigation_status = cfg.state_dir / "navigation-status.json"
-    navigation_status.unlink(missing_ok=True)
+    with process_operation(cfg):
+        navigation_status.unlink(missing_ok=True)
     return start_managed(cfg, "gps-bridge", cmd, startup_check_s=6.0)
 
 
+@serialized_startup
 def cmd_gps(cfg: Config) -> None:
     proc = start_gps_bridge(cfg)
     navigation_status = cfg.state_dir / "navigation-status.json"
@@ -1447,6 +1568,7 @@ def cmd_gps(cfg: Config) -> None:
 
     saw_spoof = False
     while True:
+        check_startup_current(cfg)
         if not managed_leader_alive(proc):
             stop_managed(cfg, "gps-bridge", expected_proc=proc)
             raise RuntimeError("GPS bridge stopped during the spoof sequence")
@@ -1649,6 +1771,7 @@ def watch_navigation_status(cfg: Config) -> None:
             return
 
 
+@serialized_startup
 def cmd_run(
     cfg: Config,
     path_arg: str,
@@ -1702,6 +1825,12 @@ def cmd_logs(cfg: Config, name: str, lines: int = 40, full: bool = False) -> Non
 
 @serialized_process_operation
 def cmd_stop(cfg: Config, name: Optional[str] = None) -> None:
+    # Keep invalid ownership state fail-closed, before changing anything.
+    read_state(cfg)
+    if name in (None, "cuvslam", "gps-bridge"):
+        # Invalidate the starter's token without allocating disk space. Stop
+        # must still be possible when logging has exhausted the filesystem.
+        (cfg.state_dir / "startup-generation.json").unlink(missing_ok=True)
     stopped = stop_managed(cfg, name)
     if name is None:
         stop_visible_isaac_sessions()
@@ -1874,7 +2003,7 @@ def configure_heading(cfg: Config) -> Config:
         print("PX4 reference uncertainty is retained at startup/recovery; it does not reset to 1 degree.")
         prompts = ("Minimum heading uncertainty deg (1 sigma, 0.1..90)",
                    "Heading output rate Hz (30..50)",
-                   "Maximum camera sample age s (0.02..0.2)",
+                   "Maximum camera sample age s (0.02..0.5)",
                    "Startup heading readback tolerance deg (>0..20)")
         output_values = tuple(prompt_line(label, str(value))
                               for label, value in zip(prompts, output_values))
@@ -1883,7 +2012,7 @@ def configure_heading(cfg: Config) -> Config:
         noise, rate, age, tolerance = tuple(float(x) for x in output_values)
         if not math.isfinite(manual_heading):
             raise ValueError("manual heading must be finite")
-        if not (.1 <= noise <= 90 and 30 <= rate <= 50 and .02 <= age <= .2
+        if not (.1 <= noise <= 90 and 30 <= rate <= 50 and .02 <= age <= .5
                 and 0 < tolerance <= 20):
             raise ValueError("heading output values outside displayed bounds")
         cfg = replace(
@@ -1980,7 +2109,7 @@ def configure_pose_gate(cfg: Config) -> Config:
              cfg.gate_max_yaw_rate_deg_s, float, 0.0),
         )),
         ("Timing", (
-            ("capture_age", "Maximum camera capture age s (0.02..0.2, GPS and yaw)",
+            ("capture_age", "Maximum camera capture age s (0.02..0.5, GPS and yaw)",
              cfg.external_yaw_max_age_s, float, 0.0),
             ("gap", "Maximum tracking gap s", cfg.gate_max_gap_s, float, 0.0),
         )),
@@ -2027,8 +2156,8 @@ def configure_pose_gate(cfg: Config) -> Config:
                 if value <= minimum:
                     raise ValueError(f"{label} must be greater than {minimum:g}")
                 values[key] = value
-        if not .02 <= values["capture_age"] <= .2:
-            raise ValueError("Camera capture age must be 0.02..0.2 s")
+        if not .02 <= values["capture_age"] <= .5:
+            raise ValueError("Camera capture age must be 0.02..0.5 s")
     except ValueError as exc:
         print(f"Invalid gate configuration: {exc}")
         pause()

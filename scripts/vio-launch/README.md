@@ -23,6 +23,24 @@ children remain tracked and receive a bounded TERM/KILL shutdown. A failed
 ownership check or failed shutdown retains state and blocks replacement;
 the camera is not stopped underneath an unverified live GPS publisher.
 
+Startup has a separate ownership lock: only one launcher can start the
+pipeline, but it does not hold the process-state lock while waiting for Docker,
+camera readiness, or the RC switch. **Stop all** from another CLI cancels that
+pending startup and stops its processes. A delayed successful readiness check
+cannot restart the camera or bridge afterward. Reopen/start deliberately to
+try again; cancellation needs no new log or state-file allocation.
+
+Managed bridge stdout/stderr logs rotate **during** a run, including after
+**Leave CLI**. Each process keeps at most 5 MiB in `name.log` and 5 MiB in
+`name.log.1` under `~/.local/state/vio-launch/logs/`; older output is discarded.
+Previously oversized files for that process are trimmed on its next launch.
+An I/O failure after launch disables disk logging but continues draining output
+so it does not block navigation. ROS/Docker logs outside this directory have
+their own retention policies and are not covered by this limit.
+The detached log supervisor inherits no terminal or SSH output pipes. Leaving
+the CLI returns to the shell while the managed bridge and bounded logging
+continue. Bridge stdout/stderr remains in the log, not the detached terminal.
+
 Interactive companion CLI (inspired by `theseus-packages`) for VIO ↔ PX4.
 
 **On Jetson (AnyDesk):** run `vio-launch` with no args → a numbered menu pops up.
@@ -78,6 +96,11 @@ enabling it; the CLI does not change PX4 parameters for you.
 Camera capture-age protection (default 0.2 s), timestamp/frame/quaternion checks,
 and full quarantine recovery also apply with heading output **off**. The shared
 age limit is available in **Pose-jump gate limits** as well as heading settings.
+The selectable range is 0.02–0.5 s; a saved 0.5 s override applies to both GPS
+and heading after restarting Path A. It permits older measurements, does not
+reduce actual latency, and never replaces capture timestamps with send time.
+It does not clear accumulated position/heading uncertainty. Pose-jump checks,
+FCU-telemetry freshness limits, and full recovery checks are unchanged.
 Blackout recovery uses FCU movement from the last trusted camera capture, not
 from the later returning frame. GPS-only operation now services TIMESYNC for
 this matching too; no optional-yaw PX4 parameters are required for GPS-only use.

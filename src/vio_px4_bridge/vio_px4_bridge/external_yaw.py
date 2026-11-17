@@ -135,8 +135,8 @@ class FcuPose:
 class NavigationTiming:
     """Capture validation and matched FCU history, independent of yaw output."""
     def __init__(self, max_age_s=.2):
-        if not math.isfinite(max_age_s) or not .02 <= max_age_s <= .2:
-            raise ValueError("Camera capture age must be 0.02..0.2 s")
+        if not math.isfinite(max_age_s) or not .02 <= max_age_s <= .5:
+            raise ValueError("Camera capture age must be 0.02..0.5 s")
         self.max_age_s = max_age_s
         self.clock = ClockSync()
         self.history = deque(maxlen=100)
