@@ -32,16 +32,16 @@ ${ISAAC_ROS_WS}/src/isaac_ros_common/scripts/.isaac_ros_common-config
 It creates timestamped backups before replacing existing files. The Git copies
 under `bootstrap/jetson-config/isaac_ros_overrides/` remain authoritative.
 
-Both large runtime workspaces remain standalone siblings:
+The NVIDIA runtime workspace remains a standalone sibling:
 
 ```text
 ~/workspaces/isaac_ros-dev   # NVIDIA cuVSLAM/RealSense container workspace
-~/workspaces/mavros          # MAVROS source/build workspace for Path B
 ~/workspaces/VIO_PX4         # this project
 ```
 
-The full bootstrap creates and builds the first two; generated build trees and
-Docker images are intentionally not nested in this repository or committed.
+The full bootstrap creates the NVIDIA workspace and builds this project's
+bridge. Generated build trees and Docker images are intentionally not committed.
+MAVROS is no longer a dependency; existing installations are left untouched.
 
 The active launch is stereo-only VO, using the base-image camera driver with
 IMU fusion explicitly disabled. The experimental SDK 2.56.5 overlay is not

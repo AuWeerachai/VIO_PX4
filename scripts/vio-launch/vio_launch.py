@@ -78,7 +78,6 @@ class Config:
         default_factory=lambda: Path.home() / "workspaces/VIO_PX4_NEW_PIPELINE"
     )
     ros_setup: Path = field(default_factory=lambda: Path("/opt/ros/humble/setup.bash"))
-    mavros_dir: Path = field(default_factory=lambda: Path.home() / "workspaces/mavros")
     isaac_ros_dir: Path = field(
         default_factory=lambda: Path.home() / "workspaces/isaac_ros-dev"
     )
@@ -211,7 +210,6 @@ def save_config(cfg: Config) -> None:
         "rviz_enabled": cfg.rviz_enabled,
         "vio_px4_dir": str(cfg.vio_px4_dir),
         "ros_setup": str(cfg.ros_setup),
-        "mavros_dir": str(cfg.mavros_dir),
         "isaac_ros_dir": str(cfg.isaac_ros_dir),
     }
     atomic_write_json(path, payload)
@@ -279,7 +277,7 @@ def apply_dict(cfg: Config, data: dict) -> Config:
     ):
         if key in data and data[key] is not None:
             updates[key] = data[key]
-    for key in ("vio_px4_dir", "ros_setup", "mavros_dir", "isaac_ros_dir"):
+    for key in ("vio_px4_dir", "ros_setup", "isaac_ros_dir"):
         if key in data and data[key]:
             updates[key] = expand(str(data[key]))
     if str(updates.get("heading_source", "")).strip().lower() == "compass":
@@ -605,9 +603,7 @@ def normalize_path(value: str) -> str:
     v = value.lower()
     if v in {"a", "gps", "hil", "internship"}:
         return "a"
-    if v in {"b", "ev", "vision", "external-vision"}:
-        return "b"
-    raise RuntimeError(f"Unknown path '{value}'. Use a|gps or b|ev.")
+    raise RuntimeError(f"Unsupported path '{value}'. Only Path A (a|gps) is available.")
 
 
 def validate_mavlink_url(value: str) -> Optional[str]:
@@ -737,39 +733,6 @@ def ensure_isaac_container(cfg: Config, timeout_s: float = 600.0) -> None:
     )
 
 
-def ros_topic_names(cfg: Config) -> set[str]:
-    command = (
-        f"{ros_prefix(cfg, [cfg.vio_px4_dir / 'install/setup.bash'])} && "
-        "ros2 topic list --no-daemon"
-    )
-    try:
-        result = subprocess.run(
-            ["bash", "-lc", command],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("Timed out while checking ROS 2 topics") from exc
-    if result.returncode != 0:
-        raise RuntimeError(
-            "Could not query ROS 2 topics. Confirm ROS is running and start your "
-            "configured PX4↔ROS middleware before using Path B."
-        )
-    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
-
-
-def require_px4_ros_link(cfg: Config) -> None:
-    topics = ros_topic_names(cfg)
-    status_topic = "/fmu/out/vehicle_status"
-    if status_topic not in topics:
-        raise RuntimeError(
-            f"PX4 ROS 2 topic {status_topic} is not available. Start your configured "
-            "PX4↔ROS middleware, then retry Path B."
-        )
-    require_ros_message(cfg, status_topic, "PX4 status", timeout_s=5.0)
-
-
 def require_ros_message(
     cfg: Config,
     topic: str,
@@ -809,35 +772,12 @@ def require_ros_message(
     )
 
 
-def require_mavros_connected(cfg: Config, timeout_s: float = 10.0) -> None:
-    mavros_setup = cfg.mavros_dir / "install/setup.bash"
-    command = (
-        f"{ros_prefix(cfg, [mavros_setup])} && "
-        "ros2 topic echo --no-daemon --once /mavros/state"
-    )
-    try:
-        result = subprocess.run(
-            ["bash", "-lc", command], capture_output=True, text=True,
-            timeout=timeout_s,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("MAVROS did not publish state before timeout") from exc
-    if result.returncode != 0 or "connected: true" not in result.stdout.lower():
-        raise RuntimeError("MAVROS is running but is not connected to the Cube")
-
-
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
 
 def cmd_doctor(cfg: Config) -> int:
-    mavros_workspace_setup = cfg.mavros_dir / "install/setup.bash"
-    mavros_check = subprocess.run(
-        ["bash", "-lc", f"{ros_prefix(cfg, [mavros_workspace_setup])} && ros2 pkg prefix mavros"],
-        capture_output=True,
-        text=True,
-    )
     url_error = validate_mavlink_url(cfg.mavlink_url)
     checks = [
         ("MAVLink configuration", url_error is None, url_error or cfg.mavlink_url),
@@ -846,12 +786,6 @@ def cmd_doctor(cfg: Config) -> int:
             "VIO_PX4 install",
             (cfg.vio_px4_dir / "install/setup.bash").exists(),
             str(cfg.vio_px4_dir),
-        ),
-        (
-            "MAVROS install (Path B)",
-            mavros_check.returncode == 0,
-            (mavros_check.stdout.strip() if mavros_check.returncode == 0
-             else "not found in ROS or workspace overlay"),
         ),
         (
             "Isaac ROS workspace",
@@ -906,59 +840,8 @@ def cmd_status(cfg: Config) -> None:
             latest_state = max(states, key=lambda item: item[0])
             if latest_state[0] >= 0:
                 phase = latest_state[1]
-        elif p.get("name") == "ev-bridge":
-            phase = "MAVROS external-vision relay running"
         print(f"  {p['name']}  {phase}  pid={p['pid']}  since={p['startedAt']}")
         print(f"    log: {p['logFile']}")
-
-
-def cmd_ev_bridge(cfg: Config) -> None:
-    require_current_cli()
-    if find_proc(cfg, "gps-bridge"):
-        raise RuntimeError("Path A is already running. Stop it before starting Path B.")
-    require_camera_ready(cfg)
-    setup = cfg.vio_px4_dir / "install/setup.bash"
-    if not setup.exists():
-        raise RuntimeError(f"Missing {setup} — build vio_px4_bridge first")
-    print(f"Checking live VIO odometry on {cfg.odom_topic}...", flush=True)
-    require_ros_message(cfg, cfg.odom_topic, "VIO odometry", timeout_s=5.0)
-    print("VIO odometry ready.")
-    if not find_proc(cfg, "mavros"):
-        mavros_setup = cfg.mavros_dir / "install/setup.bash"
-        mavros_check = subprocess.run(
-            ["bash", "-lc", f"{ros_prefix(cfg, [mavros_setup])} && ros2 pkg prefix mavros"],
-            capture_output=True,
-            text=True,
-        )
-        if mavros_check.returncode != 0:
-            raise RuntimeError(
-                "MAVROS is not installed. Run bootstrap/bootstrap_jetson.sh --install-deps"
-            )
-        if not cfg.mavlink_url.startswith("/dev/"):
-            raise RuntimeError("Path B currently requires the Jetson serial link")
-        serial_device, _, baud = cfg.mavlink_url.rpartition(":")
-        holders = serial_users(Path(serial_device))
-        if holders:
-            raise RuntimeError(
-                f"{serial_device} is already open by pid(s) {holders}; stop Path A "
-                "or the old MAVROS launcher first"
-            )
-        mavros_cmd = (
-            f"{ros_prefix(cfg, [mavros_setup])} && ros2 launch mavros px4.launch "
-            f"fcu_url:=serial://{serial_device}:{baud}"
-        )
-        mavros_proc = start_managed(cfg, "mavros", mavros_cmd, startup_check_s=3.0)
-        print(f"Started MAVROS pid={mavros_proc['pid']}; waiting for FCU connection...")
-        require_mavros_connected(cfg, timeout_s=10.0)
-    cmd = (
-        f"{ros_prefix(cfg, [setup])} && ros2 run vio_px4_bridge mavros_ev_bridge --ros-args"
-        f" -p {shlex.quote(f'odom_topic:={cfg.odom_topic}')}"
-        " -p expected_child_frame:=drone_link"
-        " -p output_parent_frame:=odom"
-    )
-    proc = start_managed(cfg, "ev-bridge", cmd)
-    print(f"Started EV bridge pid={proc['pid']}")
-    print(f"log: {proc['logFile']}")
 
 
 ISAAC_TMUX_VIO = "vio-launch-isaac-vio"
@@ -1153,6 +1036,7 @@ def require_camera_ready(cfg: Config, started_only: bool = False) -> None:
 
 
 def require_no_publishers_for_camera_restart(cfg: Config) -> None:
+    # Retain the guard for a relay left running by an older deployment.
     active = [name for name in ("gps-bridge", "ev-bridge") if find_proc(cfg, name)]
     if active:
         raise RuntimeError(
@@ -1317,7 +1201,7 @@ def stop_failed_spoof(cfg: Config, reason: str) -> None:
 def cmd_gps(cfg: Config) -> None:
     require_current_cli()
     if find_proc(cfg, "ev-bridge") or find_proc(cfg, "mavros"):
-        raise RuntimeError("Path B/MAVROS is already running. Stop it before starting Path A.")
+        raise RuntimeError("A legacy EV/MAVROS process is already running. Stop it before starting Path A.")
     # This command is also callable directly, without cmd_run/cmd_vio.
     # Verify the opened device before starting any HIL_GPS publisher.
     require_camera_ready(cfg, started_only=True)
@@ -1343,7 +1227,7 @@ def cmd_gps(cfg: Config) -> None:
         if holders:
             raise RuntimeError(
                 f"{serial_device} is already open by pid(s) {holders}. Path A needs "
-                "exclusive serial access; stop MAVROS first."
+                "exclusive serial access; stop the process using that port first."
             )
     params = {
         "transport": "mavlink",
@@ -1422,7 +1306,7 @@ def cmd_gps(cfg: Config) -> None:
                 flush=True,
             )
         if saw_spoof and navigation == "live_vio":
-            print("- 15 s done. VIO takes over. See option 3) Status.", flush=True)
+            print("- 15 s done. VIO takes over. See option 2) Status.", flush=True)
             return
         if status.get("spoof_failure_reason") or (saw_spoof and navigation == "waiting_for_rc"):
             reason = status.get("spoof_failure_reason") or "no healthy heading-aligned VIO handoff"
@@ -1556,29 +1440,16 @@ def cmd_run(
     path_arg: str,
 ) -> None:
     require_current_cli()
-    which = normalize_path(path_arg)
-    label = "GPS spoof + VIO GPS" if which == "a" else "external vision"
-    print(f"Starting Path {which.upper()} ({label})...\n", flush=True)
+    normalize_path(path_arg)
+    print("Starting Path A (GPS spoof + VIO GPS)...\n", flush=True)
 
-    # Reject conflicting paths BEFORE touching the camera/session they depend on.
-    if which == "a" and (find_proc(cfg, "ev-bridge") or find_proc(cfg, "mavros")):
-        raise RuntimeError("Path B/MAVROS is already running. Stop it before starting Path A.")
-    if which == "b" and find_proc(cfg, "gps-bridge"):
-        raise RuntimeError("Path A is already running. Stop it before starting Path B.")
-    cmd_vio(cfg, defer_health=(which == "a"))
-
-    if which == "b":
-        if find_proc(cfg, "gps-bridge"):
-            raise RuntimeError("Path A is already running. Stop it before starting Path B.")
-        if not find_proc(cfg, "ev-bridge"):
-            cmd_ev_bridge(cfg)
-        print("\nPath B started (local EV → Cube).")
-    else:
-        if find_proc(cfg, "ev-bridge"):
-            raise RuntimeError("Path B is already running. Stop it before starting Path A.")
-        if not find_proc(cfg, "gps-bridge"):
-            cmd_gps(cfg)
-        # cmd_gps reports success only after receiving a PX4 heartbeat.
+    # Reject legacy publishers BEFORE touching the camera/session they depend on.
+    if find_proc(cfg, "ev-bridge") or find_proc(cfg, "mavros"):
+        raise RuntimeError("A legacy EV/MAVROS process is already running. Stop it before starting Path A.")
+    cmd_vio(cfg, defer_health=True)
+    if not find_proc(cfg, "gps-bridge"):
+        cmd_gps(cfg)
+    # cmd_gps reports success only after receiving a PX4 heartbeat.
 
 
 def cmd_logs(cfg: Config, name: str, lines: int = 40, full: bool = False) -> None:
@@ -1840,7 +1711,7 @@ def configure_camera_extrinsic(cfg: Config) -> Config:
         f"xyz=({entered[0]:+g}, {entered[1]:+g}, {entered[2]:+g}) m, "
         f"rpy=({entered[3]:+g}, {entered[4]:+g}, {entered[5]:+g})°."
     )
-    print("The new extrinsic takes effect the next time Path A or Path B starts cuVSLAM.")
+    print("The new extrinsic takes effect the next time Path A starts cuVSLAM.")
     pause()
     return cfg
 
@@ -1972,10 +1843,10 @@ def toggle_rviz(cfg: Config) -> Config:
 
 def pick_log(cfg: Config) -> None:
     ensure_dirs(cfg)
-    # Only show logs that exist for components used by the hardware paths.
+    # Only show logs that exist for components used by the current path.
     names = [
         name
-        for name in ("gps-bridge", "ev-bridge")
+        for name in ("gps-bridge",)
         if (cfg.log_dir / f"{name}.log").is_file()
     ]
     if not names:
@@ -2011,10 +1882,6 @@ def interactive_main(cfg: Config) -> int:
                 MenuItem(
                     "Path A — GPS spoof → live VIO (global)",
                     "run-a",
-                ),
-                MenuItem(
-                    "Path B — External vision (local)",
-                    "run-b",
                 ),
                 MenuItem("Status", "nav-status"),
                 MenuItem("", "h2", disabled=True),
@@ -2091,10 +1958,6 @@ def interactive_main(cfg: Config) -> int:
                 _clear()
                 cmd_run(cfg, "a")
                 pause()
-            elif choice == "run-b":
-                _clear()
-                cmd_run(cfg, "b")
-                pause()
             elif choice == "link":
                 cfg = configure_link(cfg)
             elif choice == "home":
@@ -2137,12 +2000,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = p.add_subparsers(dest="command")
     sub.add_parser("tui", help="Open interactive menu (default)")
-    sub.add_parser("ev-bridge")
     sub.add_parser("vio")
     sub.add_parser("gps")
 
     run_p = sub.add_parser("run")
-    run_p.add_argument("path")
+    run_p.add_argument("path", type=str.lower, choices=("a", "gps", "hil", "internship"))
 
     return p
 
@@ -2160,9 +2022,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return interactive_main(cfg)
 
     try:
-        if args.command == "ev-bridge":
-            cmd_ev_bridge(cfg)
-        elif args.command == "vio":
+        if args.command == "vio":
             cmd_vio(cfg)
         elif args.command == "gps":
             cmd_gps(cfg)

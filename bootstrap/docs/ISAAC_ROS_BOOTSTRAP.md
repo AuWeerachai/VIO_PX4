@@ -71,14 +71,12 @@ The bootstrap performs these operations in order:
    IMU fusion is explicitly disabled; no experimental IMU overlay is built or loaded.
 9. Preserves configurable body-to-camera extrinsics and bridge recovery checks.
 10. Checks that IMU fusion is disabled and body odometry is healthy before live GPS
-    output. Path A performs validation during its stationary spoof; Path B
-    checks before starting. An existing IMU-enabled session must be fully stopped.
+    output. Path A performs validation during its stationary spoof.
+    An existing IMU-enabled session must be fully stopped.
 
-`bootstrap_jetson.sh` also reconstructs the standalone
-`~/workspaces/mavros` workspace at the pinned commit recorded in
-`bootstrap/jetson-config/mavros_release.env`, applies the proven Jetson patch, and builds it.
-MAVROS remains a sibling dependency rather than being nested in VIO_PX4. It is
-used by Path B; Path A talks MAVLink directly and does not start MAVROS.
+`bootstrap_jetson.sh` builds the GPS bridge without a MAVROS workspace or
+packages. Path A talks MAVLink directly. Existing MAVROS installations are not
+removed, but must not run on the FC serial link used by Path A.
 
 The first `./vio-launch` invocation asks `run_dev.sh` to build/pull the large
 Isaac ROS image. Docker caches unchanged layers, so subsequent launches should

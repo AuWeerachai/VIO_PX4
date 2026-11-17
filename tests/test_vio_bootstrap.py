@@ -103,12 +103,12 @@ def test_update_while_menu_is_waiting_is_detected_before_dispatch():
     run.assert_not_called()
 
 
-@pytest.mark.parametrize('path,active', [('a', 'ev-bridge'), ('a', 'mavros'), ('b', 'gps-bridge')])
-def test_conflicting_path_is_rejected_before_touching_camera(path, active):
+@pytest.mark.parametrize('active', ['ev-bridge', 'mavros'])
+def test_legacy_publisher_is_rejected_before_touching_camera(active):
     with patch.object(cli, 'find_proc', side_effect=lambda cfg, name: {'pid': 123} if name == active else None), \
          patch.object(cli, 'cmd_vio') as camera:
         with pytest.raises(RuntimeError, match='already running'):
-            cli.cmd_run(cli.Config(), path)
+            cli.cmd_run(cli.Config(), 'a')
     camera.assert_not_called()
 
 
@@ -128,14 +128,13 @@ def test_camera_is_not_restarted_under_active_gps(existing_session):
     stop.assert_not_called()
 
 
-@pytest.mark.parametrize('command', ['cmd_gps', 'cmd_ev_bridge'])
-def test_direct_bridge_commands_cannot_bypass_camera_identity(command):
+def test_direct_gps_command_cannot_bypass_camera_identity():
     with patch.object(cli, 'find_proc', return_value=None), \
          patch.object(cli, 'require_camera_ready', side_effect=RuntimeError('Wrong VIO camera')), \
          patch.object(cli, 'start_managed') as start, \
          patch.object(cli, 'serial_users') as port_check:
         with pytest.raises(RuntimeError, match='Wrong VIO camera'):
-            getattr(cli, command)(cli.Config(camera_serial='333422300181'))
+            cli.cmd_gps(cli.Config(camera_serial='333422300181'))
     start.assert_not_called()
     port_check.assert_not_called()
 
@@ -252,15 +251,77 @@ def test_readiness_runs_as_camera_user_and_propagates_failure(tmp_path):
     assert 'vo --timeout 12' in run.call_args.args[0][-1]
 
 
-def test_path_a_defers_health_but_path_b_does_not(tmp_path):
+def test_path_a_defers_health_until_spoof_without_changing_launch_order(tmp_path):
     cfg = cli.Config(isaac_ros_dir=tmp_path)
-    with patch.object(cli, 'cmd_vio') as camera, \
+    events = []
+    with patch.object(cli, 'cmd_vio', side_effect=lambda *a, **kw: events.append('camera')) as camera, \
          patch.object(cli, 'find_proc', return_value=None), \
-         patch.object(cli, 'cmd_gps'), patch.object(cli, 'cmd_ev_bridge'):
+         patch.object(cli, 'cmd_gps', side_effect=lambda *a: events.append('gps')) as gps:
         cli.cmd_run(cfg, 'a')
-        camera.assert_called_with(cfg, defer_health=True)
-        cli.cmd_run(cfg, 'b')
-        camera.assert_called_with(cfg, defer_health=False)
+        camera.assert_called_once_with(cfg, defer_health=True)
+        gps.assert_called_once_with(cfg)
+    assert events == ['camera', 'gps']
+
+
+@pytest.mark.parametrize('path', ['b', 'B', 'ev', 'vision', 'external-vision'])
+def test_removed_path_is_rejected_without_starting_camera_or_gps(path):
+    with patch.object(cli, 'cmd_vio') as camera, patch.object(cli, 'cmd_gps') as gps:
+        with pytest.raises(RuntimeError, match='Only Path A'):
+            cli.cmd_run(cli.Config(), path)
+    camera.assert_not_called()
+    gps.assert_not_called()
+
+
+@pytest.mark.parametrize('args', [['ev-bridge'], ['run', 'b'], ['run', 'ev']])
+def test_parser_rejects_removed_commands_before_loading_config(args):
+    with patch.object(cli, 'load_config') as load_config:
+        with pytest.raises(SystemExit) as stopped:
+            cli.main(args)
+    assert stopped.value.code == 2
+    load_config.assert_not_called()
+
+
+@pytest.mark.parametrize('path', ['a', 'gps', 'hil', 'internship', 'A', 'GPS'])
+def test_gps_aliases_still_work(path):
+    args = cli.build_parser().parse_args(['run', path])
+    assert cli.normalize_path(args.path) == 'a'
+
+
+def test_menu_has_only_path_a_and_status_is_option_two():
+    with patch.object(cli, 'select_menu', return_value='detach') as menu, \
+         patch.object(cli, '_clear'):
+        assert cli.interactive_main(cli.Config()) == 0
+    choices = [item.value for item in menu.call_args.args[1] if not item.disabled]
+    assert choices[:2] == ['run-a', 'nav-status']
+    assert 'run-b' not in choices
+
+
+def test_obsolete_mavros_config_is_ignored_without_losing_camera_settings(tmp_path):
+    data = dict(mavros_dir='/old/mavros', camera_serial='333422300181',
+                camera_pitch_deg=30.5, camera_yaw_deg=180., home_alt=200.)
+    cfg = cli.apply_dict(cli.Config(), data)
+    assert not hasattr(cfg, 'mavros_dir')
+    with patch.object(cli, 'user_config_path', return_value=tmp_path/'config.json'):
+        cli.save_config(cfg)
+        saved = cli.load_saved_overrides()
+    assert 'mavros_dir' not in saved
+    assert all(saved[key] == value for key, value in data.items() if key != 'mavros_dir')
+
+
+def test_package_and_bootstrap_no_longer_install_path_b():
+    import runpy
+    import xml.etree.ElementTree as ET
+    package = ROOT/'src/vio_px4_bridge'
+    assert not (package/'vio_px4_bridge/mavros_ev_bridge.py').exists()
+    dependencies = ET.parse(package/'package.xml').getroot()
+    assert not any('mavros' in (child.text or '') for child in dependencies)
+    with patch('setuptools.setup') as setup:
+        runpy.run_path(str(package/'setup.py'))
+    assert setup.call_args.kwargs['entry_points']['console_scripts'] == [
+        'vio_px4_gps_bridge = vio_px4_bridge.vio_px4_gps_bridge:main']
+    assert 'mavros' not in (ROOT/'bootstrap/bootstrap_jetson.sh').read_text().lower()
+    assert not (ROOT/'bootstrap/jetson-config/mavros_release.env').exists()
+    assert not (ROOT/'bootstrap/jetson-config/mavros_overrides/proven_jetson.patch').exists()
 
 
 def test_failed_spoof_stops_gps_before_camera_and_preserves_evidence(tmp_path):

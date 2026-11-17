@@ -1,15 +1,13 @@
 # VIO_PX4 Bridge (ROS 2 Humble)
 
-Two ways to feed the Cube+/PX4 EKF from Jetson VIO:
-
-1. **External vision** — cuVSLAM body odometry through MAVROS `ODOMETRY`
-2. **Internship-style GPS (new)** — boot GPS spoof, then VIO projected as GPS via `HIL_GPS`
+Path A feeds the Cube+/PX4 EKF from Jetson VIO: boot GPS spoof, then VIO
+projected as GPS via `HIL_GPS`. The former external-vision Path B is removed.
 
 The internship ArduPilot stack uses MAVLink `GPS_INPUT`. Stock PX4 does **not** fuse that the same way. PX4’s supported inject path is **`HIL_GPS`** with **`MAV_USEHILGPS=1`** (source sysid must match the vehicle, usually `1`).
 
 ## Fresh Jetson setup
 
-The repository contains the VIO bridges, operator launcher, and project-owned
+The repository contains the VIO-as-GPS bridge, operator launcher, and project-owned
 Isaac ROS launch overrides. For a Jetson that does not yet have Isaac ROS,
 provision the compatible NVIDIA base and this project together:
 
@@ -37,18 +35,18 @@ creates backups of existing Isaac launch scripts, installs the versioned
 overrides, builds `vio_px4_bridge`, and creates both `~/vio-launch` and
 `~/.local/bin/vio-launch`.
 
-The deployment keeps NVIDIA Isaac ROS and MAVROS as standalone sibling
-workspaces rather than vendoring their generated build trees:
+The deployment keeps NVIDIA Isaac ROS as a standalone sibling workspace
+rather than vendoring its generated build tree:
 
 ```text
 ~/workspaces/isaac_ros-dev
-~/workspaces/mavros
 ~/workspaces/VIO_PX4
 ```
 
-The full bootstrap creates both dependency workspaces at the pinned, proven
-revisions. Path A uses `isaac_ros-dev` but owns MAVLink directly; Path B uses
-both `isaac_ros-dev` and MAVROS.
+The full bootstrap creates `isaac_ros-dev` at the pinned revisions. Path A
+owns MAVLink directly; no MAVROS workspace or packages are installed. Existing
+MAVROS installations are left untouched, but must not own the FC serial port
+while Path A runs.
 
 See `bootstrap/jetson-config/README.md` for the installed paths. Generated ROS build trees,
 logs, bags, credentials, and Docker images are intentionally not stored in Git.
@@ -71,24 +69,7 @@ Run the repository-root entry point; its implementation is versioned under
 
 See `scripts/vio-launch/README.md`.
 
-## 1) External vision through MAVROS
-
-```bash
-vio-launch run b
-```
-
-PX4 params (EV):
-- Start **without EV yaw fusion** until the deployed cuVSLAM frames and mounting
-  transform have been verified. Do not blindly use `EKF2_EV_CTRL = 15`.
-- `EKF2_HGT_REF = Vision`
-
-Path B starts MAVROS on `/dev/ttyUSB0:921600`, then relays validated body-frame
-cuVSLAM odometry to `/mavros/odometry/out`. Micro XRCE-DDS and `px4_msgs` are not
-part of the Jetson deployment. The relay rejects raw `camera_link` poses; use
-the installed `bootstrap/jetson-config/isaac_ros_overrides/scripts/start_vio.sh` so cuVSLAM
-publishes `child_frame_id=drone_link` directly.
-
-## 2) Internship-style GPS spoof + live VIO GPS (recommended for GPS path)
+## Path A: GPS spoof + live VIO GPS
 
 Same *pattern* as vns-sdk `GpsSpoof` → `BasaltGpsBridge`:
 

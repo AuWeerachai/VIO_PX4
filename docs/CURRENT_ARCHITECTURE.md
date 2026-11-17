@@ -67,25 +67,15 @@ accuracy starts at PX4's accumulated horizontal uncertainty and tightens back
 to 0.1 m. All numeric limits are configured in
 `vio-launch`.
 
-## Path B: external vision through MAVROS
-
-```text
-body-frame cuVSLAM odometry
-  -> validated frame relay
-  -> /mavros/odometry/out
-  -> MAVROS ODOMETRY
-  -> PX4 EKF2 external-vision fusion
-```
-
-Path A directly owns the FC serial port. Path B gives that port to MAVROS. They
-are mutually exclusive. Micro XRCE-DDS, SITL, fake odometry, and
-`test_fmu_vio` are not part of this hardware pipeline.
+Path A directly and exclusively owns the FC serial port. The former MAVROS
+external-vision Path B has been removed. Micro XRCE-DDS, SITL, fake odometry,
+and `test_fmu_vio` are not part of this hardware pipeline.
 
 ## Reproducibility boundary
 
 This Git repository owns:
 
-- both PX4 bridge paths;
+- the PX4 HIL_GPS bridge;
 - the numbered operator CLI;
 - camera/body launch overrides;
 - Jetson bootstrap and dependency checks;

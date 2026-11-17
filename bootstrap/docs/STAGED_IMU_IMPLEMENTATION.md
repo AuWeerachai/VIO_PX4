@@ -32,7 +32,7 @@ IMU implementation and bench checks, not the current launch sequence.
    saving `camera-spoof-failure.log`. Start Path A again to retry. The 15-second
    deadline is not extended by bad samples. Keep the vehicle stationary and on
    the ground until live handoff. This is not flight certification.
-9. Path B and the standalone `vio` command retain their strict readiness probe
+9. The standalone `vio` command retains its strict readiness probe
    before reporting success. VO fallback does not require IMU samples, but does
    require the actual camera fusion mode to match and healthy body odometry.
 

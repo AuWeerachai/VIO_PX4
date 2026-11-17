@@ -13,10 +13,10 @@ publishers before replacing camera/bridge files. Reopen the CLI after the update
 An already-open updated launcher detects changes to its own source and refuses
 new launches or settings saves; Leave and Stop remain available. Older launchers
 without this guard must be closed explicitly during their first upgrade.
-Direct `gps` and `ev-bridge` commands also verify camera identity. The CLI does
+The direct `gps` command also verifies camera identity. The CLI does
 not automatically restart the camera underneath a running navigation publisher;
-stop the pipeline deliberately first. Conflicting paths are rejected before
-the camera/session is touched.
+stop the pipeline deliberately first. Leftover EV/MAVROS publishers from older
+deployments are rejected before the camera/session is touched.
 
 Interactive companion CLI (inspired by `theseus-packages`) for VIO ↔ PX4.
 
@@ -38,7 +38,7 @@ quarantine/recovery fixes remain in use.
 Path A checks recent body odometry during its 15-second stationary spoof,
 along with fusion mode, heading alignment and pose-gate health. Startup glitches
 can recover; failed validation stops GPS and then cuVSLAM/RViz. Keep the drone
-stationary until live handoff. Path B keeps its pre-launch readiness check.
+stationary until live handoff.
 Fully stop the old camera session and reopen the CLI before restarting.
 Old IMU selection files do not re-enable fusion; a mismatched running session
 or a shell with the experimental IMU overlay still sourced is rejected.
@@ -47,7 +47,7 @@ The archived IMU tools/cache are not needed for VO and are not deleted.
 | Item | What it does |
 |------|----------------|
 | **Path A — GPS spoof → live** | Internship-style global GPS (`HIL_GPS`) |
-| **Path B — External vision** | Body VIO → MAVROS → Cube (`ODOMETRY`) |
+| **Status (option 2)** | Live GPS navigation and recovery status |
 | **FC link** | Pick direct UART/USB serial, UDP networking, or keep the current setting |
 | **Home latitude/longitude** | Horizontal spoof/origin position |
 | **Heading alignment** | Use PX4 estimated heading (default) or explicit manual true heading |
@@ -58,9 +58,9 @@ The archived IMU tools/cache are not needed for VO and are not deleted.
 | **Stop all processes** | Stop bridges, Isaac sessions, and the container |
 
 The CLI is hardware-only: it runs on the Jetson and talks to the real Cube.
-Path A uses MAVLink directly and exclusively owns `/dev/ttyUSB0`. Path B starts
-the installed MAVROS workspace on that serial link. The paths are mutually
-exclusive; Micro XRCE-DDS is not used.
+Path A uses MAVLink directly and exclusively owns `/dev/ttyUSB0`. MAVROS and
+Micro XRCE-DDS are not required. The former Path B launcher and relay have been
+removed; `run b` and `ev-bridge` are no longer supported.
 
 Settings persist in `~/.config/vio-launch/config.json`.
 
@@ -75,8 +75,8 @@ This does not certify north alignment or remove magnetic interference.
 Camera translation uses ROS FLU axes: +X forward, +Y left, and +Z up.
 Positive roll, pitch, and yaw follow the right-hand rule. In particular,
 positive pitch points a forward-facing camera downward. Gate changes apply the
-next time Path A starts; camera-extrinsic changes apply the next time either
-path starts cuVSLAM.
+next time Path A starts; camera-extrinsic changes apply the next time cuVSLAM
+starts.
 
 ## Units and pose-jump gate meanings
 
@@ -138,16 +138,14 @@ forward their escape sequences correctly.
 2. Run `./bootstrap/bootstrap_jetson.sh --install-deps` from the repository root.
 3. Run `~/vio-launch`.
 4. **FC link → UART** → pick your serial device / baud.
-5. **Path A** for internship-style GPS, or **Path B** for local EV.
+5. **Path A** for GPS spoof followed by live VIO-as-GPS.
 
 PX4 still needs `MAV_USEHILGPS=1` for Path A.
 
 Path A checks the serial device and waits for a PX4 MAVLink heartbeat, then
 waits for RC channel 6 LOW/MID→HIGH before starting a 15-second home spoof.
-Live VIO takes over when ready. Both paths require body-frame cuVSLAM odometry
-with `child_frame_id=drone_link`; raw `camera_link` poses are rejected. Path B
-waits for VIO, starts MAVROS, waits for the Cube connection, then starts its
-validated odometry relay.
+Live VIO takes over when ready. Path A requires body-frame cuVSLAM odometry
+with `child_frame_id=drone_link`; raw `camera_link` poses are rejected.
 
 ## Direct launch commands (optional)
 
@@ -155,5 +153,5 @@ Direct commands still work:
 
 ```bash
 ./vio-launch run a
-./vio-launch run b
+./vio-launch gps
 ```

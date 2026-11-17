@@ -8,12 +8,13 @@ firmware because message handling and estimator requirements can change.
 
 - [ ] Cube and Jetson share a working MAVLink/UART link; the selected `/dev/tty*`
   exists and is readable/writable by the user.
-- [ ] A PX4 heartbeat is received before either bridge reports success.
+- [ ] A PX4 heartbeat is received before the GPS bridge reports success.
 - [ ] The configured home latitude, longitude and MSL altitude are intentional.
 - [ ] cuVSLAM publishes fresh `nav_msgs/Odometry` at the configured topic.
 - [ ] The odometry `frame_id`, `child_frame_id`, twist frame, and camera-to-body
   mounting convention have been verified on the actual Jetson.
-- [ ] Only one of Path A (GPS) and Path B (external vision) is active.
+- [ ] Path A exclusively owns the FC serial port; no leftover EV/MAVROS publisher
+  from an older deployment is running.
 - [ ] Identify the physical Here and injected VIO instances from live PX4 data.
   Do not infer instance numbers from connector names or startup order.
 - [ ] PX4 estimator status and innovations are observed before arming.
@@ -219,32 +220,15 @@ firmware because message handling and estimator requirements can change.
 - [ ] Connect cuVSLAM's explicit tracking/reset event as the primary re-anchor
   trigger; timestamp-derived physical rate checks remain the fallback.
 
-## Path B: MAVROS ODOMETRY contract
-
-- [ ] MAVROS exclusively owns `/dev/ttyUSB0:921600` and `/mavros/state` reports
-  `connected: true` before the EV relay starts.
-- [ ] Micro XRCE-DDS and `px4_msgs` are not required or started for Path B.
-- [ ] Publish at 30-50 Hz when practical; PX4 documentation warns that low-rate
-  external vision may not be fused.
-- [ ] `EKF2_EV_CTRL` enables only intended position, height, velocity and yaw
-  fields. Do not fuse EV yaw until the VIO frame has been aligned deliberately.
-- [ ] cuVSLAM publishes `child_frame_id=drone_link`; the relay rejects
-  `camera_link` so camera pose cannot be mistaken for vehicle-body pose.
-- [ ] Position, orientation, velocity, covariance and timestamps use consistent
-  PX4 frames and time domain.
-- [ ] Configure `EKF2_EV_DELAY` and `EKF2_EV_POS_X/Y/Z` for measured latency and
-  camera lever arm.
-
 ## Acceptance checks before propellers
 
-- [ ] PX4 `listener sensor_gps` (Path A) or MAVLink `ODOMETRY` inspection
-  (Path B) shows the intended rate, frame, values and no dropouts.
+- [ ] PX4 `listener sensor_gps` shows the intended rate and values with no dropouts.
 - [ ] Move the vehicle north/east/up by a known direction and verify signs and
   scale independently of PX4's fused output.
 - [ ] Point the vehicle along independently known north/east headings and verify
   aligned VIO displacement/velocity; do not validate PX4 using only data that
   originated from PX4.
-- [ ] Confirm EKF GNSS/EV checks pass and inspect position, velocity, height and
+- [ ] Confirm EKF GNSS checks pass and inspect position, velocity, height and
   magnetometer innovation test ratios.
 - [ ] Disconnect VIO and the serial link separately and confirm the expected PX4
   aiding-loss/failsafe behavior while disarmed.
