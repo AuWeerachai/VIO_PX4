@@ -64,6 +64,18 @@ removed; `run b` and `ev-bridge` are no longer supported.
 
 Settings persist in `~/.config/vio-launch/config.json`.
 
+The CLI verifies all seven copied camera/runtime files against its
+`camera_release.json` before starting or reusing the camera, querying identity,
+or starting RViz. Missing or different files block startup instead of mixing
+releases. `git pull` and a bridge build alone do not update the copies inside
+`isaac_ros-dev`. Stop the pipeline before deployment and synchronize the
+project-owned overrides using `bootstrap/bootstrap_jetson.sh`; then run
+`python3 bootstrap/verify_camera_deployment.py` and reopen the CLI.
+Camera, RViz and readiness probes use the same environment: the customized
+cuVSLAM package plus the matched base-image RealSense driver/messages. The
+experimental IMU overlays and other workspace driver copies are not loaded.
+This camera compatibility setup does not change GPS navigation or send EV yaw.
+
 Old `heading_source=compass` settings automatically migrate to `px4` when loaded
 (persisted on the next settings save). The bridge also accepts `compass` as a
 deprecated alias for `px4`, with a warning. No bridge declination is added to

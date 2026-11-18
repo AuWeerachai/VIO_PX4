@@ -22,6 +22,18 @@ def load(name, path):
 cli = load('vio_launch_bootstrap_test', ROOT/'scripts/vio-launch/vio_launch.py')
 fixes = load('vio_imu_fixes_test', SCRIPTS/'apply_vio_imu_fixes.py')
 selection = load('vio_camera_selection_test', SCRIPTS/'camera_selection.py')
+environment = load('vo_environment_test', SCRIPTS/'check_vo_environment.py')
+
+
+@pytest.fixture(autouse=True)
+def isolate_installed_camera_helpers(request):
+    # Launcher unit tests mock the external installation. The deployment tests
+    # below exercise the real hash guard against complete/mixed installations.
+    if request.node.name.startswith('test_camera_deployment_'):
+        yield
+    else:
+        with patch.object(cli, 'require_camera_deployment'):
+            yield
 
 
 def test_camera_identity_rejects_wrong_serial_and_wrong_model():
@@ -388,6 +400,9 @@ def test_vo_shell_launch_preserves_extrinsics_and_ignores_old_mode_file(tmp_path
     (common/'scripts').mkdir(parents=True)
     (common/'scripts/vio_imu_mode').write_text('vio\n')
     shutil.copy(SCRIPTS/'camera_selection.py', common/'scripts/camera_selection.py')
+    # This argument test mocks ROS; environment checks are tested separately.
+    (common/'scripts/vo_environment.sh').write_text('true\n')
+    (common/'scripts/check_vo_environment.py').write_text('pass\n')
     base = workspace/'share/isaac_ros_realsense/config/realsense_stereo.yaml'
     base.parent.mkdir(parents=True)
     base.write_text('enable_infra1: true\nenable_infra2: true\nenable_gyro: false\n')

@@ -984,13 +984,14 @@ def stop_rviz_session() -> None:
 
 
 def start_rviz_session(cfg: Config) -> None:
+    require_camera_deployment(cfg)
     stop_rviz_session()
     print("- Opening Terminal 2: Isaac ROS RViz (run_dev.sh → start_rviz.sh)...")
     start_visible_isaac_session(cfg, ISAAC_TMUX_RVIZ, "Isaac ROS RViz")
     time.sleep(3.0)
     tmux_command(
         ISAAC_TMUX_RVIZ,
-        "source ${ISAAC_ROS_WS}/install/setup.bash && "
+        "source ${ISAAC_ROS_WS}/src/isaac_ros_common/scripts/vo_environment.sh && "
         "cd ${ISAAC_ROS_WS}/src/isaac_ros_common && ./scripts/start_rviz.sh; exit",
     )
 
@@ -1005,10 +1006,33 @@ def camera_mode_label(cfg: Config) -> str:
     return "VIO (stereo + IMU)" if mode == "vio" else "VO (stereo only)"
 
 
+def require_camera_deployment(cfg: Config) -> None:
+    """Fail before opening hardware when copied camera helpers are mismatched."""
+    manifest_path = _CLI_FILE.with_name("camera_release.json")
+    try:
+        expected = json.loads(manifest_path.read_text())
+        if not isinstance(expected, dict) or not expected:
+            raise ValueError("empty or invalid camera release manifest")
+        scripts = cfg.isaac_ros_dir / "src/isaac_ros_common/scripts"
+        for name, digest in expected.items():
+            if (Path(name).name != name or not isinstance(digest, str)
+                    or len(digest) != 64):
+                raise ValueError("invalid camera release manifest entry")
+            deployed = scripts / name
+            if hashlib.sha256(deployed.read_bytes()).hexdigest() != digest:
+                raise ValueError(f"camera helper differs from this release: {deployed}")
+    except (OSError, ValueError, TypeError) as exc:
+        raise RuntimeError(
+            f"Camera deployment mismatch: {exc}. Stop the pipeline, synchronize "
+            "the project-owned Isaac scripts with this release, then reopen "
+            "~/vio-launch. No camera start or identity request was made.") from exc
+
+
 def require_camera_ready(cfg: Config, started_only: bool = False) -> None:
+    require_camera_deployment(cfg)
     mode = selected_camera_mode(cfg)
     command = (
-        "source /opt/ros/humble/setup.bash && "
+        "source ${ISAAC_ROS_WS}/src/isaac_ros_common/scripts/vo_environment.sh && "
         "python3 ${ISAAC_ROS_WS}/src/isaac_ros_common/scripts/check_camera_ready.py "
         # Each probe creates a new ROS participant. Identity-service discovery
         # needs the same budget even when only checking startup, not data health.
@@ -1051,6 +1075,7 @@ def cmd_vio(cfg: Config, defer_health: bool = False) -> None:
     if not isinstance(cfg.camera_serial, str) or not cfg.camera_serial.isascii() or not cfg.camera_serial.isdecimal():
         raise RuntimeError('Set the rear D456 SDK serial in Camera extrinsic settings first. Automatic camera selection is disabled.')
     print(f"- Selected camera: rear D456, serial {cfg.camera_serial}")
+    require_camera_deployment(cfg)
     if not shutil.which("tmux") or not shutil.which("gnome-terminal"):
         raise RuntimeError("tmux and gnome-terminal are required for visible Isaac sessions")
     raw_topic = "/visual_slam/tracking/odometry"
@@ -1108,8 +1133,7 @@ def cmd_vio(cfg: Config, defer_health: bool = False) -> None:
         "echo '=== Incremental build: isaac_ros_visual_slam ==='; "
         "colcon build --packages-select isaac_ros_visual_slam || exit $?; "
         "else echo '=== Using installed isaac_ros_visual_slam package ==='; fi; "
-        "if [[ -f ${ISAAC_ROS_WS}/install/setup.bash ]]; then "
-        "source ${ISAAC_ROS_WS}/install/setup.bash; fi && "
+        "source ${ISAAC_ROS_WS}/src/isaac_ros_common/scripts/vo_environment.sh && "
         "echo \"=== Using: $(ros2 pkg prefix isaac_ros_visual_slam) ===\" && "
         "cd ${ISAAC_ROS_WS}/src/isaac_ros_common && "
         f"VIO_MODE={selected_camera_mode(cfg)} "

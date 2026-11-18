@@ -32,6 +32,9 @@ fi
 
 # Use the driver's SDK serial, not the USB ASIC serial. Never pick the first
 # available camera: the front/arm camera has a different mounting transform.
+source ./scripts/vo_environment.sh
+python3 ./scripts/check_vo_environment.py
+
 camera_config="$(mktemp /tmp/vio-realsense-XXXXXX.yaml)"
 trap 'rm -f -- "$camera_config"' EXIT
 realsense_prefix="$(ros2 pkg prefix isaac_ros_realsense)"

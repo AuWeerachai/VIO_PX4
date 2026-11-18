@@ -26,11 +26,21 @@ ${ISAAC_ROS_WS}/src/isaac_ros_common/scripts/start_vio.sh
 ${ISAAC_ROS_WS}/src/isaac_ros_common/scripts/start_rviz.sh
 ${ISAAC_ROS_WS}/src/isaac_ros_common/scripts/camera_selection.py
 ${ISAAC_ROS_WS}/src/isaac_ros_common/scripts/check_camera_ready.py
+${ISAAC_ROS_WS}/src/isaac_ros_common/scripts/vo_environment.sh
+${ISAAC_ROS_WS}/src/isaac_ros_common/scripts/check_vo_environment.py
 ${ISAAC_ROS_WS}/src/isaac_ros_common/scripts/.isaac_ros_common-config
 ```
 
 It creates timestamped backups before replacing existing files. The Git copies
 under `bootstrap/jetson-config/isaac_ros_overrides/` remain authoritative.
+
+All seven camera runtime files are covered by
+`scripts/vio-launch/camera_release.json`. Bootstrap verifies source, manifest
+and installed copies; the CLI blocks startup on a mismatch. Updating Git or
+rebuilding the bridge alone is not a complete deployment. Stop the pipeline,
+install the matching overrides, verify the deployment, and reopen the CLI.
+The shared environment loads only the customized cuVSLAM package over the
+base ROS installation, avoiding mixed RealSense driver/message versions.
 
 The NVIDIA runtime workspace remains a standalone sibling:
 

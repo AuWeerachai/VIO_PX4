@@ -76,7 +76,7 @@ install_override \
 install_override \
   "$SCRIPT_DIR/jetson-config/isaac_ros_overrides/scripts/start_rviz.sh" \
   "$ISAAC_SCRIPTS/start_rviz.sh"
-for helper in check_camera_ready.py camera_selection.py; do
+for helper in check_camera_ready.py camera_selection.py vo_environment.sh check_vo_environment.py; do
   install_override "$SCRIPT_DIR/jetson-config/isaac_ros_overrides/scripts/$helper" "$ISAAC_SCRIPTS/$helper"
 done
 install_override "$SCRIPT_DIR/jetson-config/isaac_ros_overrides/scripts/vio-imu-mode" "$HOME/vio-imu-mode"
@@ -87,6 +87,9 @@ fi
 install -m 0644 \
   "$SCRIPT_DIR/jetson-config/isaac_ros_overrides/.isaac_ros_common-config" \
   "$ISAAC_SCRIPTS/.isaac_ros_common-config"
+
+# Compare every installed camera helper against the release used by the CLI.
+python3 "$SCRIPT_DIR/verify_camera_deployment.py" --repo "$REPO_DIR" --isaac-ws "$ISAAC_WS"
 
 realsense_patch="$SCRIPT_DIR/jetson-config/isaac_ros_overrides/docker/Dockerfile.realsense.patch"
 if grep -q 'ros-humble-isaac-ros-visual-slam' "$ISAAC_COMMON/docker/Dockerfile.realsense"; then
