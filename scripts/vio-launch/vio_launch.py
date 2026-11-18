@@ -91,6 +91,8 @@ class Config:
     odom_topic: str = "/visual_slam/tracking/odometry"
     heading_source: str = "px4"
     manual_heading_deg: float = 0.0
+    send_vo_heading: bool = False
+    heading_std_deg: float = 1.0
     mag_declination_source: str = "table"
     mag_declination_deg: float = 0.0
     child_to_body_yaw_deg: float = 0.0
@@ -182,6 +184,8 @@ def save_config(cfg: Config) -> None:
         "odom_topic": cfg.odom_topic,
         "heading_source": cfg.heading_source,
         "manual_heading_deg": cfg.manual_heading_deg,
+        "send_vo_heading": cfg.send_vo_heading,
+        "heading_std_deg": cfg.heading_std_deg,
         "mag_declination_source": cfg.mag_declination_source,
         "mag_declination_deg": cfg.mag_declination_deg,
         "child_to_body_yaw_deg": cfg.child_to_body_yaw_deg,
@@ -246,6 +250,8 @@ def apply_dict(cfg: Config, data: dict) -> Config:
         "odom_topic",
         "heading_source",
         "manual_heading_deg",
+        "send_vo_heading",
+        "heading_std_deg",
         "mag_declination_source",
         "mag_declination_deg",
         "child_to_body_yaw_deg",
@@ -1277,10 +1283,12 @@ def cmd_gps(cfg: Config) -> None:
         "rc_low_pwm_max": 1300,
         "rc_high_pwm_min": 1700,
         "rc_request_rate_hz": 10.0,
-        "rate_hz": 10.0,
+        "rate_hz": 30.0,
         "odom_topic": cfg.odom_topic,
         "heading_source": cfg.heading_source,
         "manual_heading_deg": cfg.manual_heading_deg,
+        "send_vo_heading": "true" if cfg.send_vo_heading else "false",
+        "heading_std_deg": cfg.heading_std_deg,
         "mag_declination_source": cfg.mag_declination_source,
         "mag_declination_deg": cfg.mag_declination_deg,
         "child_to_body_yaw_deg": cfg.child_to_body_yaw_deg,
@@ -1379,6 +1387,16 @@ def show_navigation_status(cfg: Config) -> None:
     print(f"- Connection status: {connection}")
     print(f"- VIO status: {vio_status}")
     print(f"- Pose-jump gate status: {gate_status}")
+    if status.get("vo_heading_enabled"):
+        heading_on = status.get("vo_heading_active", False)
+        heading = status.get("vo_heading_deg")
+        std = status.get("vo_heading_std_deg")
+        sample_age = status.get("vo_heading_age_s")
+        detail = "not sent yet" if heading is None else (
+            f"last sent {heading:.1f}° | std {std:.2f}° | age {sample_age*1000:.0f} ms")
+        print(f"- VO heading: {'ON' if heading_on else 'OFF'} | {detail}")
+        if not heading_on:
+            print(f"- Heading paused: {status.get('vo_heading_reason') or 'waiting'}")
     if navigation in ("spoof_active", "waiting_for_rc"):
         print(f"- Spoof health check: {status.get('handoff_check_reason') or 'healthy'}")
     if status.get("spoof_failure_reason"):
@@ -1646,7 +1664,15 @@ def configure_heading(cfg: Config) -> Config:
     print("The bridge does not add declination or calculate compass heading again.")
     print("Verify PX4 heading first; keep the drone stationary during spoofing.")
     print("Alignment stays fixed in normal tracking; recovery uses current PX4 heading.\n")
-    source = prompt_line("Source (px4/manual)", cfg.heading_source)
+    enabled = prompt_line("Send VO heading to PX4 (on/off)", "on" if cfg.send_vo_heading else "off")
+    if enabled is None:
+        return cfg
+    enabled = enabled.strip().lower()
+    if enabled not in ("on", "off"):
+        print("Use on or off.")
+        pause()
+        return cfg
+    source = prompt_line("Initial heading reference (px4/manual)", cfg.heading_source)
     if source is None:
         return cfg
     source = (source or cfg.heading_source).strip().lower()
@@ -1654,21 +1680,31 @@ def configure_heading(cfg: Config) -> Config:
         print("Invalid source; use px4 or manual.")
         pause()
         return cfg
-    mounting = prompt_line(
-        "cuVSLAM child-to-body yaw", str(cfg.child_to_body_yaw_deg)
-    )
     manual = str(cfg.manual_heading_deg)
     if source == "manual":
         manual = prompt_line("Body true heading at alignment (deg clockwise from north)", manual)
+    std = str(cfg.heading_std_deg)
+    if enabled == "on":
+        print("Both HIL_GPS and heading output run at 30 Hz.")
+        print("Heading uses drone_link; configure camera mounting only under extrinsics.")
+        print("Std is assumed 1-sigma heading uncertainty, not a guaranteed error limit.")
+        print("Recovery may increase it to reflect PX4 uncertainty.")
+        std = prompt_line("Heading standard deviation (deg, 0.1..90)", std)
+    if manual is None or std is None:
+        return cfg
     try:
-        values = tuple(float(x) for x in (mounting, manual))
+        values = tuple(float(x) for x in (manual, std))
         if not all(math.isfinite(x) for x in values):
             raise ValueError("angles must be finite")
+        if not .1 <= values[1] <= 90:
+            raise ValueError("heading std must be 0.1..90 degrees")
         cfg = replace(
             cfg,
             heading_source=source,
-            child_to_body_yaw_deg=values[0],
-            manual_heading_deg=values[1],
+            send_vo_heading=enabled == "on",
+            heading_std_deg=values[1],
+            manual_heading_deg=values[0],
+            child_to_body_yaw_deg=0.0,
         )
     except (TypeError, ValueError) as exc:
         print(f"Invalid heading configuration: {exc}")
@@ -1921,10 +1957,11 @@ def interactive_main(cfg: Config) -> int:
                     f"{cfg.home_lat}, {cfg.home_lon}",
                 ),
                 MenuItem(
-                    "Heading alignment",
+                    "Heading alignment / VO heading",
                     "heading",
                     f"{heading_label(cfg)}; "
-                    f"child→body={cfg.child_to_body_yaw_deg}°",
+                    f"VO output={'ON' if cfg.send_vo_heading else 'OFF'}; "
+                    f"std={cfg.heading_std_deg:g}°",
                 ),
                 MenuItem(
                     "Camera extrinsic (ROS FLU XYZ/RPY)",

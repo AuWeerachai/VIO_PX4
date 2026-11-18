@@ -34,7 +34,8 @@ firmware because message handling and estimator requirements can change.
   rejects non-HIL `HIL_GPS` from a different system ID.
 - [ ] `EKF2_GPS_CTRL=1`: fuse longitude/latitude only, matching vns-sdk.
   Altitude remains on the configured height source, velocity is not fused, and
-  heading remains on the compass.
+  heading remains on PX4's configured source unless the optional yaw-only EV
+  experiment below is explicitly enabled.
 - [ ] `EKF2_HGT_REF=2` selects rangefinder, or `0` selects barometer. Path A
   checks this setting and `EKF2_GPS_CTRL=1` at startup; it does not change them.
   Keep the chosen sensor enabled and healthy. Do not enable GPS height fusion
@@ -57,7 +58,8 @@ firmware because message handling and estimator requirements can change.
   Verify mission readiness while disarmed; a sensor fault remains a PX4 fault,
   not something the bridge should hide. Never change origin altitude during
   a flight; review any mission using absolute AMSL altitudes after changing it.
-- [ ] Send at 10 Hz without long gaps. PX4 timestamps receipt locally.
+- [ ] This retry branch sends HIL_GPS at 30 Hz without long gaps (stable baseline
+  used 10 Hz). PX4 timestamps receipt locally.
 - [ ] `fix_type=3`, synthetic satellites=40, speed accuracy
   below `EKF2_REQ_SACC`, and EPH/EPV below their configured gates.
 - [ ] Set `EKF2_GPS_P_NOISE=0.1 m` to match the bridge's healthy horizontal
@@ -81,6 +83,46 @@ firmware because message handling and estimator requirements can change.
 - [ ] Confirm `VIO_GPS_OUTPUT_STOPPED` and `VIO_GPS_OUTPUT_RESUMED` transitions
   in the bridge log and corresponding `VIO GPS:` messages in QGroundControl
   during a propeller-off VIO disconnect/recovery test.
+
+## Optional heading-fusion retry
+
+Applies only when the operator explicitly enables `send_vo_heading` on
+`heading-fusion-retry`. Keep the GPS-only stable release available. Do not change
+these settings during flight. The launcher does not set PX4 parameters itself.
+
+- [ ] `MAV_USEHILGPS=1`, `EKF2_GPS_CTRL=1` remain as above.
+- [ ] `EKF2_EV_CTRL=8`: yaw only, never EV horizontal position, height or velocity.
+- [ ] `EKF2_EV_NOISE_MD=0`: use the reported heading covariance.
+- [ ] `EKF2_EVA_NOISE` is in **radians**, and must be no greater than the chosen
+  heading std. For 1 degree std, `0.01745` rad is an appropriate matching floor.
+  The outgoing variance is `(std_deg*pi/180)^2` rad², not degrees squared.
+- [ ] Keep the verified magnetometer initialization strategy: `EKF2_MAG_TYPE=6`
+  (initialization only) for this setup. The experiment also accepts 5 (none) but
+  that requires a separately verified initial heading; do not change to it
+  simply to pass startup. Continuous magnetic fusion is rejected by the bridge.
+- [ ] Keep the chosen `EKF2_HGT_REF=0` or `2` and enabled vertical sensor unchanged.
+- [ ] Verify the initial PX4 heading while stationary. Heading output is from
+  `drone_link`; no second camera/child-to-body rotation is applied by the sender.
+- [ ] Startup is disarmed-only. Observe a live GPS handoff, then heading ON.
+  Clock warmup can postpone heading without quarantining or pausing GPS.
+- [ ] Both requested stream rates are 30 Hz. Check actual received rate,
+  `estimator_status_flags.cs_ev_yaw`, EV yaw innovations and time alignment.
+  The bridge's ON status means transmission, **not** confirmed PX4 fusion.
+- [ ] Ground test stationary operation and known left/right turns across 0/360°.
+  Record raw body VO, sent corrected heading and PX4 yaw against timestamps.
+  Smooth samples with approximately 0.3 s capture age must not start quarantine.
+- [ ] Induce a real position and a separate yaw jump. Both outputs must stop
+  during the existing full recovery checks; no single-sample shortcut is added.
+- [ ] Disconnect/restore the camera. Confirm timeout and existing gap recovery.
+  Heading clock failures must not change GPS anchors or position uncertainty.
+- [ ] Before returning to GPS-only, disable `send_vo_heading`, restore
+  `EKF2_EV_CTRL=0`, and restart the bridge while disarmed. Preserve the working
+  height, magnetometer, home, camera and physical-gate settings.
+
+References: [PX4 EV setup/rate/timing](https://docs.px4.io/main/en/ros/external_position_estimation),
+[MAVLink ODOMETRY](https://mavlink.io/en/messages/common.html#ODOMETRY).
+The local custom PX4 receiver accepts LOCAL_NED ODOMETRY and forwards its
+orientation covariance; verify this remains true when changing firmware.
 
 ## PX4-owned heading alignment
 

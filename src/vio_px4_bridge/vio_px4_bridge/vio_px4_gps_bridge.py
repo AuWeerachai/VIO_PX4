@@ -49,6 +49,7 @@ from vio_px4_bridge.recovery_yaw import RecoveryYawAgreement
 from vio_px4_bridge.recovery_yaw import timestamp_order
 from vio_px4_bridge.spoof_readiness import SpoofReadiness
 from vio_px4_bridge.startup_heading import Px4StartupHeading, heading_source
+from vio_px4_bridge.heading_output import HeadingOutput
 
 
 class Phase(Enum):
@@ -74,7 +75,7 @@ class VioPx4GpsBridge(Node):
         self.declare_parameter("mavlink_compid", 191)
         self.declare_parameter("heartbeat_timeout_s", 5.0)
         self.declare_parameter("ros2_gps_topic", "/fmu/in/sensor_gps")
-        self.declare_parameter("rate_hz", 10.0)
+        self.declare_parameter("rate_hz", 30.0)
         self.declare_parameter("status_file", "")
         self.declare_parameter("camera_imu_required", True)
 
@@ -125,6 +126,10 @@ class VioPx4GpsBridge(Node):
         # to ATTITUDE yaw: PX4 has already applied its heading corrections.
         self.declare_parameter("heading_source", "px4")  # px4 | manual
         self.declare_parameter("manual_heading_deg", 0.0)
+        # New opt-in name deliberately ignores the failed experiment's saved
+        # external_yaw_enabled setting. No extra navigation/quarantine gates.
+        self.declare_parameter("send_vo_heading", False)
+        self.declare_parameter("heading_std_deg", 1.0)
         # Legacy launch parameters accepted but no longer used for alignment.
         self.declare_parameter("mag_declination_source", "table")
         self.declare_parameter("mag_declination_deg", 0.0)
@@ -374,6 +379,15 @@ class VioPx4GpsBridge(Node):
         self._mav = None
         self._gps_pub = None
         self._hil_gps_extensions_supported = None
+        self.heading_output = None
+        if bool(self.get_parameter("send_vo_heading").value):
+            if (self.transport != "mavlink" or not self.odom_is_enu
+                    or self.expected_child_frame != "drone_link"
+                    or self.child_to_body_yaw_rad != 0.0):
+                raise ValueError("VO heading requires MAVLink and ENU drone_link odometry; "
+                                 "camera mounting must be handled only in cuVSLAM extrinsics")
+            self.heading_output = HeadingOutput(
+                float(self.get_parameter("heading_std_deg").value), self.vio_timeout_s)
         self._init_transport()
 
         qos = QoSProfile(
@@ -393,6 +407,9 @@ class VioPx4GpsBridge(Node):
         )
         self.create_timer(0.5, self._check_camera_fusion)
         self.create_timer(1.0 / self.rate_hz, self._tick)
+        if self.heading_output is not None:
+            self.create_timer(.005, self._heading_service)
+            self.create_timer(1.0 / HeadingOutput.RATE_HZ, self._heading_tick)
         if self.status_file:
             self.create_timer(0.5, self._write_status_file)
 
@@ -494,6 +511,10 @@ class VioPx4GpsBridge(Node):
                 else "PX4 selects physical GPS if healthy; otherwise dead reckoning/failsafe"
             ),
         }
+        aid = getattr(self, "heading_output", None)
+        if aid is not None:
+            payload.update(aid.status(now, self.phase == Phase.LIVE
+                                      and not self.continuity_recovering))
         target = Path(self.status_file).expanduser()
         temporary = target.with_suffix(target.suffix + ".tmp")
         try:
@@ -626,6 +647,9 @@ class VioPx4GpsBridge(Node):
                 "recovery (PX4 position/velocity variance and reset counter included)"
             )
             self.px4_target_compid = heartbeat.get_srcComponent()
+            if self.heading_output is not None:
+                self._validate_heading_configuration(heartbeat)
+                self._request_mavlink_stream(heartbeat, 111, 50.0)  # TIMESYNC
             if self.heading_source == "px4":
                 self.get_logger().info(
                     "Startup heading uses PX4 ATTITUDE yaw; no bridge compass/declination correction"
@@ -659,6 +683,62 @@ class VioPx4GpsBridge(Node):
             mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
             message_id, int(round(1_000_000.0 / rate_hz)), 0, 0, 0, 0, 0,
         )
+
+    def _validate_heading_configuration(self, heartbeat):
+        """Read only. Do not silently enable competing fusion sources."""
+        if self.px4_armed is not False:
+            raise RuntimeError("Start the heading experiment only while PX4 is DISARMED")
+        for name, allowed in (("EKF2_EV_CTRL", (8,)), ("EKF2_EV_NOISE_MD", (0,)),
+                              ("EKF2_MAG_TYPE", (5, 6))):
+            value = self._read_px4_param(heartbeat, name)
+            if value is None or int(round(value)) not in allowed:
+                raise RuntimeError(f"VO heading needs {name} in {allowed}; current={value}. "
+                                   "No PX4 parameters were changed.")
+        noise = self._read_px4_param(heartbeat, "EKF2_EVA_NOISE")
+        if (noise is None or not math.isfinite(noise) or noise < 0
+                or noise > math.sqrt(self.heading_output.variance) + 1e-6):
+            raise RuntimeError("EKF2_EVA_NOISE (radians) must not exceed the chosen heading std")
+        self.get_logger().warn(
+            "Experimental VO heading: 30 Hz, yaw-only EV. Initial heading std is "
+            "operator-configured, not a measured absolute accuracy. Recovery retains "
+            "PX4 uncertainty. Timing faults pause heading only; GPS gates are unchanged."
+        )
+
+    def _heading_service(self):
+        """Fast TIMESYNC replies without the failed experiment's pose watchdog."""
+        self._poll_mavlink()
+        request = self.heading_output.clock.request(time.monotonic())
+        if request is not None:
+            self._mav.mav.timesync_send(*request)
+
+    def _heading_tick(self):
+        aid = self.heading_output
+        now = time.monotonic()
+        reason = None
+        if self.phase != Phase.LIVE:
+            reason = "waiting_for_live_gps"
+        elif self.continuity_recovering:
+            reason = "continuity_quarantine"
+        elif not self.have_vio or self.last_vio_time is None or now-self.last_vio_time > self.vio_timeout_s:
+            reason = "vio_stale"
+        elif (self.last_px4_heartbeat_time is None
+              or now-self.last_px4_heartbeat_time > self.heartbeat_timeout_s):
+            reason = "px4_disconnected"
+        if reason:
+            aid.active, aid.block_reason = False, reason
+            return
+        # Read the accepted GPS uncertainty without advancing its recovery
+        # timer/state a second time from the heading publisher.
+        packet = aid.packet(now, self.latest_fix["eph"], self.latest_fix["epv"])
+        if packet is None:
+            return
+        try:
+            self._mav.mav.odometry_send(**packet)
+        except Exception as exc:
+            aid.active, aid.block_reason = False, "heading_send_failed"
+            self.get_logger().error(f"VO heading send failed: {exc}")
+            return
+        aid.mark_sent(now)
 
     def _read_px4_param(self, heartbeat, name: str) -> float | None:
         encoded = name.encode("ascii")
@@ -1080,6 +1160,9 @@ class VioPx4GpsBridge(Node):
         return local_delta, self.inertial_yaw_delta
 
     def _finish_inertial_propagation(self):
+        aid = getattr(self, "heading_output", None)
+        if aid is not None:
+            aid.recover(time.monotonic(), self.inertial_max_message_age_s)
         displacement = tuple(self.inertial_displacement_ned)
         elapsed = time.monotonic() - self.inertial_start_time
         variance = 0.0 if self.latest_px4_odometry is None else max(
@@ -1260,6 +1343,11 @@ class VioPx4GpsBridge(Node):
         return self.camera_readiness.reason(now)
 
     def _odom_callback(self, msg: Odometry):
+        aid = getattr(self, "heading_output", None)
+        if aid is not None:
+            # Any rejected callback must not leave an old heading eligible for
+            # transmission. Only the accepted-pose tail below fills it again.
+            aid.begin_sample()
         pos, orientation = msg.pose.pose.position, msg.pose.pose.orientation
         stamp = msg.header.stamp
         self.camera_readiness.observe_odom(
@@ -1439,6 +1527,14 @@ class VioPx4GpsBridge(Node):
         }
         self.have_vio = True
         self.last_vio_time = time.monotonic()
+        if aid is not None and self.heading_offset_rad is not None:
+            aid.store(
+                float(stamp.sec) + float(stamp.nanosec)*1e-9,
+                self.get_clock().now().nanoseconds*1e-9, self.last_vio_time,
+                (north, east, down),
+                (orientation.x, orientation.y, orientation.z, orientation.w),
+                wrap_pi(continuity.yaw + self.heading_offset_rad),
+            )
         if self.vio_stale_warned:
             self.get_logger().info("VIO odometry resumed; GPS updates resumed")
             self.vio_stale_warned = False
@@ -1560,6 +1656,13 @@ class VioPx4GpsBridge(Node):
             if (self.px4_target_sysid is not None
                     and int(msg.get_srcSystem()) != self.px4_target_sysid):
                 continue
+            aid = getattr(self, "heading_output", None)
+            if message_type == "TIMESYNC" and aid is not None:
+                if int(msg.get_srcComponent()) == self.px4_target_compid:
+                    reply = aid.clock.receive(msg.tc1, msg.ts1, now)
+                    if reply is not None:
+                        self._mav.mav.timesync_send(*reply)
+                continue
             if (
                 message_type == "HEARTBEAT"
                 and self.px4_target_sysid is not None
@@ -1598,6 +1701,12 @@ class VioPx4GpsBridge(Node):
                         self._reject_heading_recovery("invalid_px4_attitude_sample")
                 continue
             if message_type == "ODOMETRY":
+                if aid is not None:
+                    # A router may echo our new EV ODOMETRY. It must never be
+                    # mistaken for FCU recovery data or invalidate that data.
+                    if int(msg.get_srcComponent()) != self.px4_target_compid:
+                        continue
+                    aid.observe_covariance(msg, now)
                 sample_time = float(msg.time_usec) * 1e-6
                 north, east = float(msg.x), float(msg.y)
                 try:
@@ -1659,6 +1768,8 @@ class VioPx4GpsBridge(Node):
             self.anchor_ned = None
             self.heading_offset_rad = None
             self.startup_heading.reset()
+            if aid is not None:
+                aid.clear("waiting_for_live_gps")
             self.spoof_failure_reason = None
             self._last_handoff_reason = None
             self.phase = Phase.SPOOF

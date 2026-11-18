@@ -64,6 +64,46 @@ removed; `run b` and `ev-bridge` are no longer supported.
 
 Settings persist in `~/.config/vio-launch/config.json`.
 
+## Heading-fusion retry (experimental branch)
+
+This branch starts from GPS-only release `23b10a8`, not the failed heading
+integration. In **Heading alignment / VO heading**, explicitly switch VO heading
+ON. The only new tuning value is heading standard deviation in degrees (1 sigma,
+default 1 degree). The existing PX4/manual initial reference choice remains.
+Camera mounting is configured only in **Camera extrinsic**, not here.
+Old `external_yaw_enabled`, age, rate and tolerance settings are ignored; they
+cannot silently enable this experiment. New settings are `send_vo_heading` and
+`heading_std_deg`.
+
+The launcher sends HIL_GPS at 30 Hz and heading-only MAVLink ODOMETRY at 30 Hz.
+There is no rate prompt. Direct ROS users can still set the GPS `rate_hz`
+parameter; heading output is fixed at 30 Hz. Only distinct accepted camera poses
+are transmitted as heading observations, with their capture timestamps preserved.
+Actual rates can be lower if the camera, scheduler or connection cannot keep up.
+
+The stable position/yaw-jump gates, startup, and recovery algorithm are unchanged.
+A real position/yaw jump or an existing tracking timeout stops both aids. The
+failed experiment's 200-ms gate, extra heading-agreement startup gate, and
+time-matched recovery replacement are absent. Heading timestamp/clock faults
+pause heading output only; they cannot start navigation quarantine, change the
+position anchor, or increase GPS uncertainty. Heading age uses the existing
+`vio_timeout_s` (default 1 s), not a new CLI limit. PX4 may independently reject
+delayed EV measurements; sending packets is not evidence that they were fused.
+
+Heading starts after the normal GPS live handoff and MAVLink clock synchronization
+warmup. Warmup does not block GPS. During live tracking, heading is the corrected
+body VO yaw plus the frozen initial earth-heading offset. It is not continuously
+steered toward PX4. After a genuine quarantine, the existing recovery uses current
+PX4 heading; the heading transmitter inherits conservative PX4 uncertainty rather
+than claiming the operator's nominal std removes dead-reckoning error. Missing
+recovery covariance pauses heading only. Initial std is an operator assumption
+about a verified starting heading, not measured or guaranteed absolute accuracy.
+
+See [PX4 setup and verification](../../bootstrap/docs/PX4_INTERFACE_CHECKLIST.md#optional-heading-fusion-retry)
+before enabling. No PX4 parameters are changed automatically. This branch needs
+a disarmed hardware test before flight; local tests cannot establish EKF fusion
+or real-world heading accuracy.
+
 The CLI verifies all seven copied camera/runtime files against its
 `camera_release.json` before starting or reusing the camera, querying identity,
 or starting RViz. Missing or different files block startup instead of mixing

@@ -178,13 +178,48 @@ def test_heading_defaults_migrate_saved_compass_without_changing_extrinsics():
 def test_heading_menu_no_longer_prompts_for_bridge_declination():
     cfg = cli.Config()
     with patch.object(cli, '_clear'), patch.object(cli, 'pause'), \
-         patch.object(cli, 'prompt_line', side_effect=['px4', '0']) as prompt, \
+         patch.object(cli, 'prompt_line', side_effect=['off', 'px4']) as prompt, \
          patch.object(cli, 'save_config') as save:
         changed = cli.configure_heading(cfg)
     assert changed.heading_source == 'px4'
     assert prompt.call_count == 2
     assert all('declination' not in call.args[0].lower() for call in prompt.call_args_list)
     save.assert_called_once_with(changed)
+
+
+def test_heading_retry_has_only_std_as_new_tuning_prompt():
+    with patch.object(cli, '_clear'), patch.object(cli, 'pause'), \
+         patch.object(cli, 'prompt_line', side_effect=['on', 'px4', '1.5']) as prompt, \
+         patch.object(cli, 'save_config') as save:
+        changed = cli.configure_heading(cli.Config(child_to_body_yaw_deg=30))
+    assert changed.send_vo_heading
+    assert changed.heading_std_deg == 1.5
+    assert changed.child_to_body_yaw_deg == 0
+    labels = [call.args[0].lower() for call in prompt.call_args_list]
+    assert len(labels) == 3
+    assert not any(word in label for word in ('age', 'rate', 'tolerance', 'child') for label in labels)
+    save.assert_called_once_with(changed)
+
+
+@pytest.mark.parametrize('value', ['nan', '-1', '0', '91'])
+def test_heading_retry_rejects_invalid_std_without_saving(value):
+    cfg = cli.Config()
+    with patch.object(cli, '_clear'), patch.object(cli, 'pause'), \
+         patch.object(cli, 'prompt_line', side_effect=['on', 'px4', value]), \
+         patch.object(cli, 'save_config') as save:
+        assert cli.configure_heading(cfg) == cfg
+    save.assert_not_called()
+
+
+def test_heading_retry_old_experiment_flags_cannot_enable_output(tmp_path):
+    cfg = cli.apply_dict(cli.Config(), {'external_yaw_enabled': True,
+                                      'external_yaw_max_age_s': .2})
+    assert not cfg.send_vo_heading
+    cfg = cli.apply_dict(cfg, {'send_vo_heading': True, 'heading_std_deg': 1.5})
+    with patch.object(cli, 'user_config_path', return_value=tmp_path/'config.json'):
+        cli.save_config(cfg)
+        loaded = cli.load_config()
+    assert loaded.send_vo_heading and loaded.heading_std_deg == 1.5
 
 
 def test_default_and_explicit_modes(tmp_path):
