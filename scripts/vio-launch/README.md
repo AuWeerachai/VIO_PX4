@@ -115,6 +115,21 @@ samples confirm a new coordinate segment, followed by the configured stable
 sample window and fresh velocity/yaw-change agreement. The default maximum
 yaw rate is `360 deg/s`.
 
+Status shows **pose-jump episodes since Path A started**, plus the trigger for
+the latest episode and its measured value/configured limit. These are gate
+triggers, not proof that cuVSLAM actually reset: acceleration, speed, yaw rate,
+position/heading steps, tracking gaps, timestamps, and frame changes can trigger
+the gate. Consecutive rejected samples and repeated recovery-candidate resets
+count as one episode until the gate accepts the trajectory again. Startup
+disturbances are included and labelled `during startup`.
+
+The count and latest trigger survive recovery and RC activation; they reset
+only when a new GPS bridge process starts. Each episode is logged as
+`VIO_POSE_JUMP count=... reason=... stage=... epoch=... detail=...` in
+`~/.local/state/vio-launch/logs/gps-bridge.log`. Existing `VIO_CONTINUITY` lines
+include the episode number for following its recovery. This is diagnostic
+reporting only; no gate limit, GPS output, or recovery decision is changed.
+
 Recovery prefers PX4's dead-reckoned horizontal position change from the start
 of quarantine, anchored to the last trusted bridge position. It uses current
 FCU heading to orient the recovered camera segment. There is **no fixed

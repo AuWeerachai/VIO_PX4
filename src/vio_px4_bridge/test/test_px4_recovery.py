@@ -1,6 +1,8 @@
 """Exercise bridge recovery without ROS, serial hardware, or a running FCU."""
 import ast
+import json
 import math
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -46,7 +48,7 @@ def bridge():
              '_validated_recovery_target', '_reset_recovery_agreement',
              '_refresh_recovery_heading',
              '_poll_mavlink',
-             '_recovery_velocity_agrees', '_tick', '_odom_callback',
+             '_recovery_velocity_agrees', '_tick', '_odom_callback', '_record_pose_gate_result',
              '_recovery_yaw_agrees', '_finish_inertial_propagation', '_select_accuracy'}
     module = ast.Module(body=[n for n in cls.body if getattr(n, 'name', '') in names],
                         type_ignores=[])
@@ -107,6 +109,14 @@ def bridge():
     obj._set_live_output_state = Mock()
     obj._publish_fix = Mock()
     obj.continuity_recovering = True
+    # Use the real session initialization for diagnostic fields.
+    init = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == '__init__')
+    diagnostic_init = [n for n in init.body if isinstance(n, ast.Assign)
+                       and any(isinstance(t, ast.Attribute) and
+                               t.attr.startswith(('pose_jump_', 'last_pose_jump_'))
+                               for t in n.targets)]
+    exec(compile(ast.Module(body=diagnostic_init, type_ignores=[]), str(source), 'exec'),
+         {'self': obj})
     obj.last_vio_time = 10.0
     obj.have_vio = True
     obj.vio_timeout_s = .5
@@ -355,6 +365,156 @@ def vio_message(t, north, yaw=0., vn=0.):
         twist=SimpleNamespace(twist=twist))
 
 
+@pytest.mark.parametrize('reason', [
+    'speed_limit', 'acceleration_limit', 'yaw_rate_limit', 'position_jump',
+    'yaw_jump', 'tracking_gap', 'timestamp_regression', 'frame_changed',
+])
+def test_episode_counter_records_actual_gate_trigger_once(bridge, reason):
+    bridge.continuity = LocalPoseContinuity()
+    bridge.inertial_active = bridge.continuity_recovering = False
+    assert bridge.pose_jump_count == 0
+    assert bridge.last_pose_jump_reason is None
+    bridge._odom_callback(vio_message(10., 0.))
+    original_fix = dict(bridge.latest_fix)
+    t = 11.1 if reason == 'tracking_gap' else 10. if reason == 'timestamp_regression' else 10.05
+    msg = vio_message(t, 1. if reason == 'position_jump' else 0.,
+                      yaw=.5 if reason == 'yaw_jump' else 0.,
+                      vn=11. if reason == 'speed_limit' else 1. if reason == 'acceleration_limit' else 0.)
+    if reason == 'yaw_rate_limit':
+        msg.twist.twist.angular.z = -7.
+    if reason == 'frame_changed':
+        msg.header.frame_id = 'new_odom'
+    bridge.clock.now = t
+    bridge._odom_callback(msg)
+    assert bridge.continuity_recovering
+    assert bridge.pose_jump_count == 1
+    assert bridge.last_pose_jump_reason == reason
+    assert bridge.last_pose_jump_detail
+    assert bridge.last_pose_jump_stage == 'live'
+    assert bridge.latest_fix == original_fix
+    first_detail = bridge.last_pose_jump_detail
+    # Duplicate/rejected samples during the same outage must not inflate the
+    # counter or overwrite the trigger that initially caused the quarantine.
+    for _ in range(10):
+        bridge._odom_callback(msg)
+        bridge._tick()
+    assert bridge.pose_jump_count == 1
+    assert bridge.last_pose_jump_reason == reason
+    assert bridge.last_pose_jump_detail == first_detail
+    bridge._publish_fix.assert_not_called()
+    logs = [str(c) for c in bridge.get_logger().warn.call_args_list if 'VIO_POSE_JUMP ' in str(c)]
+    assert len(logs) == 1
+    assert f'count=1 reason={reason} stage=live' in logs[0]
+
+
+def test_episode_counter_groups_restarted_recovery_candidates(bridge):
+    result = SimpleNamespace(recovering=True, reason='acceleration_limit',
+                             detail='acceleration_m_s2=60.283 limit_m_s2=60.000',
+                             epoch=0, event='quarantine_started')
+    bridge._record_pose_gate_result(result)
+    for event in ['candidate_window_restarted', 'reset_confirmed', None, 'quarantine_started']:
+        result.event, result.reason, result.epoch = event, 'yaw_jump', 2
+        bridge._record_pose_gate_result(result)
+    assert bridge.pose_jump_count == 1
+    assert bridge.last_pose_jump_reason == 'acceleration_limit'
+    result.recovering = False
+    bridge._record_pose_gate_result(result)
+    assert not bridge.pose_jump_episode_active
+    assert bridge.pose_jump_count == 1
+    assert bridge.last_pose_jump_reason == 'acceleration_limit'
+    result.recovering = True
+    bridge._record_pose_gate_result(result)
+    assert bridge.pose_jump_count == 2
+    assert bridge.last_pose_jump_reason == 'yaw_jump'
+
+
+def test_startup_reseeds_do_not_hide_or_multiply_gate_episodes(bridge):
+    bridge.phase = 'spoof'
+    bridge.spoof_until_vio = False
+    bridge.continuity = LocalPoseContinuity()
+    bridge.inertial_active = bridge.continuity_recovering = False
+    bridge.startup_heading = Mock()
+    bridge.spoof_eph_m, bridge.spoof_epv_m = .5, 1.
+    bridge._odom_callback(vio_message(10., 0.))
+    for t, p in [(10.05, 100.), (10.10, 200.), (10.15, 300.)]:
+        bridge._odom_callback(vio_message(t, p))
+        assert bridge.pose_jump_count == 1
+        assert bridge.last_pose_jump_reason == 'position_jump'
+        assert bridge.last_pose_jump_stage == 'startup'
+        assert not bridge.continuity_recovering  # Existing startup behavior.
+        assert not bridge.inertial_active
+    # A real healthy follow-up, not the internally reseeded sample, ends it.
+    bridge._odom_callback(vio_message(10.20, 300.))
+    assert not bridge.pose_jump_episode_active
+    bridge._odom_callback(vio_message(10.25, 400.))
+    assert bridge.pose_jump_count == 2
+
+
+def test_rc_activation_does_not_clear_episode_history(bridge):
+    bridge.pose_jump_count = 4
+    bridge.pose_jump_episode_active = True
+    bridge.last_pose_jump_reason = 'tracking_gap'
+    bridge.last_pose_jump_detail = 'gap_s=1.500 limit_s=0.500'
+    bridge.last_pose_jump_stage = 'startup'
+    bridge.phase = 'waiting'
+    bridge.rc_trigger_enabled = True
+    bridge.rc_channel = 6
+    bridge.last_rc_position = 'low'
+    bridge.spoof_failure_reason = None
+    bridge.spoof_duration_s = 15.
+    bridge._rc_position = Mock(return_value='high')
+    bridge.continuity = Mock()
+    bridge.startup_heading = Mock()
+    msg = Mock(chan6_raw=2000)
+    msg.get_type.return_value = 'RC_CHANNELS'
+    msg.get_srcSystem.return_value = 1
+    bridge._mav = Mock()
+    bridge._mav.recv_match.side_effect = [msg, None]
+    bridge.poll_real()
+    assert bridge.phase == 'spoof'
+    assert not bridge.pose_jump_episode_active
+    assert bridge.pose_jump_count == 4
+    assert bridge.last_pose_jump_reason == 'tracking_gap'
+    assert bridge.last_pose_jump_detail == 'gap_s=1.500 limit_s=0.500'
+
+
+def test_status_writer_publishes_episode_history(bridge, tmp_path):
+    source = Path(__file__).parents[1] / 'vio_px4_bridge/vio_px4_gps_bridge.py'
+    cls = next(n for n in ast.parse(source.read_text()).body
+               if isinstance(n, ast.ClassDef) and n.name == 'VioPx4GpsBridge')
+    method = next(n for n in cls.body if getattr(n, 'name', '') == '_write_status_file')
+    phase = next(n for n in ast.parse(source.read_text()).body
+                 if isinstance(n, ast.ClassDef) and n.name == 'Phase')
+    from enum import Enum
+    namespace = dict(json=json, os=os, math=math, Path=Path, Enum=Enum,
+                     time=SimpleNamespace(monotonic=lambda: 10., time=lambda: 100.))
+    exec(compile(ast.Module(body=[phase, method], type_ignores=[]), str(source), 'exec'), namespace)
+    bridge.phase = namespace['Phase'].LIVE
+    bridge.live_output_active = True
+    bridge.last_rc_position = 'low'
+    bridge.last_px4_heartbeat_time, bridge.heartbeat_timeout_s = 10., 5.
+    bridge.heading_source = 'px4'
+    bridge.startup_heading = SimpleNamespace(reason='aligned to PX4 heading')
+    bridge.recovery_yaw_agreement_state = 'idle'
+    bridge.live_output_block_reason = 'all_health_gates_passed'
+    bridge.spoof_failure_reason = None
+    bridge.origin_setup = SimpleNamespace(confirmed=True)
+    bridge._handoff_block_reason = Mock(return_value=None)
+    bridge.status_file = str(tmp_path / 'navigation-status.json')
+    bridge.pose_jump_count = 3
+    bridge.last_pose_jump_reason = 'acceleration_limit'
+    bridge.last_pose_jump_detail = 'acceleration_m_s2=60.283 limit_m_s2=60.000'
+    bridge.last_pose_jump_stage = 'live'
+    namespace['_write_status_file'](bridge)
+    status = json.loads(Path(bridge.status_file).read_text())
+    assert status['pose_jump_count'] == 3
+    assert status['last_pose_jump_reason'] == 'acceleration_limit'
+    assert status['last_pose_jump_detail'] == bridge.last_pose_jump_detail
+    assert status['last_pose_jump_stage'] == 'live'
+    assert status['hil_gps_output_active'] is True
+    assert not (tmp_path / 'navigation-status.json.tmp').exists()
+
+
 @pytest.mark.parametrize('failure', ['uncertainty', 'position_step', 'yaw_jump', 'reset', 'none'])
 def test_actual_odometry_callback_and_output_gate(bridge, failure):
     """Run production callback, continuity, telemetry checks and publish timer."""
@@ -367,6 +527,7 @@ def test_actual_odometry_callback_and_output_gate(bridge, failure):
     bridge._odom_callback(vio_message(10.05, 100., yaw=2.))
     assert bridge.continuity_recovering
     assert bridge.inertial_active
+    assert bridge.pose_jump_count == 1
     for i in range(2, 30):
         t = 10. + i * .05
         feed_px4(bridge, t, yaw=2. if failure == 'yaw_jump' else 0.,
@@ -382,6 +543,9 @@ def test_actual_odometry_callback_and_output_gate(bridge, failure):
             break
     assert not bridge.continuity_recovering
     bridge._publish_fix.assert_called_once()
+    assert bridge.pose_jump_count == 1
+    assert bridge.last_pose_jump_reason == 'position_jump'
+    assert not bridge.pose_jump_episode_active
     assert not bridge.inertial_active
     assert bridge.latest_fix['lat'] == initial_fix['lat']
     assert bridge.latest_fix['lon'] == initial_fix['lon']
@@ -664,6 +828,7 @@ def test_repeated_recoveries_do_not_accumulate_heading_offsets(bridge):
         assert bridge.latest_fix['lon'] == original['lon']
         assert wrap_pi(bridge.continuity.last_output_yaw + .7 - fcu_yaw) == pytest.approx(0.)
         assert bridge.heading_offset_rad == .7  # Never change the home-world transform.
+    assert bridge.pose_jump_count == 2
 
 
 @pytest.mark.parametrize('duration', [30., 90.])

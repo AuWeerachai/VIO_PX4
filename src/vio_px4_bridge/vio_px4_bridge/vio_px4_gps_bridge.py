@@ -358,6 +358,13 @@ class VioPx4GpsBridge(Node):
         self.recovery_resume_time = None
         self.logged_odom_frames = False
         self.continuity_recovering = False
+        # Diagnostics only: count episodes, not rejected samples or candidate
+        # resets within an episode. Keep this history for the bridge session.
+        self.pose_jump_count = 0
+        self.pose_jump_episode_active = False
+        self.last_pose_jump_reason = None
+        self.last_pose_jump_detail = None
+        self.last_pose_jump_stage = None
         self.live_output_active = False
         self.live_output_block_reason = "not_live"
         self.last_px4_heartbeat_time = None
@@ -456,6 +463,10 @@ class VioPx4GpsBridge(Node):
                 else "explicit manual heading"
             ),
             "pose_gate_quarantine": self.continuity_recovering,
+            "pose_jump_count": self.pose_jump_count,
+            "last_pose_jump_reason": self.last_pose_jump_reason,
+            "last_pose_jump_detail": self.last_pose_jump_detail,
+            "last_pose_jump_stage": self.last_pose_jump_stage,
             "inertial_recovery_active": self.inertial_active,
             "inertial_recovery_safe": self.inertial_position_safe and self.inertial_heading_safe,
             "recovery_position_safe": self.inertial_position_safe,
@@ -1259,6 +1270,24 @@ class VioPx4GpsBridge(Node):
             return "pose-jump gate recovering"
         return self.camera_readiness.reason(now)
 
+    def _record_pose_gate_result(self, result):
+        """Observe the gate without changing its decisions or recovery state."""
+        if not result.recovering:
+            self.pose_jump_episode_active = False
+            return
+        if self.pose_jump_episode_active:
+            return
+        self.pose_jump_episode_active = True
+        self.pose_jump_count += 1
+        self.last_pose_jump_reason = result.reason or "unknown"
+        self.last_pose_jump_detail = result.detail
+        self.last_pose_jump_stage = "live" if self.phase == Phase.LIVE else "startup"
+        self.get_logger().warn(
+            f"VIO_POSE_JUMP count={self.pose_jump_count} "
+            f"reason={self.last_pose_jump_reason} stage={self.last_pose_jump_stage} "
+            f"epoch={result.epoch} detail={result.detail or 'none'}"
+        )
+
     def _odom_callback(self, msg: Odometry):
         pos, orientation = msg.pose.pose.position, msg.pose.pose.orientation
         stamp = msg.header.stamp
@@ -1356,6 +1385,10 @@ class VioPx4GpsBridge(Node):
             recovery_displacement=recovery_displacement,
             recovery_yaw_delta=recovery_yaw_delta,
         )
+        # Record the original gate result, including startup resets that the
+        # following block reseeds. A synthetic seed is not a healthy recovery
+        # sample and must not split one ongoing disturbance into many counts.
+        self._record_pose_gate_result(continuity)
         # Before live handoff there is no VIO GPS trajectory to preserve. A
         # startup relocalization should establish a fresh local origin rather
         # than invoke PX4-aided in-flight recovery.
@@ -1375,6 +1408,7 @@ class VioPx4GpsBridge(Node):
             message = (
                 f"VIO_CONTINUITY event={continuity.event} "
                 f"reason={continuity.reason or 'none'} epoch={continuity.epoch} "
+                f"episode={self.pose_jump_count} "
                 f"detail={continuity.detail or 'none'}"
             )
             if continuity.event in ("quarantine_started", "reset_confirmed",
@@ -1654,6 +1688,7 @@ class VioPx4GpsBridge(Node):
             self.camera_readiness.reset()
             self.continuity.reset()
             self.continuity_recovering = False
+            self.pose_jump_episode_active = False
             self.have_vio = False
             self.last_vio_time = None
             self.anchor_ned = None

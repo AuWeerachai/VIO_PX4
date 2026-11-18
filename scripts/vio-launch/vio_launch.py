@@ -1391,6 +1391,28 @@ def show_navigation_status(cfg: Config) -> None:
     print(f"- Connection status: {connection}")
     print(f"- VIO status: {vio_status}")
     print(f"- Pose-jump gate status: {gate_status}")
+    if "pose_jump_count" in status:
+        print(f"- Pose-jump episodes: {int(status['pose_jump_count'])} since Path A start")
+        reason = status.get("last_pose_jump_reason")
+        if reason:
+            labels = {
+                "speed_limit": "speed limit",
+                "acceleration_limit": "acceleration limit",
+                "yaw_rate_limit": "yaw-rate limit",
+                "position_jump": "position change exceeds speed limit",
+                "yaw_jump": "heading change exceeds yaw-rate limit",
+                "tracking_gap": "tracking gap",
+                "timestamp_regression": "duplicate/backward timestamp",
+                "frame_changed": "coordinate frame changed",
+            }
+            stage = " during startup" if status.get("last_pose_jump_stage") == "startup" else ""
+            print(f"- Latest episode trigger: {labels.get(reason, reason)}{stage}")
+            if status.get("last_pose_jump_detail"):
+                print(f"  {status['last_pose_jump_detail']}")
+        else:
+            print("- Latest episode trigger: none")
+    else:
+        print("- Pose-jump episodes: unavailable (running bridge has no counter)")
     if navigation in ("spoof_active", "waiting_for_rc"):
         print(f"- Spoof health check: {status.get('handoff_check_reason') or 'healthy'}")
     if status.get("spoof_failure_reason"):
