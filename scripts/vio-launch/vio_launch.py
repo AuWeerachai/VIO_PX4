@@ -1222,8 +1222,20 @@ def stop_failed_spoof(cfg: Config, reason: str) -> None:
     print("- GPS bridge and cuVSLAM/RViz sessions stopped. Start Path A again to retry.", flush=True)
 
 
+def require_path_a_stopped(cfg: Config) -> None:
+    """Reject a duplicate launch before inspecting or changing camera sessions."""
+    existing = find_proc(cfg, "gps-bridge")
+    if existing:
+        raise RuntimeError(
+            f"Path A is already running (GPS bridge pid={existing['pid']}). "
+            "No additional GPS bridge was started. Use Status to inspect it; "
+            "stop the current session deliberately before starting again."
+        )
+
+
 def cmd_gps(cfg: Config) -> None:
     require_current_cli()
+    require_path_a_stopped(cfg)
     if find_proc(cfg, "ev-bridge") or find_proc(cfg, "mavros"):
         raise RuntimeError("A legacy EV/MAVROS process is already running. Stop it before starting Path A.")
     # This command is also callable directly, without cmd_run/cmd_vio.
@@ -1465,14 +1477,16 @@ def cmd_run(
 ) -> None:
     require_current_cli()
     normalize_path(path_arg)
-    print("Starting Path A (GPS spoof + VIO GPS)...\n", flush=True)
+    require_path_a_stopped(cfg)
 
     # Reject legacy publishers BEFORE touching the camera/session they depend on.
     if find_proc(cfg, "ev-bridge") or find_proc(cfg, "mavros"):
         raise RuntimeError("A legacy EV/MAVROS process is already running. Stop it before starting Path A.")
+    print("Starting Path A (GPS spoof + VIO GPS)...\n", flush=True)
     cmd_vio(cfg, defer_health=True)
-    if not find_proc(cfg, "gps-bridge"):
-        cmd_gps(cfg)
+    # Recheck in cmd_gps: another launcher may have started the bridge while
+    # camera readiness was being checked. Never silently reuse that publisher.
+    cmd_gps(cfg)
     # cmd_gps reports success only after receiving a PX4 heartbeat.
 
 

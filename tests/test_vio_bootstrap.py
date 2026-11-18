@@ -102,6 +102,62 @@ def test_stale_cli_cannot_launch_a_path():
     gps.assert_not_called()
 
 
+@pytest.mark.parametrize('direct_gps', [False, True])
+def test_duplicate_path_a_is_rejected_without_camera_or_process_changes(direct_gps, capsys):
+    cfg = cli.Config(camera_serial='333422300181')
+    with patch.object(cli, 'find_proc', side_effect=lambda cfg, name: {'pid': 123} if name == 'gps-bridge' else None), \
+         patch.object(cli, 'cmd_vio') as camera, \
+         patch.object(cli, 'require_camera_ready') as readiness, \
+         patch.object(cli, 'serial_users') as serial, \
+         patch.object(cli, 'start_managed') as start, \
+         patch.object(cli, 'stop_managed') as stop:
+        with pytest.raises(RuntimeError, match=r'Path A is already running \(GPS bridge pid=123\)'):
+            if direct_gps:
+                cli.cmd_gps(cfg)
+            else:
+                cli.cmd_run(cfg, 'a')
+    camera.assert_not_called()
+    readiness.assert_not_called()
+    serial.assert_not_called()
+    start.assert_not_called()
+    stop.assert_not_called()
+    assert 'Starting Path A' not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('direct_gps', [False, True])
+def test_stale_cli_warning_precedes_duplicate_path_a_check(direct_gps):
+    with patch.object(cli, '_LOADED_CLI_HASH', b'outdated'), \
+         patch.object(cli, 'find_proc', return_value={'pid': 123}) as process, \
+         patch.object(cli, 'cmd_vio') as camera, \
+         patch.object(cli, 'require_camera_ready') as readiness:
+        with pytest.raises(cli.StaleLauncherError, match='updated while this menu was open'):
+            if direct_gps:
+                cli.cmd_gps(cli.Config())
+            else:
+                cli.cmd_run(cli.Config(), 'a')
+    process.assert_not_called()
+    camera.assert_not_called()
+    readiness.assert_not_called()
+
+
+def test_bridge_started_during_camera_readiness_is_reported_not_silently_reused():
+    active = False
+    def camera_ready(*args, **kwargs):
+        nonlocal active
+        active = True
+    def process(cfg, name):
+        return {'pid': 456} if active and name == 'gps-bridge' else None
+    with patch.object(cli, 'find_proc', side_effect=process), \
+         patch.object(cli, 'cmd_vio', side_effect=camera_ready) as camera, \
+         patch.object(cli, 'require_camera_ready') as readiness, \
+         patch.object(cli, 'start_managed') as start:
+        with pytest.raises(RuntimeError, match=r'Path A is already running \(GPS bridge pid=456\)'):
+            cli.cmd_run(cli.Config(), 'a')
+    camera.assert_called_once()
+    readiness.assert_not_called()
+    start.assert_not_called()
+
+
 def test_update_while_menu_is_waiting_is_detected_before_dispatch():
     choices = iter(['run-a', 'detach'])
     def select(*args, **kwargs):

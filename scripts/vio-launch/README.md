@@ -13,6 +13,11 @@ publishers before replacing camera/bridge files. Reopen the CLI after the update
 An already-open updated launcher detects changes to its own source and refuses
 new launches or settings saves; Leave and Stop remain available. Older launchers
 without this guard must be closed explicitly during their first upgrade.
+Selecting Path A when its bridge is already running reports the bridge PID
+and leaves the existing session alone, before checking the camera or RViz.
+The direct `gps` command makes the same check. This is separate from the
+old-CLI warning: a freshly opened, up-to-date menu can still find a running
+bridge. Starting again does not silently reuse or restart that bridge.
 The direct `gps` command also verifies camera identity. The CLI does
 not automatically restart the camera underneath a running navigation publisher;
 stop the pipeline deliberately first. Leftover EV/MAVROS publishers from older
