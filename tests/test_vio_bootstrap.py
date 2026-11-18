@@ -151,6 +151,25 @@ def test_direct_gps_command_cannot_bypass_camera_identity():
     port_check.assert_not_called()
 
 
+def test_launcher_requests_one_cm_healthy_hacc(tmp_path):
+    import shlex
+    setup = tmp_path/'install/setup.bash'
+    setup.parent.mkdir()
+    setup.touch()
+    cfg = cli.Config(vio_px4_dir=tmp_path, state_dir=tmp_path/'state',
+                     mavlink_url='udpout:127.0.0.1:14540')
+    with patch.object(cli, 'find_proc', return_value=None), \
+         patch.object(cli, 'require_camera_ready'), \
+         patch.object(cli, 'start_managed', side_effect=RuntimeError('test: no launch')) as start:
+        with pytest.raises(RuntimeError, match='test: no launch'):
+            cli.cmd_gps(cfg)
+    args = shlex.split(start.call_args.args[2])
+    assert 'boot_accuracy_m:=0.01' in args
+    assert 'cruise_eph_m:=0.01' in args
+    assert 'rate_hz:=30.0' in args
+    assert 'horizontal_only_output:=true' in args
+
+
 def test_old_launcher_missing_serial_cannot_open_any_camera(tmp_path):
     import os
     (tmp_path/'src/isaac_ros_common').mkdir(parents=True)

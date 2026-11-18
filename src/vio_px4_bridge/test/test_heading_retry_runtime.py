@@ -10,7 +10,8 @@ from types import SimpleNamespace
 import pytest
 
 
-def test_real_node_runs_both_outputs_at_30hz_and_cuts_both_on_jump(monkeypatch):
+@pytest.mark.parametrize('boot_duration_s', [0., 60.])
+def test_real_node_runs_both_outputs_at_30hz_and_cuts_both_on_jump(monkeypatch, boot_duration_s):
     rclpy = pytest.importorskip('rclpy')
     mavlink = pytest.importorskip('pymavlink.dialects.v20.common')
     from nav_msgs.msg import Odometry
@@ -38,12 +39,15 @@ def test_real_node_runs_both_outputs_at_30hz_and_cuts_both_on_jump(monkeypatch):
 
     monkeypatch.setattr(VioPx4GpsBridge, '_init_transport', fake_connection)
     rclpy.init(args=['--ros-args', '-p', 'send_vo_heading:=true',
-                    '-p', 'camera_imu_required:=false'])
+                    '-p', 'camera_imu_required:=false',
+                    '-p', f'boot_duration_s:={boot_duration_s}'])
     executor = SingleThreadedExecutor()
     node = None
     try:
         node = VioPx4GpsBridge()
         assert node.rate_hz == 30
+        assert node.boot_accuracy_m == node.cruise_eph_m == .01
+        assert node.spoof_eph_m == .5  # Stationary spoof uncertainty is unchanged.
         node.phase = Phase.LIVE
         node.heading_offset_rad = math.radians(66)  # local +90 -> true +156
         node.live_start_time = time.monotonic()
@@ -76,7 +80,9 @@ def test_real_node_runs_both_outputs_at_30hz_and_cuts_both_on_jump(monkeypatch):
         assert not node.continuity_recovering
         assert node.continuity.epoch == 0
         assert node.frozen_position_uncertainty_m == 0
-        assert all(m.eph == 10 for _, m in gps)
+        assert all(m.eph == 1 for _, m in gps)  # 0.01 m encoded as one centimetre.
+        assert all(m.pose_covariance[0] == pytest.approx(.01**2) for _, m in yaw)
+        assert all(m.pose_covariance[6] == pytest.approx(.01**2) for _, m in yaw)
         assert all(m.pose_covariance[20] == pytest.approx(math.radians(1)**2) for _, m in yaw)
         assert all(.25 < t-m.time_usec*1e-6 < .5 for t, m in yaw)
 

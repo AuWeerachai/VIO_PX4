@@ -62,9 +62,10 @@ timestamp regressions reject propagation. Position then remains frozen, but
 heading validation fails closed and HIL_GPS cannot resume automatically.
 Candidate/recovery VIO samples never move the trusted anchor. A failed
 propagation is discarded and requires operator restart/re-alignment. On a
-successful handoff, reported GPS
-accuracy starts at PX4's accumulated horizontal uncertainty and tightens back
-to 0.1 m. All numeric limits are configured in
+successful handoff, reported GPS uncertainty retains the accumulated PX4
+uncertainty as a floor; healthy relative tracking cannot erase that inherited
+global error. The configured healthy live hAcc is 0.01 m, not a guarantee of
+actual centimetre accuracy. All numeric limits are configured in
 `vio-launch`.
 
 Path A directly and exclusively owns the FC serial port. The former MAVROS

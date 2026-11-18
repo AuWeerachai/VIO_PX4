@@ -69,7 +69,7 @@ def test_smooth_delayed_odometry_never_starts_quarantine(bridge, delay):
         assert bridge.inherited_position_uncertainty_m == 0
     assert bridge._mav.mav.odometry_send.call_count == 60
     assert bridge._publish_fix.call_count == 60
-    assert bridge.latest_fix['eph'] == .1
+    assert bridge.latest_fix['eph'] == .01
     for call in bridge._mav.mav.odometry_send.call_args_list:
         assert call.kwargs['time_usec'] < int(bridge.clock.now*1e6)
         assert call.kwargs['pose_covariance'][20] == pytest.approx(math.radians(1)**2)

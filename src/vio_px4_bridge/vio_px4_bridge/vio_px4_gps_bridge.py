@@ -90,10 +90,11 @@ class VioPx4GpsBridge(Node):
         self.declare_parameter("spoof_eph_m", 0.5)
         self.declare_parameter("spoof_epv_m", 1.0)
 
-        # Live / cruise accuracy (BasaltGpsBridge boot -> cruise analogue)
-        self.declare_parameter("boot_accuracy_m", 0.1)
+        # Operator-selected healthy horizontal uncertainty, not measured accuracy.
+        # Recovery retains any larger inherited/frozen-position uncertainty.
+        self.declare_parameter("boot_accuracy_m", 0.01)
         self.declare_parameter("boot_duration_s", 60.0)
-        self.declare_parameter("cruise_eph_m", 0.1)
+        self.declare_parameter("cruise_eph_m", 0.01)
         self.declare_parameter("cruise_epv_m", 1.5)
         self.declare_parameter("speed_accuracy_m_s", 0.25)
         # HIL_GPS requires altitude and velocity fields even when PX4 is
@@ -1172,7 +1173,7 @@ class VioPx4GpsBridge(Node):
                          self.inertial_position_uncertainty_m)
         source = "px4_position_displacement"
         if self.inertial_fallback_to_frozen_pose:
-            # Freezing loses unknown real movement. Do not claim 0.1 m accuracy
+            # Freezing loses unknown real movement. Do not claim healthy accuracy
             # on resumption; bound the possible loss using the configured speed.
             resume_eph = max(resume_eph, self.continuity.max_speed_mps * elapsed)
             self.frozen_position_uncertainty_m += self.continuity.max_speed_mps * elapsed

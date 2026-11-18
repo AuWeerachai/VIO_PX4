@@ -170,9 +170,14 @@ is an estimator estimate, not a guarantee of true error.
 
 Freezing cannot account for movement during the outage. Recovery therefore
 retains a conservative global uncertainty floor (maximum configured speed
-times outage duration), rather than automatically claiming 0.1 m accuracy.
+times outage duration), rather than automatically claiming the healthy 0.01 m floor.
 PX4 may reject the resulting degraded GPS. A verified origin and new bridge
 session are needed to clear that uncertainty.
+
+Healthy live GPS reports 0.01 m hAcc (one centimetre on the HIL_GPS wire).
+This configured uncertainty is not proof of centimetre accuracy. Static spoof
+still reports 0.5 m. The launcher does not change `EKF2_GPS_P_NOISE`; if PX4
+keeps that parameter at 0.1 m, its measurement-noise floor remains 0.1 m.
 
 ## Selecting an option
 

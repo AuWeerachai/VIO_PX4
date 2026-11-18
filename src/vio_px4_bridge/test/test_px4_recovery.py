@@ -94,7 +94,7 @@ def bridge():
     obj.recovery_velocity_last_timestamp = None
     obj.recovery_velocity_agreement_m_s = .2
     obj.recovery_velocity_agreement_samples = 2
-    obj.cruise_eph_m = 0.1
+    obj.cruise_eph_m = 0.01
     obj.cruise_epv_m = 5.0
     obj.phase = 'live'
     obj.frozen_position_uncertainty_m = 0.0
@@ -132,6 +132,19 @@ def bridge():
     obj.boot_duration_s = 0.
     obj.recovery_accuracy_tighten_s = 5.
     return obj
+
+
+@pytest.mark.parametrize('inherited,frozen', [(0., 0.), (.4, 0.), (0., .6), (.4, .6)])
+@pytest.mark.parametrize('live_start_time', [None, 9., -100.])
+def test_one_cm_healthy_hacc_never_overrides_recovery_uncertainty(
+        bridge, inherited, frozen, live_start_time):
+    bridge.boot_accuracy_m = .01
+    bridge.boot_duration_s = 60.
+    bridge.spoof_epv_m = 1.
+    bridge.live_start_time = live_start_time
+    bridge.inherited_position_uncertainty_m = inherited
+    bridge.frozen_position_uncertainty_m = frozen
+    assert bridge._select_accuracy()[0] == pytest.approx(max(.01, inherited, frozen))
 
 
 def test_repeated_quarantine_preserves_original_propagation_boundary(bridge):
