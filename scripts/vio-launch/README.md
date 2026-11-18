@@ -1,5 +1,11 @@
 # vio-launch
 
+On the experimental `vio-dynamic-repositioning` branch, **Pose-jump gate limits**
+also controls continuous PX4-heading alignment of new VO movement increments,
+plus full-rotation recovery using time-matched FCU attitude. See
+[3D recovery, limits and ground-test checklist](../../bootstrap/docs/DYNAMIC_REPOSITIONING.md).
+This does not enable IMU fusion or send VO heading to PX4.
+
 Camera selection is explicit: in **Camera extrinsic**, enter the rear D456's
 SDK serial from `rs-enumerate-devices -s`. This is not necessarily the serial
 shown in USB/sysfs. The CLI stores it as `camera_serial` in its user config.
@@ -55,7 +61,7 @@ The archived IMU tools/cache are not needed for VO and are not deleted.
 | **Status (option 2)** | Live GPS navigation and recovery status |
 | **FC link** | Pick direct UART/USB serial, UDP networking, or keep the current setting |
 | **Home latitude/longitude** | Horizontal spoof/origin position |
-| **Heading alignment** | Use PX4 estimated heading (default) or explicit manual true heading |
+| **Heading alignment** | Dynamic mode: continuous PX4 heading for new movement steps; legacy mode: startup PX4/manual alignment |
 | **Camera extrinsic** | Configure the full ROS FLU `drone_link → camera_link` XYZ/RPY transform |
 | **Pose-jump gate limits** | Configure physical rate, timing, and recovery limits |
 | **RViz auto-launch** | Persistently toggle automatic RViz startup; default OFF |
@@ -86,7 +92,9 @@ Old `heading_source=compass` settings automatically migrate to `px4` when loaded
 deprecated alias for `px4`, with a warning. No bridge declination is added to
 PX4 yaw. Finish calibration and verify PX4's true heading before starting Path A.
 Fresh, stationary startup samples align the local trajectory to PX4; the offset
-then stays fixed in normal tracking. Existing quarantine recovery is unchanged.
+defines a fixed geographic basis. On this experimental branch, each new
+movement increment also uses matched PX4 heading; past positions stay unchanged.
+Roll/pitch is corrected during validated recovery as described above.
 This does not certify north alignment or remove magnetic interference.
 
 Camera translation uses ROS FLU axes: +X forward, +Y left, and +Z up.
@@ -135,7 +143,7 @@ is an estimator estimate, not a guarantee of true error.
 
 Freezing cannot account for movement during the outage. Recovery therefore
 retains a conservative global uncertainty floor (maximum configured speed
-times outage duration), rather than automatically claiming 0.1 m accuracy.
+times outage duration), rather than automatically claiming 0.05 m accuracy.
 PX4 may reject the resulting degraded GPS. A verified origin and new bridge
 session are needed to clear that uncertainty.
 

@@ -113,6 +113,7 @@ def bridge():
     exec(compile(ast.Module(body=[n for n in cls.body if getattr(n, 'name', '') in names],
                             type_ignores=[]), str(source), 'exec'), ns)
     obj = type('StartupHarness', (), {name: ns[name] for name in names})()
+    obj.dynamic_repositioning_enabled = False
     obj.startup_heading = Px4StartupHeading()
     obj.heading_source = 'px4'
     obj.heading_offset_rad = None

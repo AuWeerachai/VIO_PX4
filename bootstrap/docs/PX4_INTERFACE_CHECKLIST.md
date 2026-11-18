@@ -60,8 +60,10 @@ firmware because message handling and estimator requirements can change.
 - [ ] Send at 10 Hz without long gaps. PX4 timestamps receipt locally.
 - [ ] `fix_type=3`, synthetic satellites=40, speed accuracy
   below `EKF2_REQ_SACC`, and EPH/EPV below their configured gates.
-- [ ] Set `EKF2_GPS_P_NOISE=0.1 m` to match the bridge's healthy horizontal
-  EPH. Do not claim RTK fix types to influence source selection.
+- [ ] The bridge reports healthy horizontal EPH of `0.05 m`. PX4's
+  `EKF2_GPS_P_NOISE` is a separate lower bound: keeping it at `0.1 m` means
+  PX4 still applies at least that position noise. Do not claim RTK fix types
+  to influence source selection.
 - [ ] Hold valid, stationary spoof data for at least `EKF2_REQ_GPS_H` (10 s by
   default). The configured 15 s window provides only 5 s margin.
 - [ ] Latitude/longitude are WGS84 degrees scaled by 1e7; altitude is MSL metres
@@ -198,7 +200,7 @@ firmware because message handling and estimator requirements can change.
   "Last accepted VIO sample" is accepted-data age, not transport/camera latency.
 - [ ] Successful PX4-position recovery retains the peak reported horizontal
   uncertainty during the outage (and any previously inherited floor). Do not
-  automatically tighten inherited global uncertainty to 0.1 m merely because
+  automatically tighten inherited global uncertainty to 0.05 m merely because
   relative camera tracking stabilizes or PX4 later reports a smaller variance.
 - [ ] Verify 30- and 90-second stationary and moving tests recover to the
   trusted anchor plus actual PX4 position displacement, without the old time

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 from vio_px4_bridge.geo_utils import wrap_pi
+from vio_px4_bridge import frame_rotation as rot
 
 @dataclass(frozen=True)
 class ContinuityResult:
@@ -15,13 +16,16 @@ class ContinuityResult:
     epoch: int
     event: str | None = None
     detail: str | None = None
+    orientation: tuple | None = None
+    waiting_for_heading: bool = False
 
 class LocalPoseContinuity:
     """Map reset-prone VIO into a continuous frame using a quarantine gate."""
     def __init__(self, max_gap_s=1.0,
                  recovery_samples=10, confirmation_samples=3,
                  max_speed_mps=10.0, max_acceleration_mps2=5.0,
-                 max_yaw_rate_rad_s=math.radians(360.0)):
+                 max_yaw_rate_rad_s=math.radians(360.0), full_attitude=False):
+        self.full_attitude = full_attitude
         self.max_gap_s = max(0.05, max_gap_s)
         self.recovery_samples = max(1, recovery_samples)
         self.confirmation_samples = max(2, confirmation_samples)
@@ -32,13 +36,18 @@ class LocalPoseContinuity:
 
     def reset(self):
         self.rotation = 0.0
+        self.correction_q = rot.IDENTITY
+        self.correction_matrix = rot.matrix(rot.IDENTITY)
         self.translation = (0.0, 0.0, 0.0)
         self.last_raw_position = self.last_raw_yaw = None
         self.last_raw_velocity = self.last_yaw_rate = None
         self.last_timestamp = self.last_frame_key = None
         self.last_output_position = self.last_output_yaw = None
+        self.last_output_raw_position = self.last_output_timestamp = None
         self.stable_samples = self.epoch = 0
         self.recovery_anchor_position = self.recovery_anchor_yaw = None
+        self.last_raw_orientation = self.last_output_orientation = None
+        self.recovery_anchor_orientation = None
         self._clear_suspect()
 
     def _clear_suspect(self):
@@ -56,16 +65,21 @@ class LocalPoseContinuity:
         return math.sqrt(sum(x*x for x in values))
 
     def _transform_position(self, p):
+        if self.full_attitude:
+            v = rot.rotate_matrix(self.correction_matrix, p)
+            return tuple(v[i]+self.translation[i] for i in range(3))
         x, y = self._rotate_xy(p[0], p[1], self.rotation)
         return x+self.translation[0], y+self.translation[1], p[2]+self.translation[2]
 
     def _transform_velocity(self, v):
+        if self.full_attitude:
+            return rot.rotate_matrix(self.correction_matrix, v)
         x, y = self._rotate_xy(v[0], v[1], self.rotation)
         return x, y, v[2]
 
     def _motion_reason(self, old, new, enforce_gap=True):
-        p0, yaw0, v0, rate0, t0, frame0 = old
-        p1, yaw1, v1, rate1, t1, frame1 = new
+        p0, yaw0, v0, rate0, t0, frame0, q0 = old
+        p1, yaw1, v1, rate1, t1, frame1, q1 = new
         dt = t1-t0
         if dt <= 0: return "timestamp_regression"
         if frame1 != frame0: return "frame_changed"
@@ -80,13 +94,15 @@ class LocalPoseContinuity:
         delta = tuple(p1[i]-p0[i] for i in range(3))
         if self._norm(delta) / dt > self.max_speed_mps:
             return "position_jump"
-        if abs(wrap_pi(yaw1-yaw0)) / dt > self.max_yaw_rate_rad_s:
+        if self.full_attitude and rot.distance(q0, q1)/dt > self.max_yaw_rate_rad_s:
+            return "attitude_jump"
+        if not self.full_attitude and abs(wrap_pi(yaw1-yaw0)) / dt > self.max_yaw_rate_rad_s:
             return "yaw_jump"
         return None
 
     def _gate_detail(self, old, new, reason):
-        p0, yaw0, v0, rate0, t0, frame0 = old
-        p1, yaw1, v1, rate1, t1, frame1 = new
+        p0, yaw0, v0, rate0, t0, frame0, q0 = old
+        p1, yaw1, v1, rate1, t1, frame1, q1 = new
         dt = t1-t0
         if reason == "timestamp_regression":
             return f"dt_s={dt:.6f} limit=>0"
@@ -112,12 +128,16 @@ class LocalPoseContinuity:
             return (f"pose_implied_yaw_rate_deg_s={math.degrees(implied_rate):.3f} "
                     f"limit_deg_s={math.degrees(self.max_yaw_rate_rad_s):.3f} "
                     f"dt_s={dt:.3f}")
+        if reason == "attitude_jump":
+            return (f"rotation_rate_deg_s={math.degrees(rot.distance(q0,q1)/dt):.3f} "
+                    f"limit_deg_s={math.degrees(self.max_yaw_rate_rad_s):.3f}")
         return "explicit_source_event=true"
 
     def _accepted_sample(self):
         if self.last_timestamp is None: return None
         return (self.last_raw_position, self.last_raw_yaw, self.last_raw_velocity,
-                self.last_yaw_rate, self.last_timestamp, self.last_frame_key)
+                self.last_yaw_rate, self.last_timestamp, self.last_frame_key,
+                self.last_raw_orientation)
 
     def _held(self, reason, event=None, detail=None):
         position = self.recovery_anchor_position or self.last_output_position
@@ -131,59 +151,128 @@ class LocalPoseContinuity:
         if self.recovery_anchor_position is None:
             self.recovery_anchor_position = self.last_output_position
             self.recovery_anchor_yaw = self.last_output_yaw
+            self.recovery_anchor_orientation = self.last_output_orientation
+
+    def quarantine(self, reason):
+        """Latch external health failure without accepting its corrupt sample."""
+        if self.last_output_position is None:
+            return
+        self._start_recovery()
+        self._clear_suspect()
+        # No shortcut: the next finite sample must begin a candidate window.
+        self.suspect_reason = reason
+        self.stable_samples = 0
 
     def _set_raw_state(self, sample):
-        p, yaw, v, rate, timestamp, frame = sample
+        p, yaw, v, rate, timestamp, frame, q = sample
         self.last_raw_position, self.last_raw_yaw, self.last_raw_velocity = p, yaw, v
         self.last_yaw_rate, self.last_timestamp, self.last_frame_key = rate, timestamp, frame
+        self.last_raw_orientation = q
 
-    def _finish_recovery(self, sample, displacement, yaw_delta):
+    def _finish_recovery(self, sample, displacement, yaw_delta, recovery_orientation=None):
         """Align the recovered raw epoch to the independently propagated target."""
-        p, yaw, v, rate, timestamp, frame = sample
+        p, yaw, v, rate, timestamp, frame, q = sample
         target = tuple(self.recovery_anchor_position[i] + displacement[i]
                        for i in range(3))
         target_yaw = wrap_pi(self.recovery_anchor_yaw + yaw_delta)
         self.rotation = wrap_pi(target_yaw - yaw)
         rx, ry = self._rotate_xy(p[0], p[1], self.rotation)
         self.translation = (target[0] - rx, target[1] - ry, target[2] - p[2])
+        if self.full_attitude:
+            # One rigid transform about the recovery point. Never rotate the
+            # existing/global trajectory about the raw origin or GPS home.
+            self.correction_q = rot.multiply(recovery_orientation, rot.inverse(q))
+            self.correction_matrix = rot.matrix(self.correction_q)
+            rp = rot.rotate_matrix(self.correction_matrix, p)
+            self.translation = tuple(target[i]-rp[i] for i in range(3))
+            self.last_output_orientation = rot.normalize(recovery_orientation)
+            target_yaw = rot.yaw(self.last_output_orientation)
         self._set_raw_state(sample)
         self.last_output_position, self.last_output_yaw = target, target_yaw
+        self.last_output_raw_position, self.last_output_timestamp = p, timestamp
         self.recovery_anchor_position = self.recovery_anchor_yaw = None
+        self.recovery_anchor_orientation = None
         out_v = self._transform_velocity(v)
         return ContinuityResult(target, target_yaw, out_v, False, True, None,
                                 self.epoch, "recovery_completed",
-                                "anchor=independent_px4_inertial_delta")
+                                "anchor=independent_px4_inertial_delta",
+                                self.last_output_orientation)
 
     def _accept(self, sample, reanchored=False, reason=None, event=None,
-                detail=None, recovery_displacement=None, recovery_yaw_delta=0.0):
-        p, yaw, v, rate, timestamp, frame = sample
+                detail=None, recovery_displacement=None, recovery_yaw_delta=0.0,
+                recovery_orientation=None, heading_reference=None, require_heading=False):
+        p, yaw, v, rate, timestamp, frame, q = sample
         out_p, out_yaw, out_v = self._transform_position(p), wrap_pi(yaw+self.rotation), self._transform_velocity(v)
+        out_q = rot.multiply(self.correction_q, q) if self.full_attitude else None
+        if out_q is not None:
+            out_yaw = rot.yaw(out_q)
         self._set_raw_state(sample)
         if self.recovery_anchor_position is not None:
             if not reanchored:
                 self.stable_samples += 1
             if (self.stable_samples >= self.recovery_samples
-                    and recovery_displacement is not None):
+                    and recovery_displacement is not None
+                    and (not self.full_attitude or recovery_orientation is not None)):
                 return self._finish_recovery(
-                    sample, recovery_displacement, recovery_yaw_delta
+                    sample, recovery_displacement, recovery_yaw_delta, recovery_orientation
                 )
             return ContinuityResult(
                 self.recovery_anchor_position, self.recovery_anchor_yaw,
                 (0.0, 0.0, 0.0), True, reanchored, reason, self.epoch,
                 event, detail,
             )
+        if require_heading:
+            if heading_reference is None:
+                # Still validate EVERY raw sample, but do not advance the
+                # published trajectory using an old/unmatched heading.
+                if self.last_output_position is None:
+                    self.last_output_position, self.last_output_yaw = out_p, out_yaw
+                    self.last_output_orientation = out_q
+                    self.last_output_raw_position, self.last_output_timestamp = p, timestamp
+                return ContinuityResult(
+                    self.last_output_position, self.last_output_yaw, (0.,0.,0.),
+                    False, False, None, self.epoch, orientation=self.last_output_orientation,
+                    waiting_for_heading=True)
+            # Heading is expressed in the existing local output frame. Only
+            # the NEXT displacement is rotated; old positions never rotate.
+            correction = rot.multiply(
+                rot.from_rpy(0., 0., wrap_pi(heading_reference-rot.yaw(out_q))),
+                self.correction_q)
+            if self.last_output_raw_position is not None:
+                delta = tuple(p[i]-self.last_output_raw_position[i] for i in range(3))
+                # Mid-interval correction avoids using the ending heading for
+                # an entire turn. No gyro/velocity integration is performed.
+                middle = rot.interpolate(self.correction_q, correction, .5)
+                step = rot.rotate(middle, delta)
+                out_p = tuple(self.last_output_position[i]+step[i] for i in range(3))
+            self.correction_q = correction
+            self.correction_matrix = rot.matrix(correction)
+            rp = rot.rotate_matrix(self.correction_matrix, p)
+            self.translation = tuple(out_p[i]-rp[i] for i in range(3))
+            out_q = rot.multiply(correction, q)
+            out_yaw, out_v = rot.yaw(out_q), self._transform_velocity(v)
         self.last_output_position, self.last_output_yaw = out_p, out_yaw
+        self.last_output_raw_position, self.last_output_timestamp = p, timestamp
+        self.last_output_orientation = out_q
         if self.epoch and not reanchored: self.stable_samples += 1
         recovering = bool(self.epoch and self.stable_samples < self.recovery_samples)
         return ContinuityResult(out_p, out_yaw, out_v, recovering, reanchored,
-                                reason, self.epoch, event, detail)
+                                reason, self.epoch, event, detail, out_q)
 
     def update(self, position, yaw, velocity, yaw_rate, timestamp, frame_key,
                force_reanchor_reason=None, recovery_displacement=None,
-               recovery_yaw_delta=0.0):
-        sample = (position, yaw, velocity, yaw_rate, timestamp, frame_key)
+               recovery_yaw_delta=0.0, orientation=None, recovery_orientation=None,
+               heading_reference=None, require_heading=False):
+        if require_heading and not self.full_attitude:
+            raise ValueError("Continuous PX4 heading requires full-attitude continuity")
+        if heading_reference is not None and not math.isfinite(heading_reference):
+            raise ValueError("Heading reference must be finite")
+        if self.full_attitude:
+            orientation = rot.normalize(orientation)
+        sample = (position, yaw, velocity, yaw_rate, timestamp, frame_key, orientation)
         accepted = self._accepted_sample()
-        if accepted is None: return self._accept(sample)
+        if accepted is None:
+            return self._accept(sample, heading_reference=heading_reference, require_heading=require_heading)
 
         if force_reanchor_reason:
             self._start_recovery()
@@ -194,10 +283,14 @@ class LocalPoseContinuity:
                                   self.suspect_detail)
         elif not self.suspect_samples:
             reason = self._motion_reason(accepted, sample)
+            if self.recovery_anchor_position is not None and self.suspect_reason:
+                reason = reason or self.suspect_reason
             if reason is None:
                 return self._accept(
                     sample, recovery_displacement=recovery_displacement,
                     recovery_yaw_delta=recovery_yaw_delta,
+                    recovery_orientation=recovery_orientation,
+                    heading_reference=heading_reference, require_heading=require_heading,
                 )
             self._start_recovery()
             self.suspect_reason, self.suspect_samples = reason, [sample]
@@ -235,11 +328,19 @@ class LocalPoseContinuity:
         self.translation = (self.recovery_anchor_position[0]-rx,
                             self.recovery_anchor_position[1]-ry,
                             self.recovery_anchor_position[2]-anchor_p[2])
+        if self.full_attitude:
+            self.correction_q = rot.multiply(self.recovery_anchor_orientation,
+                                            rot.inverse(self.suspect_samples[0][6]))
+            self.correction_matrix = rot.matrix(self.correction_q)
+            rp = rot.rotate_matrix(self.correction_matrix, anchor_p)
+            self.translation = tuple(self.recovery_anchor_position[i]-rp[i]
+                                     for i in range(3))
         reason, detail = self.suspect_reason, self.suspect_detail
         self._clear_suspect()
         self.epoch += 1
         self.stable_samples = 0
         return self._accept(
             sample, True, reason, "reset_confirmed", detail,
-            recovery_displacement, recovery_yaw_delta,
+            recovery_displacement, recovery_yaw_delta, recovery_orientation,
+            heading_reference, require_heading,
         )

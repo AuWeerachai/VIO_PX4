@@ -121,6 +121,14 @@ class Config:
     recovery_yaw_agreement_samples: int = 5
     recovery_reset_rotation_budget_deg: float = 2.0  # legacy config, inactive
     recovery_accuracy_tighten_s: float = 5.0
+    dynamic_repositioning_enabled: bool = True
+    recovery_max_body_tilt_deg: float = 10.0
+    recovery_attitude_agreement_deg: float = 5.0
+    continuity_tilt_disagreement_deg: float = 10.0
+    continuity_tilt_disagreement_samples: int = 5
+    attitude_pair_max_skew_s: float = 0.03
+    timesync_max_rtt_s: float = 0.05
+    timesync_max_age_s: float = 2.0
     rviz_enabled: bool = False
     state_dir: Path = field(default_factory=lambda: Path.home() / ".local/state/vio-launch")
 
@@ -207,6 +215,14 @@ def save_config(cfg: Config) -> None:
         "recovery_yaw_agreement_deg": cfg.recovery_yaw_agreement_deg,
         "recovery_yaw_agreement_samples": cfg.recovery_yaw_agreement_samples,
         "recovery_accuracy_tighten_s": cfg.recovery_accuracy_tighten_s,
+        "dynamic_repositioning_enabled": cfg.dynamic_repositioning_enabled,
+        "recovery_max_body_tilt_deg": cfg.recovery_max_body_tilt_deg,
+        "recovery_attitude_agreement_deg": cfg.recovery_attitude_agreement_deg,
+        "continuity_tilt_disagreement_deg": cfg.continuity_tilt_disagreement_deg,
+        "continuity_tilt_disagreement_samples": cfg.continuity_tilt_disagreement_samples,
+        "attitude_pair_max_skew_s": cfg.attitude_pair_max_skew_s,
+        "timesync_max_rtt_s": cfg.timesync_max_rtt_s,
+        "timesync_max_age_s": cfg.timesync_max_age_s,
         "rviz_enabled": cfg.rviz_enabled,
         "vio_px4_dir": str(cfg.vio_px4_dir),
         "ros_setup": str(cfg.ros_setup),
@@ -216,6 +232,8 @@ def save_config(cfg: Config) -> None:
 
 
 def heading_label(cfg: Config) -> str:
+    if cfg.dynamic_repositioning_enabled:
+        return "PX4 heading for every movement step (time-matched)"
     if cfg.heading_source in ("px4", "compass"):
         return "PX4 estimated heading (declination handled by PX4)"
     return f"manual true heading {cfg.manual_heading_deg:g}°"
@@ -273,6 +291,14 @@ def apply_dict(cfg: Config, data: dict) -> Config:
         "recovery_yaw_agreement_samples",
         "recovery_reset_rotation_budget_deg",
         "recovery_accuracy_tighten_s",
+        "dynamic_repositioning_enabled",
+        "recovery_max_body_tilt_deg",
+        "recovery_attitude_agreement_deg",
+        "continuity_tilt_disagreement_deg",
+        "continuity_tilt_disagreement_samples",
+        "attitude_pair_max_skew_s",
+        "timesync_max_rtt_s",
+        "timesync_max_age_s",
         "rviz_enabled",
     ):
         if key in data and data[key] is not None:
@@ -1276,8 +1302,8 @@ def cmd_gps(cfg: Config) -> None:
         # Keep the stationary bootstrap active for the full configured duration.
         # PX4/QGroundControl receives STATUSTEXT when spoof starts and when VIO takes over.
         "spoof_until_vio": "false",
-        "boot_accuracy_m": 0.1,
-        "cruise_eph_m": 0.1,
+        "boot_accuracy_m": 0.05,
+        "cruise_eph_m": 0.05,
         # Maximum numeric MAVLink value; 255 is reserved for "unknown".
         "satellites": 40,
         "horizontal_only_output": "true",
@@ -1291,11 +1317,11 @@ def cmd_gps(cfg: Config) -> None:
         "rc_request_rate_hz": 10.0,
         "rate_hz": 10.0,
         "odom_topic": cfg.odom_topic,
-        "heading_source": cfg.heading_source,
+        "heading_source": "px4" if cfg.dynamic_repositioning_enabled else cfg.heading_source,
         "manual_heading_deg": cfg.manual_heading_deg,
         "mag_declination_source": cfg.mag_declination_source,
         "mag_declination_deg": cfg.mag_declination_deg,
-        "child_to_body_yaw_deg": cfg.child_to_body_yaw_deg,
+        "child_to_body_yaw_deg": 0.0 if cfg.dynamic_repositioning_enabled else cfg.child_to_body_yaw_deg,
         "expected_child_frame": "drone_link",
         "continuity_max_gap_s": cfg.gate_max_gap_s,
         "continuity_recovery_samples": cfg.gate_recovery_samples,
@@ -1312,11 +1338,20 @@ def cmd_gps(cfg: Config) -> None:
         "recovery_yaw_agreement_deg": cfg.recovery_yaw_agreement_deg,
         "recovery_yaw_agreement_samples": cfg.recovery_yaw_agreement_samples,
         "recovery_accuracy_tighten_s": cfg.recovery_accuracy_tighten_s,
+        "dynamic_repositioning_enabled": cfg.dynamic_repositioning_enabled,
+        "recovery_max_body_tilt_deg": cfg.recovery_max_body_tilt_deg,
+        "recovery_attitude_agreement_deg": cfg.recovery_attitude_agreement_deg,
+        "continuity_tilt_disagreement_deg": cfg.continuity_tilt_disagreement_deg,
+        "continuity_tilt_disagreement_samples": cfg.continuity_tilt_disagreement_samples,
+        "attitude_pair_max_skew_s": cfg.attitude_pair_max_skew_s,
+        "timesync_max_rtt_s": cfg.timesync_max_rtt_s,
+        "timesync_max_age_s": cfg.timesync_max_age_s,
         "status_file": str(cfg.state_dir / "navigation-status.json"),
         "camera_imu_required": "true" if selected_camera_mode(cfg) == "vio" else "false",
     }
     param_args = " ".join(
-        f"-p {shlex.quote(f'{name}:={value}')}" for name, value in params.items()
+        f"-p {shlex.quote(name + ':=' + (str(value).lower() if isinstance(value, bool) else str(value)))}"
+        for name, value in params.items()
     )
     cmd = (
         f"{ros_prefix(cfg, [setup])} && ros2 run vio_px4_bridge vio_px4_gps_bridge --ros-args"
@@ -1391,6 +1426,10 @@ def show_navigation_status(cfg: Config) -> None:
     print(f"- Connection status: {connection}")
     print(f"- VIO status: {vio_status}")
     print(f"- Pose-jump gate status: {gate_status}")
+    if status.get("dynamic_repositioning_enabled"):
+        heading = status.get("px4_reference_heading_deg")
+        text = "waiting for paired data" if heading is None else f"last paired {heading:.1f}°"
+        print(f"- Heading reference: continuous PX4 | {text}")
     if navigation in ("spoof_active", "waiting_for_rc"):
         print(f"- Spoof health check: {status.get('handoff_check_reason') or 'healthy'}")
     if status.get("spoof_failure_reason"):
@@ -1432,18 +1471,26 @@ def show_navigation_status(cfg: Config) -> None:
                 "stays stopped because heading cannot be verified "
                 f"({status.get('inertial_recovery_failure') or 'unknown reason'})"
             )
-        yaw_state = status.get("recovery_yaw_agreement_state", "unknown")
-        yaw_count = int(status.get("recovery_yaw_agreement_count", 0))
-        yaw_residual = status.get("recovery_yaw_residual_deg")
-        residual_text = (
-            "not evaluated" if yaw_residual is None
-            else f"{float(yaw_residual):+.1f} deg"
-        )
-        print(
-            f"- Recovery yaw-change agreement: {yaw_state} "
-            f"({yaw_count}/{cfg.recovery_yaw_agreement_samples}, "
-            f"residual={residual_text})"
-        )
+        if status.get("dynamic_repositioning_enabled"):
+            count = status.get("recovery_frame_samples", 0)
+            needed = status.get("recovery_frame_required_samples", 0)
+            tilt = status.get("px4_body_tilt_deg")
+            tilt_text = "unavailable" if tilt is None else f"{tilt:.1f}°"
+            print(f"- 3D recovery: {status.get('recovery_frame_state', 'unknown')} "
+                  f"({count}/{needed}); PX4 body tilt {tilt_text}")
+        else:
+            yaw_state = status.get("recovery_yaw_agreement_state", "unknown")
+            yaw_count = int(status.get("recovery_yaw_agreement_count", 0))
+            yaw_residual = status.get("recovery_yaw_residual_deg")
+            residual_text = (
+                "not evaluated" if yaw_residual is None
+                else f"{float(yaw_residual):+.1f} deg"
+            )
+            print(
+                f"- Recovery yaw-change agreement: {yaw_state} "
+                f"({yaw_count}/{cfg.recovery_yaw_agreement_samples}, "
+                f"residual={residual_text})"
+            )
         reordered = (
             int(status.get("inertial_reordered_odometry_drops", 0))
             + int(status.get("inertial_reordered_yaw_drops", 0))
@@ -1655,6 +1702,15 @@ def configure_home(cfg: Config) -> Config:
 
 def configure_heading(cfg: Config) -> Config:
     _clear()
+    if cfg.dynamic_repositioning_enabled:
+        print("Heading reference: PX4 (continuous)\n")
+        print("Each new VO movement step uses PX4 heading from the matching time.")
+        print("Previous positions stay unchanged. No VO heading is sent to PX4.")
+        print("Verify PX4 heading; keep still during spoofing. Camera mounting is set in Camera extrinsic.")
+        cfg = replace(cfg, heading_source="px4", child_to_body_yaw_deg=0.0)
+        save_config(cfg)
+        pause()
+        return cfg
     print("Configure startup heading alignment\n")
     print("PX4 mode inherits the flight controller's estimated heading.")
     print("The bridge does not add declination or calculate compass heading again.")
@@ -1759,12 +1815,20 @@ def configure_pose_gate(cfg: Config) -> Config:
     print("Configure VIO continuity / pose-jump gate\n")
     print("A sample is quarantined when a physical or timing limit is exceeded.")
     print("Quarantined samples do not update the accepted local trajectory.\n")
+    enabled = prompt_line("Dynamic positioning: continuous PX4 heading + 3D recovery (on/off)",
+                          "on" if cfg.dynamic_repositioning_enabled else "off")
+    if enabled is None:
+        return cfg
+    if enabled.strip().lower() not in ("on", "off"):
+        print("Enter on or off.")
+        pause()
+        return cfg
     groups = (
         ("Physical rate limits", (
             ("speed", "Maximum speed m/s", cfg.gate_max_speed_m_s, float, 0.0),
             ("acceleration", "Maximum acceleration m/s^2",
              cfg.gate_max_acceleration_m_s2, float, 0.0),
-            ("yaw_rate", "Maximum yaw rate deg/s",
+            ("yaw_rate", "Maximum rotation rate deg/s (all axes in 3D mode)",
              cfg.gate_max_yaw_rate_deg_s, float, 0.0),
         )),
         ("Timing", (
@@ -1776,10 +1840,10 @@ def configure_pose_gate(cfg: Config) -> Config:
             ("recovery", "Stable samples before output resumes",
              cfg.gate_recovery_samples, int, 0),
         )),
-        ("GPS-silent PX4 inertial propagation", (
-            ("inertial_age", "Maximum PX4 motion-message age s",
+        ("PX4 reference health (heading and recovery)", (
+            ("inertial_age", "Maximum PX4 reference-message age / matched-output wait s",
              cfg.inertial_max_message_age_s, float, 0.0),
-            ("inertial_gap", "Maximum PX4 motion-message gap s",
+            ("inertial_gap", "Maximum PX4 reference-message gap s",
              cfg.inertial_max_message_gap_s, float, 0.0),
             ("inertial_reorder", "Small timestamp-reorder tolerance s",
              cfg.inertial_reorder_tolerance_s, float, -1.0),
@@ -1793,10 +1857,26 @@ def configure_pose_gate(cfg: Config) -> Config:
              cfg.recovery_velocity_agreement_samples, int, 0),
             ("yaw_agreement", "Maximum VIO/PX4 yaw-change disagreement deg",
              cfg.recovery_yaw_agreement_deg, float, 0.0),
-            ("yaw_samples", "Consecutive unique PX4 yaw-agreement samples",
+            ("yaw_samples", "Consecutive unique PX4 attitude-agreement samples",
              cfg.recovery_yaw_agreement_samples, int, 0),
-            ("accuracy_tighten", "Seconds to tighten GPS accuracy back to 0.1 m",
+            ("accuracy_tighten", "GPS accuracy-ramp duration s (recovery uncertainty floor retained)",
              cfg.recovery_accuracy_tighten_s, float, -1.0),
+        )),
+        ("Full 3D recovery / level-body check", (
+            ("body_tilt", "Maximum PX4 body tilt when resuming deg",
+             cfg.recovery_max_body_tilt_deg, float, 0.0),
+            ("attitude_agreement", "Maximum 3D rotation disagreement during recovery deg",
+             cfg.recovery_attitude_agreement_deg, float, 0.0),
+            ("tilt_disagreement", "VO/PX4 tilt disagreement to trigger quarantine deg",
+             cfg.continuity_tilt_disagreement_deg, float, 0.0),
+            ("tilt_samples", "Consecutive unique tilt-disagreement samples",
+             cfg.continuity_tilt_disagreement_samples, int, 0),
+            ("pair_skew", "Maximum attitude pairing/clock uncertainty s",
+             cfg.attitude_pair_max_skew_s, float, 0.0),
+            ("sync_rtt", "Maximum time-sync round trip s",
+             cfg.timesync_max_rtt_s, float, 0.0),
+            ("sync_age", "Maximum time-sync age s",
+             cfg.timesync_max_age_s, float, 0.0),
         )),
     )
     values: dict[str, float | int] = {}
@@ -1815,6 +1895,9 @@ def configure_pose_gate(cfg: Config) -> Config:
                 if value <= minimum:
                     raise ValueError(f"{label} must be greater than {minimum:g}")
                 values[key] = value
+        for key in ("body_tilt", "attitude_agreement", "tilt_disagreement"):
+            if values[key] >= 90:
+                raise ValueError("3D tilt/attitude limits must be below 90 degrees")
     except ValueError as exc:
         print(f"Invalid gate configuration: {exc}")
         pause()
@@ -1836,20 +1919,31 @@ def configure_pose_gate(cfg: Config) -> Config:
         recovery_yaw_agreement_deg=float(values["yaw_agreement"]),
         recovery_yaw_agreement_samples=int(values["yaw_samples"]),
         recovery_accuracy_tighten_s=float(values["accuracy_tighten"]),
+        dynamic_repositioning_enabled=enabled.strip().lower() == "on",
+        recovery_max_body_tilt_deg=float(values["body_tilt"]),
+        recovery_attitude_agreement_deg=float(values["attitude_agreement"]),
+        continuity_tilt_disagreement_deg=float(values["tilt_disagreement"]),
+        continuity_tilt_disagreement_samples=int(values["tilt_samples"]),
+        attitude_pair_max_skew_s=float(values["pair_skew"]),
+        timesync_max_rtt_s=float(values["sync_rtt"]),
+        timesync_max_age_s=float(values["sync_age"]),
     )
     save_config(cfg)
     print("\nSaved pose-jump gate limits.")
-    print(
-        "Note: speed and yaw-rate limits are automatically converted into "
-        "allowed position and heading changes using the measured time between "
-        "arriving odometry messages."
-    )
+    if cfg.dynamic_repositioning_enabled:
+        print("Each new VO movement step uses time-matched PX4 heading. "
+              "Recovery also corrects roll/pitch. PX4 must be nearly level; VO may have "
+              "any stable numerical tilt. No VO heading is sent to PX4. "
+              "The legacy yaw-only disagreement limit is inactive in this mode.")
+    rotation = "3D rotation" if cfg.dynamic_repositioning_enabled else "heading"
+    print("Note: physical rate limits are converted into allowed position and "
+          f"{rotation} changes using odometry measurement timestamps.")
     print(
         "During quarantine, PX4 odometry is used only while HIL_GPS is silent. "
         "There is no fixed duration cutoff. "
         "If position propagation fails a guard, position remains frozen. "
-        "Recovery uses current FCU heading after fresh camera/FCU agreement; "
-        "it does not require uninterrupted heading during the disturbance."
+        "Recovery requires fresh camera/FCU agreement; it does not require "
+        "uninterrupted telemetry during the disturbance."
     )
     print("The new limits take effect the next time Path A starts.")
     pause()
@@ -1937,8 +2031,8 @@ def interactive_main(cfg: Config) -> int:
                 MenuItem(
                     "Heading alignment",
                     "heading",
-                    f"{heading_label(cfg)}; "
-                    f"child→body={cfg.child_to_body_yaw_deg}°",
+                    heading_label(cfg) if cfg.dynamic_repositioning_enabled else
+                    f"{heading_label(cfg)}; child→body={cfg.child_to_body_yaw_deg}°",
                 ),
                 MenuItem(
                     "Camera extrinsic (ROS FLU XYZ/RPY)",

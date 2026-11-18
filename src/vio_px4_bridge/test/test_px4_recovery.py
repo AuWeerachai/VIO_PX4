@@ -10,9 +10,11 @@ import pytest
 from vio_px4_bridge.geo_utils import (
     mavlink_velocity_to_ned, rotate_ned_heading, wrap_pi, enu_offset_to_ned,
     yaw_from_quaternion_xyzw, ned_offset_to_lla,
+    rotate_vector_by_quaternion_xyzw,
 )
 from vio_px4_bridge.recovery_yaw import RecoveryYawAgreement, timestamp_order
 from vio_px4_bridge.local_continuity import LocalPoseContinuity
+from vio_px4_bridge import frame_rotation as rot
 
 
 def test_velocity_frame_is_independent_of_position_frame():
@@ -46,21 +48,26 @@ def bridge():
              '_validated_recovery_target', '_reset_recovery_agreement',
              '_refresh_recovery_heading',
              '_poll_mavlink',
+             '_dynamic_quarantine', '_match_dynamic_frame',
+             '_record_px4_frame_attitude',
+             '_handoff_block_reason',
              '_recovery_velocity_agrees', '_tick', '_odom_callback',
              '_recovery_yaw_agrees', '_finish_inertial_propagation', '_select_accuracy'}
     module = ast.Module(body=[n for n in cls.body if getattr(n, 'name', '') in names],
                         type_ignores=[])
     clock = SimpleNamespace(now=10.0)
     clock.monotonic = lambda: clock.now
-    ns = dict(time=clock, math=math, wrap_pi=wrap_pi,
+    ns = dict(time=clock, math=math, rot=rot, wrap_pi=wrap_pi,
               rotate_ned_heading=rotate_ned_heading, timestamp_order=timestamp_order,
               Odometry=SimpleNamespace, enu_offset_to_ned=enu_offset_to_ned,
               yaw_from_quaternion_xyzw=yaw_from_quaternion_xyzw,
               ned_offset_to_lla=ned_offset_to_lla,
+              rotate_vector_by_quaternion_xyzw=rotate_vector_by_quaternion_xyzw,
               mavlink_velocity_to_ned=mavlink_velocity_to_ned,
               Phase=SimpleNamespace(SPOOF='spoof', LIVE='live', ALIGNING='aligning', WAITING='waiting'))
     exec(compile(module, str(source), 'exec'), ns)
     obj = type('RecoveryHarness', (), {name: ns[name] for name in names})()
+    obj.dynamic_repositioning_enabled = False
     obj.get_logger = Mock(return_value=Mock())
     obj._send_status_text = Mock()
     obj.clock = clock
@@ -421,6 +428,7 @@ def telemetry(bridge, t, counter, yaw=0., gyro_z=0., attitude_first=True,
     bridge.clock.now = t
     odom = SimpleNamespace(
         get_type=lambda: 'ODOMETRY', get_srcSystem=lambda: 1,
+        get_srcComponent=lambda: 1,
         time_usec=round(t*1e6), frame_id=1, child_frame_id=1, estimator_type=8,
         x=north, y=east, vx=vn, vy=ve, vz=0., q=(math.cos(yaw/2), 0., 0., math.sin(yaw/2)),
         rollspeed=0., pitchspeed=0., yawspeed=gyro_z,

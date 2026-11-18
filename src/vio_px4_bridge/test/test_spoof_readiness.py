@@ -115,6 +115,7 @@ def bridge():
     ns = dict(Enum=Enum, time=clock)
     exec(compile(ast.Module(body=[phase_class, *nodes], type_ignores=[]), str(source), 'exec'), ns)
     obj = type('HandoffHarness', (), {name: ns[name] for name in names})()
+    obj.dynamic_repositioning_enabled = False
     obj.Phase = ns['Phase']
     obj.phase = obj.Phase.SPOOF
     obj.transport = 'mavlink'

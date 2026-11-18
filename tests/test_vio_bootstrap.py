@@ -231,8 +231,110 @@ def test_heading_defaults_migrate_saved_compass_without_changing_extrinsics():
     assert cli.apply_dict(cfg, {'heading_source': 'manual'}).heading_source == 'manual'
 
 
+def test_gps_only_rollback_ignores_heading_experiment_and_uses_five_cm(tmp_path):
+    cfg = cli.apply_dict(cli.Config(vio_px4_dir=tmp_path,
+                         mavlink_url='udpout:127.0.0.1:14540',
+                         state_dir=tmp_path/'state'),
+                         {'send_vo_heading': True, 'heading_std_deg': 1.0})
+    assert not hasattr(cfg, 'send_vo_heading')
+    (tmp_path/'install').mkdir()
+    (tmp_path/'install/setup.bash').touch()
+    with patch.object(cli, 'find_proc', return_value=None), \
+         patch.object(cli, 'require_camera_ready'), \
+         patch.object(cli, 'ros_prefix', return_value='true'), \
+         patch.object(cli, 'start_managed', side_effect=RuntimeError('capture only')) as start:
+        with pytest.raises(RuntimeError, match='capture only'):
+            cli.cmd_gps(cfg)
+    command = start.call_args.args[2]
+    assert 'boot_accuracy_m:=0.05' in command
+    assert 'cruise_eph_m:=0.05' in command
+    assert 'rate_hz:=10.0' in command
+    assert 'send_vo_heading' not in command
+    assert 'heading_std_deg' not in command
+
+
+def test_direct_bridge_healthy_accuracy_defaults_are_five_cm():
+    import ast
+    tree = ast.parse((ROOT/'src/vio_px4_bridge/vio_px4_bridge/vio_px4_gps_bridge.py').read_text())
+    declarations = {n.args[0].value: n.args[1].value for n in ast.walk(tree)
+                    if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == 'declare_parameter' and len(n.args) == 2
+                    and all(isinstance(a, ast.Constant) for a in n.args)}
+    assert declarations['boot_accuracy_m'] == .05
+    assert declarations['cruise_eph_m'] == .05
+    assert declarations['rate_hz'] == 10.
+    assert 'send_vo_heading' not in declarations
+
+
+@pytest.mark.parametrize('enabled', [True, False])
+def test_dynamic_recovery_configuration_saved_and_forwarded(tmp_path, enabled):
+    values = dict(dynamic_repositioning_enabled=enabled,
+                  recovery_max_body_tilt_deg=8.0, recovery_attitude_agreement_deg=4.0,
+                  continuity_tilt_disagreement_deg=9.0, continuity_tilt_disagreement_samples=6,
+                  attitude_pair_max_skew_s=.04, timesync_max_rtt_s=.06, timesync_max_age_s=1.5)
+    cfg = cli.apply_dict(cli.Config(vio_px4_dir=tmp_path, state_dir=tmp_path/'state',
+                                   heading_source='manual', child_to_body_yaw_deg=180.,
+                                   mavlink_url='udpout:127.0.0.1:14540'), values)
+    with patch.object(cli, 'user_config_path', return_value=tmp_path/'config.json'):
+        cli.save_config(cfg)
+        loaded = cli.load_config()
+    for name, value in values.items():
+        assert getattr(loaded, name) == value
+    (tmp_path/'install').mkdir()
+    (tmp_path/'install/setup.bash').touch()
+    with patch.object(cli, 'find_proc', return_value=None), \
+         patch.object(cli, 'require_camera_ready'), \
+         patch.object(cli, 'ros_prefix', return_value='true'), \
+         patch.object(cli, 'start_managed', side_effect=RuntimeError('capture only')) as start:
+        with pytest.raises(RuntimeError, match='capture only'):
+            cli.cmd_gps(cfg)
+    command = start.call_args.args[2]
+    for name, value in values.items():
+        expected = str(value).lower() if isinstance(value, bool) else str(value)
+        assert f'{name}:={expected}' in command
+    assert 'camera_imu_required:=false' in command
+    assert 'send_vo_heading' not in command
+    assert f"heading_source:={'px4' if enabled else 'manual'}" in command
+    assert f"child_to_body_yaw_deg:={0.0 if enabled else 180.0}" in command
+
+
+def test_dynamic_recovery_status_does_not_show_unused_yaw_check(tmp_path, capsys):
+    status = dict(updated_unix_s=cli.time.time(), navigation='recovering',
+                  px4_connected=True, pose_gate_quarantine=True,
+                  inertial_recovery_active=True, recovery_position_safe=False,
+                  recovery_heading_safe=True, recovery_frame_samples=2,
+                  recovery_frame_required_samples=5, px4_body_tilt_deg=3.,
+                  dynamic_repositioning_enabled=True, recovery_frame_state='collecting_3d_attitude_agreement')
+    with patch.object(cli.Path, 'read_text', return_value=cli.json.dumps(status)):
+        cli.show_navigation_status(cli.Config(state_dir=tmp_path))
+    output = capsys.readouterr().out
+    assert '3D recovery' in output and '(2/5)' in output
+    assert 'Recovery yaw-change agreement' not in output
+
+
+def test_dynamic_recovery_menu_exposes_all_new_limits():
+    with patch.object(cli, 'prompt_line', side_effect=lambda label, default: default) as prompt, \
+         patch.object(cli, 'save_config') as save, patch.object(cli, 'pause'), patch.object(cli, '_clear'):
+        cfg = cli.configure_pose_gate(cli.Config())
+    assert cfg.dynamic_repositioning_enabled
+    save.assert_called_once_with(cfg)
+    labels = [call.args[0] for call in prompt.call_args_list]
+    assert any('PX4 body tilt' in label for label in labels)
+    assert any('3D rotation disagreement' in label for label in labels)
+    assert any('clock uncertainty' in label for label in labels)
+
+
+def test_dynamic_recovery_menu_refuses_ninety_degree_level_tolerance():
+    with patch.object(cli, 'prompt_line', side_effect=lambda label, default:
+                      '90' if 'PX4 body tilt' in label else default), \
+         patch.object(cli, 'save_config') as save, patch.object(cli, 'pause'), patch.object(cli, '_clear'):
+        cfg = cli.Config()
+        assert cli.configure_pose_gate(cfg) is cfg
+    save.assert_not_called()
+
+
 def test_heading_menu_no_longer_prompts_for_bridge_declination():
-    cfg = cli.Config()
+    cfg = cli.Config(dynamic_repositioning_enabled=False)
     with patch.object(cli, '_clear'), patch.object(cli, 'pause'), \
          patch.object(cli, 'prompt_line', side_effect=['px4', '0']) as prompt, \
          patch.object(cli, 'save_config') as save:
@@ -241,6 +343,16 @@ def test_heading_menu_no_longer_prompts_for_bridge_declination():
     assert prompt.call_count == 2
     assert all('declination' not in call.args[0].lower() for call in prompt.call_args_list)
     save.assert_called_once_with(changed)
+
+
+def test_dynamic_heading_menu_uses_only_px4_and_no_extra_camera_yaw():
+    cfg = cli.Config(heading_source='manual', child_to_body_yaw_deg=180.)
+    with patch.object(cli, '_clear'), patch.object(cli, 'pause'), \
+         patch.object(cli, 'prompt_line') as prompt, patch.object(cli, 'save_config'):
+        updated = cli.configure_heading(cfg)
+    assert updated.heading_source == 'px4' and updated.child_to_body_yaw_deg == 0.
+    assert 'every movement step' in cli.heading_label(updated)
+    prompt.assert_not_called()
 
 
 def test_default_and_explicit_modes(tmp_path):
