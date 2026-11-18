@@ -1276,8 +1276,8 @@ def cmd_gps(cfg: Config) -> None:
         # Keep the stationary bootstrap active for the full configured duration.
         # PX4/QGroundControl receives STATUSTEXT when spoof starts and when VIO takes over.
         "spoof_until_vio": "false",
-        "boot_accuracy_m": 0.1,
-        "cruise_eph_m": 0.1,
+        "boot_accuracy_m": 0.05,
+        "cruise_eph_m": 0.05,
         # Maximum numeric MAVLink value; 255 is reserved for "unknown".
         "satellites": 40,
         "horizontal_only_output": "true",
@@ -1795,7 +1795,7 @@ def configure_pose_gate(cfg: Config) -> Config:
              cfg.recovery_yaw_agreement_deg, float, 0.0),
             ("yaw_samples", "Consecutive unique PX4 yaw-agreement samples",
              cfg.recovery_yaw_agreement_samples, int, 0),
-            ("accuracy_tighten", "Seconds to tighten GPS accuracy back to 0.1 m",
+            ("accuracy_tighten", "GPS accuracy-ramp duration s (recovery uncertainty floor retained)",
              cfg.recovery_accuracy_tighten_s, float, -1.0),
         )),
     )

@@ -231,6 +231,46 @@ def test_heading_defaults_migrate_saved_compass_without_changing_extrinsics():
     assert cli.apply_dict(cfg, {'heading_source': 'manual'}).heading_source == 'manual'
 
 
+def test_stable_main_reports_five_cm_without_dynamic_or_heading_experiments(tmp_path):
+    cfg = cli.apply_dict(cli.Config(vio_px4_dir=tmp_path,
+                         mavlink_url='udpout:127.0.0.1:14540',
+                         state_dir=tmp_path/'state'),
+                         {'send_vo_heading': True, 'heading_std_deg': 1.0,
+                          'dynamic_repositioning_enabled': True})
+    assert not hasattr(cfg, 'send_vo_heading')
+    assert not hasattr(cfg, 'dynamic_repositioning_enabled')
+    (tmp_path/'install').mkdir()
+    (tmp_path/'install/setup.bash').touch()
+    with patch.object(cli, 'find_proc', return_value=None), \
+         patch.object(cli, 'require_camera_ready'), \
+         patch.object(cli, 'ros_prefix', return_value='true'), \
+         patch.object(cli, 'start_managed', side_effect=RuntimeError('capture only')) as start:
+        with pytest.raises(RuntimeError, match='capture only'):
+            cli.cmd_gps(cfg)
+    command = start.call_args.args[2]
+    assert 'boot_accuracy_m:=0.05' in command
+    assert 'cruise_eph_m:=0.05' in command
+    assert 'rate_hz:=10.0' in command
+    assert 'camera_imu_required:=false' in command
+    assert 'send_vo_heading' not in command
+    assert 'dynamic_repositioning_enabled' not in command
+
+
+def test_stable_direct_bridge_defaults_are_five_cm_without_experiments():
+    import ast
+    tree = ast.parse((ROOT/'src/vio_px4_bridge/vio_px4_bridge/vio_px4_gps_bridge.py').read_text())
+    declarations = {n.args[0].value: n.args[1].value for n in ast.walk(tree)
+                    if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == 'declare_parameter' and len(n.args) == 2
+                    and all(isinstance(a, ast.Constant) for a in n.args)}
+    assert declarations['boot_accuracy_m'] == .05
+    assert declarations['cruise_eph_m'] == .05
+    assert declarations['spoof_eph_m'] == .5
+    assert declarations['rate_hz'] == 10.
+    assert 'send_vo_heading' not in declarations
+    assert 'dynamic_repositioning_enabled' not in declarations
+
+
 def test_heading_menu_no_longer_prompts_for_bridge_declination():
     cfg = cli.Config()
     with patch.object(cli, '_clear'), patch.object(cli, 'pause'), \
