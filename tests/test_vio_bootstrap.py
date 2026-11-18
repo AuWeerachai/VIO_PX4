@@ -220,6 +220,30 @@ def test_heading_retry_has_only_std_as_new_tuning_prompt():
     save.assert_called_once_with(changed)
 
 
+def test_pose_gate_prompts_match_recovery_and_preserve_legacy_tightening_setting(capsys):
+    cfg = cli.Config(gate_max_gap_s=.5, inertial_max_position_uncertainty_m=1.,
+                     recovery_velocity_agreement_m_s=1., recovery_yaw_agreement_deg=3.,
+                     recovery_accuracy_tighten_s=7.)
+    prompts = []
+
+    def enter(prompt):
+        prompts.append(prompt)
+        return ''
+
+    with patch.object(cli, '_clear'), patch.object(cli, 'pause'), \
+         patch('builtins.input', side_effect=enter), patch.object(cli, 'save_config') as save:
+        changed = cli.configure_pose_gate(cfg)
+    assert changed == cfg
+    save.assert_called_once_with(cfg)
+    assert len(prompts) == 14
+    assert not any('tighten' in prompt.lower() for prompt in prompts)
+    assert any('between camera timestamps' in prompt for prompt in prompts)
+    assert any('after reset confirmation' in prompt for prompt in prompts)
+    output = capsys.readouterr().out
+    assert 'Higher recovery uncertainty is retained' in output
+    assert 'separate from the missing-message timeout' in output
+
+
 @pytest.mark.parametrize('value', ['nan', '-1', '0', '91'])
 def test_heading_retry_rejects_invalid_std_without_saving(value):
     cfg = cli.Config()

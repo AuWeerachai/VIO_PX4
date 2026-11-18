@@ -122,6 +122,7 @@ class Config:
     recovery_yaw_agreement_deg: float = 20.0
     recovery_yaw_agreement_samples: int = 5
     recovery_reset_rotation_budget_deg: float = 2.0  # legacy config, inactive
+    # Retained for config compatibility; cannot lower inherited recovery uncertainty.
     recovery_accuracy_tighten_s: float = 5.0
     rviz_enabled: bool = False
     state_dir: Path = field(default_factory=lambda: Path.home() / ".local/state/vio-launch")
@@ -1790,12 +1791,12 @@ def configure_pose_gate(cfg: Config) -> Config:
              cfg.gate_max_yaw_rate_deg_s, float, 0.0),
         )),
         ("Timing", (
-            ("gap", "Maximum tracking gap s", cfg.gate_max_gap_s, float, 0.0),
+            ("gap", "Maximum gap between camera timestamps s", cfg.gate_max_gap_s, float, 0.0),
         )),
         ("Coordinate-reset recovery", (
             ("confirmation", "Samples to confirm a coordinate reset",
              cfg.gate_confirmation_samples, int, 1),
-            ("recovery", "Stable samples before output resumes",
+            ("recovery", "Stable samples after reset confirmation",
              cfg.gate_recovery_samples, int, 0),
         )),
         ("GPS-silent PX4 inertial propagation", (
@@ -1811,14 +1812,12 @@ def configure_pose_gate(cfg: Config) -> Config:
         ("VIO handoff", (
             ("velocity_agreement", "Maximum VIO/PX4 velocity disagreement m/s",
              cfg.recovery_velocity_agreement_m_s, float, 0.0),
-            ("velocity_samples", "Consecutive velocity-agreement samples",
+            ("velocity_samples", "Consecutive unique PX4 velocity-agreement samples",
              cfg.recovery_velocity_agreement_samples, int, 0),
             ("yaw_agreement", "Maximum VIO/PX4 yaw-change disagreement deg",
              cfg.recovery_yaw_agreement_deg, float, 0.0),
             ("yaw_samples", "Consecutive unique PX4 yaw-agreement samples",
              cfg.recovery_yaw_agreement_samples, int, 0),
-            ("accuracy_tighten", "GPS accuracy tightening seconds (0.01 m floor; recovery uncertainty retained)",
-             cfg.recovery_accuracy_tighten_s, float, -1.0),
         )),
     )
     values: dict[str, float | int] = {}
@@ -1857,15 +1856,14 @@ def configure_pose_gate(cfg: Config) -> Config:
         recovery_velocity_agreement_samples=int(values["velocity_samples"]),
         recovery_yaw_agreement_deg=float(values["yaw_agreement"]),
         recovery_yaw_agreement_samples=int(values["yaw_samples"]),
-        recovery_accuracy_tighten_s=float(values["accuracy_tighten"]),
     )
     save_config(cfg)
     print("\nSaved pose-jump gate limits.")
     print(
         "Note: speed and yaw-rate limits are automatically converted into "
-        "allowed position and heading changes using the measured time between "
-        "arriving odometry messages."
+        "allowed position and heading changes using camera timestamps."
     )
+    print("The camera timestamp-gap limit is separate from the missing-message timeout.")
     print(
         "During quarantine, PX4 odometry is used only while HIL_GPS is silent. "
         "There is no fixed duration cutoff. "
@@ -1873,6 +1871,8 @@ def configure_pose_gate(cfg: Config) -> Config:
         "Recovery uses current FCU heading after fresh camera/FCU agreement; "
         "it does not require uninterrupted heading during the disturbance."
     )
+    print("Stable samples AND velocity/yaw-change checks must pass before recovery.")
+    print("Healthy GPS hAcc: 0.01 m. Higher recovery uncertainty is retained, not timed away.")
     print("The new limits take effect the next time Path A starts.")
     pause()
     return cfg

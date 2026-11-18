@@ -168,6 +168,14 @@ does not remove inherited absolute position error; a new independent reference
 is needed before claiming better global accuracy. Reported uncertainty itself
 is an estimator estimate, not a guarantee of true error.
 
+The old accuracy-tightening prompt is removed: its timer cannot lower the
+inherited recovery uncertainty. Existing `recovery_accuracy_tighten_s` settings
+are retained for compatibility, without changing recovery behavior. The camera
+timestamp-gap setting checks consecutive capture timestamps, not the separate
+missing-message timeout (`vio_timeout_s`, default 1 s). Reset confirmation and
+stable-camera counts are necessary but not sufficient: fresh velocity and
+yaw-change agreement checks must also pass.
+
 Freezing cannot account for movement during the outage. Recovery therefore
 retains a conservative global uncertainty floor (maximum configured speed
 times outage duration), rather than automatically claiming the healthy 0.01 m floor.
