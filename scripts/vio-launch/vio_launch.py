@@ -90,6 +90,10 @@ class Config:
     mavlink_sysid: int = 1
     odom_topic: str = "/visual_slam/tracking/odometry"
     heading_source: str = "px4"
+    stabilized_heading_enabled: bool = True
+    position_noise_radius_m: float = 0.01
+    heading_smoothing_s: float = 0.5
+    heading_match_tolerance_s: float = 0.03
     manual_heading_deg: float = 0.0
     mag_declination_source: str = "table"
     mag_declination_deg: float = 0.0
@@ -181,6 +185,10 @@ def save_config(cfg: Config) -> None:
         "home_alt": cfg.home_alt,
         "odom_topic": cfg.odom_topic,
         "heading_source": cfg.heading_source,
+        "stabilized_heading_enabled": cfg.stabilized_heading_enabled,
+        "position_noise_radius_m": cfg.position_noise_radius_m,
+        "heading_smoothing_s": cfg.heading_smoothing_s,
+        "heading_match_tolerance_s": cfg.heading_match_tolerance_s,
         "manual_heading_deg": cfg.manual_heading_deg,
         "mag_declination_source": cfg.mag_declination_source,
         "mag_declination_deg": cfg.mag_declination_deg,
@@ -216,6 +224,8 @@ def save_config(cfg: Config) -> None:
 
 
 def heading_label(cfg: Config) -> str:
+    if cfg.stabilized_heading_enabled:
+        return "PX4 heading for each new movement (experimental, noise-stabilized)"
     if cfg.heading_source in ("px4", "compass"):
         return "PX4 estimated heading (declination handled by PX4)"
     return f"manual true heading {cfg.manual_heading_deg:g}°"
@@ -245,6 +255,10 @@ def apply_dict(cfg: Config, data: dict) -> Config:
         "home_alt",
         "odom_topic",
         "heading_source",
+        "stabilized_heading_enabled",
+        "position_noise_radius_m",
+        "heading_smoothing_s",
+        "heading_match_tolerance_s",
         "manual_heading_deg",
         "mag_declination_source",
         "mag_declination_deg",
@@ -1235,6 +1249,7 @@ def require_path_a_stopped(cfg: Config) -> None:
 
 def cmd_gps(cfg: Config) -> None:
     require_current_cli()
+    validate_stabilized_heading(cfg)
     require_path_a_stopped(cfg)
     if find_proc(cfg, "ev-bridge") or find_proc(cfg, "mavros"):
         raise RuntimeError("A legacy EV/MAVROS process is already running. Stop it before starting Path A.")
@@ -1292,6 +1307,10 @@ def cmd_gps(cfg: Config) -> None:
         "rate_hz": 10.0,
         "odom_topic": cfg.odom_topic,
         "heading_source": cfg.heading_source,
+        "stabilized_heading_enabled": str(cfg.stabilized_heading_enabled).lower(),
+        "position_noise_radius_m": cfg.position_noise_radius_m,
+        "heading_smoothing_s": cfg.heading_smoothing_s,
+        "heading_match_tolerance_s": cfg.heading_match_tolerance_s,
         "manual_heading_deg": cfg.manual_heading_deg,
         "mag_declination_source": cfg.mag_declination_source,
         "mag_declination_deg": cfg.mag_declination_deg,
@@ -1391,6 +1410,13 @@ def show_navigation_status(cfg: Config) -> None:
     print(f"- Connection status: {connection}")
     print(f"- VIO status: {vio_status}")
     print(f"- Pose-jump gate status: {gate_status}")
+    if status.get("stabilized_heading_enabled"):
+        print(f"- PX4 heading reference: {status.get('heading_reference_status', 'unknown')}")
+        correction = status.get("heading_correction_deg")
+        if correction is not None:
+            print(f"- Heading correction: {float(correction):+.2f}° | "
+                  f"noise band: {float(status.get('position_noise_radius_m', 0))*100:.1f} cm "
+                  f"({'holding' if status.get('position_noise_held') else 'moving'})")
     if "pose_jump_count" in status:
         print(f"- Pose-jump episodes: {int(status['pose_jump_count'])} since Path A start")
         reason = status.get("last_pose_jump_reason")
@@ -1498,12 +1524,15 @@ def cmd_run(
     require_current_cli()
     normalize_path(path_arg)
     require_path_a_stopped(cfg)
+    validate_stabilized_heading(cfg)
 
     # Reject legacy publishers BEFORE touching the camera/session they depend on.
     if find_proc(cfg, "ev-bridge") or find_proc(cfg, "mavros"):
         raise RuntimeError("A legacy EV/MAVROS process is already running. Stop it before starting Path A.")
     print("Starting Path A (GPS spoof + VIO GPS)...\n", flush=True)
     print("- Full 3D recovery: recovered VO frames align to PX4 roll/pitch/yaw.", flush=True)
+    if cfg.stabilized_heading_enabled:
+        print("- EXPERIMENTAL: time-matched PX4 heading + noise-stabilized VO displacement.", flush=True)
     cmd_vio(cfg, defer_health=True)
     # Recheck in cmd_gps: another launcher may have started the bridge while
     # camera readiness was being checked. Never silently reuse that publisher.
@@ -1674,7 +1703,71 @@ def configure_home(cfg: Config) -> Config:
     return cfg
 
 
+def validate_stabilized_heading(cfg: Config) -> None:
+    if not isinstance(cfg.stabilized_heading_enabled, bool):
+        raise ValueError("stabilized_heading_enabled must be a JSON boolean")
+    if not cfg.stabilized_heading_enabled:
+        return
+    if cfg.heading_source != "px4" or cfg.child_to_body_yaw_deg != 0:
+        raise ValueError("Experimental heading requires PX4 source and zero extra body yaw. "
+                         "Use Heading alignment to configure it; camera mounting stays in Extrinsics.")
+    for label, value, minimum, maximum in (
+            ("Position noise radius (m)", cfg.position_noise_radius_m, 0, .1),
+            ("Heading smoothing (s)", cfg.heading_smoothing_s, 0, 5),
+            ("Time-match tolerance (s)", cfg.heading_match_tolerance_s, .001, .1)):
+        if (not isinstance(value, (float, int)) or isinstance(value, bool)
+                or not math.isfinite(value) or not minimum <= value <= maximum):
+            raise ValueError(f"{label} must be {minimum}..{maximum}")
+    if cfg.heading_match_tolerance_s > cfg.inertial_max_message_age_s:
+        raise ValueError("Time-match tolerance must not exceed maximum PX4 message age")
+
+
 def configure_heading(cfg: Config) -> Config:
+    _clear()
+    print("Configure heading-assisted movement (experimental branch)\n")
+    print("PX4 heading orients NEW VO movement. No VO heading is sent back to PX4.")
+    print("The noise band holds tiny position fluctuations; slow travel still accumulates.")
+    choice = prompt_line("Use stabilized PX4 heading during tracking (on/off)",
+                         "on" if cfg.stabilized_heading_enabled else "off")
+    if choice is None:
+        return cfg
+    if choice.strip().lower() not in ("on", "off"):
+        print("Use on or off.")
+        pause()
+        return cfg
+    if choice.strip().lower() == "off":
+        disabled = replace(cfg, stabilized_heading_enabled=False)
+        changed = configure_startup_heading(disabled)
+        return cfg if changed is disabled else changed
+    values = {}
+    for name, label in (
+            ("position_noise_radius_m", "Horizontal noise radius m (0..0.1; 0.01 = 1 cm)"),
+            ("heading_smoothing_s", "Heading-difference smoothing s (0..5)"),
+            ("heading_match_tolerance_s", "Timestamp pairing tolerance s (0.001..0.1)")):
+        answer = prompt_line(label, str(getattr(cfg, name)))
+        if answer is None:
+            return cfg
+        try:
+            values[name] = float(answer)
+        except ValueError:
+            print("Enter a finite number.")
+            pause()
+            return cfg
+    changed = replace(cfg, heading_source="px4", child_to_body_yaw_deg=0.0,
+                      stabilized_heading_enabled=True, **values)
+    try:
+        validate_stabilized_heading(changed)
+    except ValueError as exc:
+        print(f"Invalid heading configuration: {exc}")
+        pause()
+        return cfg
+    save_config(changed)
+    print("Saved. Restart Path A to apply. Camera extrinsics are unchanged.")
+    pause()
+    return changed
+
+
+def configure_startup_heading(cfg: Config) -> Config:
     _clear()
     print("Configure startup heading alignment\n")
     print("PX4 mode inherits the flight controller's estimated heading.")

@@ -94,6 +94,7 @@ def bridge():
     obj.vio_timeout_s = 1
     obj.heading_offset_rad = 0
     obj.heading_source = 'px4'
+    obj.stabilized_heading_enabled = False
     obj.startup_heading = SimpleNamespace(offset=0, fresh=lambda now: True)
     obj.continuity_recovering = False
     obj.camera_readiness = Mock()

@@ -3,6 +3,7 @@ import ast
 import json
 import math
 import os
+from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -49,8 +50,9 @@ def bridge():
              '_reject_position_propagation', '_reject_heading_recovery',
              '_validated_recovery_target', '_reset_recovery_agreement',
              '_refresh_recovery_heading', '_recovery_attitude_target',
-             '_poll_mavlink',
-             '_recovery_velocity_agrees', '_tick', '_odom_callback', '_record_pose_gate_result',
+             '_poll_mavlink', '_heading_quarantine', '_heading_io_tick',
+             '_recovery_velocity_agrees', '_tick', '_odom_callback', '_process_odom',
+             '_drain_pending_odometry', '_record_pose_gate_result',
              '_recovery_yaw_agrees', '_finish_inertial_propagation', '_select_accuracy'}
     module = ast.Module(body=[n for n in cls.body if getattr(n, 'name', '') in names],
                         type_ignores=[])
@@ -66,6 +68,9 @@ def bridge():
               Phase=SimpleNamespace(SPOOF='spoof', LIVE='live', ALIGNING='aligning', WAITING='waiting'))
     exec(compile(module, str(source), 'exec'), ns)
     obj = type('RecoveryHarness', (), {name: ns[name] for name in names})()
+    obj.stabilized_heading_enabled = False
+    obj.heading_reference = None
+    obj.pending_odometry = deque()
     obj.get_logger = Mock(return_value=Mock())
     obj._send_status_text = Mock()
     obj.clock = clock
@@ -91,6 +96,7 @@ def bridge():
     odom = (10.0, 10.0, 0, 0, 0, 0, 0.1, 0.1, 0)
     obj.latest_px4_odometry = obj.inertial_start_odometry = obj.inertial_last_odometry = odom
     obj.continuity = SimpleNamespace(max_speed_mps=10.0, max_acceleration_mps2=5.0,
+                                    stabilizer=None,
                                     max_yaw_rate_rad_s=math.tau, recovery_anchor_yaw=0,
                                     _rotate_xy=LocalPoseContinuity._rotate_xy,
                                     last_output_orientation=None)
@@ -592,7 +598,7 @@ def telemetry(bridge, t, counter, yaw=0., gyro_z=0., attitude_first=True,
     """Feed actual MAVLink dispatch with synchronized ODOMETRY q/body gyro."""
     bridge.clock.now = t
     odom = SimpleNamespace(
-        get_type=lambda: 'ODOMETRY', get_srcSystem=lambda: 1,
+        get_type=lambda: 'ODOMETRY', get_srcSystem=lambda: 1, get_srcComponent=lambda: 1,
         time_usec=round(t*1e6), frame_id=1, child_frame_id=1, estimator_type=8,
         x=north, y=east, vx=vn, vy=ve, vz=0., q=frames.from_rpy(roll, pitch, yaw),
         rollspeed=0., pitchspeed=0., yawspeed=gyro_z,

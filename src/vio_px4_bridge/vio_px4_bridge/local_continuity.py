@@ -17,13 +17,15 @@ class ContinuityResult:
     event: str | None = None
     detail: str | None = None
     orientation: tuple[float, float, float, float] | None = None
+    waiting_for_heading: bool = False
 
 class LocalPoseContinuity:
     """Map reset-prone VIO into a continuous frame using a quarantine gate."""
     def __init__(self, max_gap_s=1.0,
                  recovery_samples=10, confirmation_samples=3,
                  max_speed_mps=10.0, max_acceleration_mps2=5.0,
-                 max_yaw_rate_rad_s=math.radians(360.0)):
+                 max_yaw_rate_rad_s=math.radians(360.0), stabilizer=None):
+        self.stabilizer = stabilizer
         self.max_gap_s = max(0.05, max_gap_s)
         self.recovery_samples = max(1, recovery_samples)
         self.confirmation_samples = max(2, confirmation_samples)
@@ -33,6 +35,8 @@ class LocalPoseContinuity:
         self.reset()
 
     def reset(self):
+        if self.stabilizer is not None:
+            self.stabilizer.reset()
         self.rotation = 0.0
         self.rotation_q = frames.IDENTITY
         self.translation = (0.0, 0.0, 0.0)
@@ -172,6 +176,8 @@ class LocalPoseContinuity:
         self._set_raw_state(sample)
         self.last_output_position, self.last_output_yaw = target, target_yaw
         self.last_output_orientation = recovery_orientation
+        if self.stabilizer is not None:
+            self.stabilizer.seed(p, self.rotation_q, target, timestamp)
         self.recovery_anchor_position = self.recovery_anchor_yaw = None
         self.recovery_anchor_orientation = None
         out_v = self._transform_velocity(v)
@@ -183,8 +189,9 @@ class LocalPoseContinuity:
 
     def _accept(self, sample, reanchored=False, reason=None, event=None,
                 detail=None, recovery_displacement=None, recovery_yaw_delta=0.0,
-                recovery_orientation=None):
+                recovery_orientation=None, heading_reference=None, require_heading=False):
         p, yaw, v, rate, timestamp, frame, orientation = sample
+        previous_raw, previous_time = self.last_raw_position, self.last_timestamp
         out_q = None if orientation is None else frames.multiply(self.rotation_q, orientation)
         out_yaw = wrap_pi(yaw+self.rotation) if out_q is None else frames.yaw(out_q)
         out_p, out_v = self._transform_position(p), self._transform_velocity(v)
@@ -194,7 +201,8 @@ class LocalPoseContinuity:
                 self.stable_samples += 1
             if (self.stable_samples >= self.recovery_samples
                     and recovery_displacement is not None
-                    and (orientation is None or recovery_orientation is not None)):
+                    and (orientation is None or recovery_orientation is not None)
+                    and (not require_heading or heading_reference is not None)):
                 return self._finish_recovery(
                     sample, recovery_displacement, recovery_yaw_delta, recovery_orientation
                 )
@@ -203,6 +211,29 @@ class LocalPoseContinuity:
                 (0.0, 0.0, 0.0), True, reanchored, reason, self.epoch,
                 event, detail, self.recovery_anchor_orientation,
             )
+        if require_heading:
+            if self.stabilizer is None or orientation is None:
+                raise ValueError("heading-assisted motion requires a stabilizer and body orientation")
+            if self.stabilizer.position is None:
+                self.stabilizer.seed(
+                    p if previous_raw is None else previous_raw, self.rotation_q,
+                    out_p if self.last_output_position is None else self.last_output_position,
+                    timestamp if previous_time is None else previous_time)
+            if heading_reference is None:
+                # Gates still inspect every raw sample. Unmatched data cannot
+                # advance the published path or refresh its accepted age.
+                return ContinuityResult(
+                    self.stabilizer.position,
+                    out_yaw if self.last_output_yaw is None else self.last_output_yaw,
+                    (0., 0., 0.), False, False, None, self.epoch,
+                    orientation=self.last_output_orientation, waiting_for_heading=True)
+            if timestamp > self.stabilizer.timestamp:
+                out_p, self.rotation_q = self.stabilizer.update(
+                    p, orientation, heading_reference, timestamp)
+                rotated = frames.rotate(self.rotation_q, p)
+                self.translation = tuple(out_p[i]-rotated[i] for i in range(3))
+                out_q = frames.multiply(self.rotation_q, orientation)
+                out_yaw, out_v = frames.yaw(out_q), self._transform_velocity(v)
         self.last_output_position, self.last_output_yaw = out_p, out_yaw
         self.last_output_orientation = out_q
         if self.epoch and not reanchored: self.stable_samples += 1
@@ -212,11 +243,13 @@ class LocalPoseContinuity:
 
     def update(self, position, yaw, velocity, yaw_rate, timestamp, frame_key,
                force_reanchor_reason=None, recovery_displacement=None,
-               recovery_yaw_delta=0.0, orientation=None, recovery_orientation=None):
+               recovery_yaw_delta=0.0, orientation=None, recovery_orientation=None,
+               heading_reference=None, require_heading=False):
         orientation = None if orientation is None else frames.normalize(orientation)
         sample = (position, yaw, velocity, yaw_rate, timestamp, frame_key, orientation)
         accepted = self._accepted_sample()
-        if accepted is None: return self._accept(sample)
+        if accepted is None:
+            return self._accept(sample, heading_reference=heading_reference, require_heading=require_heading)
 
         if force_reanchor_reason:
             self._start_recovery()
@@ -232,6 +265,7 @@ class LocalPoseContinuity:
                     sample, recovery_displacement=recovery_displacement,
                     recovery_yaw_delta=recovery_yaw_delta,
                     recovery_orientation=recovery_orientation,
+                    heading_reference=heading_reference, require_heading=require_heading,
                 )
             self._start_recovery()
             self.suspect_reason, self.suspect_samples = reason, [sample]
@@ -280,4 +314,5 @@ class LocalPoseContinuity:
             sample, True, reason, "reset_confirmed", detail,
             recovery_displacement, recovery_yaw_delta,
             recovery_orientation,
+            heading_reference, require_heading,
         )

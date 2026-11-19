@@ -1,5 +1,14 @@
 # vio-launch
 
+On branch `vio-px4-heading-stabilized`, **Heading alignment** also configures
+time-matched PX4 heading during tracking. The experiment is enabled by default
+on this branch only. Its adjustable settings are a horizontal noise radius in
+metres (default 0.01), heading-difference smoothing in seconds (0.5), and
+timestamp-pairing tolerance in seconds (0.03). Keep camera mounting in
+**Camera extrinsic**; this mode requires body odometry and no extra yaw offset.
+Settings apply on the next Path A start. Cancelling leaves settings unchanged.
+See [the experiment's behavior and limits](../../docs/PX4_HEADING_STABILIZED.md).
+
 Camera selection is explicit: in **Camera extrinsic**, enter the rear D456's
 SDK serial from `rs-enumerate-devices -s`. This is not necessarily the serial
 shown in USB/sysfs. The CLI stores it as `camera_serial` in its user config.
@@ -55,7 +64,7 @@ The archived IMU tools/cache are not needed for VO and are not deleted.
 | **Status (option 2)** | Live GPS navigation and recovery status |
 | **FC link** | Pick direct UART/USB serial, UDP networking, or keep the current setting |
 | **Home latitude/longitude** | Horizontal spoof/origin position |
-| **Heading alignment** | Use PX4 estimated heading (default) or explicit manual true heading |
+| **Heading alignment** | Configure stabilized PX4-heading movement; when disabled, configure startup-only alignment |
 | **Camera extrinsic** | Configure the full ROS FLU `drone_link → camera_link` XYZ/RPY transform |
 | **Pose-jump gate limits** | Configure physical rate, timing, and recovery limits |
 | **RViz auto-launch** | Persistently toggle automatic RViz startup; default OFF |
@@ -85,8 +94,10 @@ Old `heading_source=compass` settings automatically migrate to `px4` when loaded
 (persisted on the next settings save). The bridge also accepts `compass` as a
 deprecated alias for `px4`, with a warning. No bridge declination is added to
 PX4 yaw. Finish calibration and verify PX4's true heading before starting Path A.
-Fresh, stationary startup samples align the local trajectory to PX4; the offset
-then stays fixed in normal tracking. Existing quarantine recovery is unchanged.
+Fresh, stationary startup samples align the local trajectory to PX4. With the
+experiment disabled, the offset then stays fixed during normal tracking. With
+it enabled, only subsequent movements are corrected using matched PX4 heading;
+previous positions never rotate. Full-3D quarantine recovery remains required.
 This does not certify north alignment or remove magnetic interference.
 
 Camera translation uses ROS FLU axes: +X forward, +Y left, and +Z up.

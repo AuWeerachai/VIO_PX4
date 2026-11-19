@@ -17,6 +17,7 @@ import math
 import os
 import struct
 import time
+from collections import deque
 from enum import Enum
 from pathlib import Path
 
@@ -49,6 +50,8 @@ from vio_px4_bridge.recovery_yaw import timestamp_order
 from vio_px4_bridge.spoof_readiness import SpoofReadiness
 from vio_px4_bridge.startup_heading import Px4StartupHeading, heading_source
 from vio_px4_bridge import frame_alignment as frames
+from vio_px4_bridge.px4_heading_reference import Px4HeadingReference
+from vio_px4_bridge.stabilized_displacement import StabilizedDisplacement
 
 
 class Phase(Enum):
@@ -124,6 +127,10 @@ class VioPx4GpsBridge(Node):
         # PX4 owns earth heading at startup and recovery. Never add declination
         # to ATTITUDE yaw: PX4 has already applied its heading corrections.
         self.declare_parameter("heading_source", "px4")  # px4 | manual
+        self.declare_parameter("stabilized_heading_enabled", True)
+        self.declare_parameter("position_noise_radius_m", 0.01)
+        self.declare_parameter("heading_smoothing_s", 0.5)
+        self.declare_parameter("heading_match_tolerance_s", 0.03)
         self.declare_parameter("manual_heading_deg", 0.0)
         # Legacy launch parameters accepted but no longer used for alignment.
         self.declare_parameter("mag_declination_source", "table")
@@ -255,7 +262,19 @@ class VioPx4GpsBridge(Node):
             self.alignment_sample_count, self.alignment_max_std_rad,
             self.alignment_max_speed, self.alignment_sensor_max_age_s,
         )
+        self.stabilized_heading_enabled = bool(self.get_parameter("stabilized_heading_enabled").value)
+        stabilizer = None
+        if self.stabilized_heading_enabled:
+            if (self.transport != "mavlink" or self.heading_source != "px4"
+                    or not self.odom_is_enu or self.expected_child_frame != "drone_link"
+                    or self.child_to_body_yaw_rad != 0.0 or not self.horizontal_only_output):
+                raise ValueError("Stabilized heading requires MAVLink, PX4 heading, ENU drone_link, "
+                                 "zero extra body yaw and horizontal-only GPS")
+            stabilizer = StabilizedDisplacement(
+                float(self.get_parameter("position_noise_radius_m").value),
+                float(self.get_parameter("heading_smoothing_s").value))
         self.continuity = LocalPoseContinuity(
+            stabilizer=stabilizer,
             max_gap_s=float(self.get_parameter("continuity_max_gap_s").value),
             recovery_samples=int(self.get_parameter("continuity_recovery_samples").value),
             confirmation_samples=int(
@@ -303,6 +322,14 @@ class VioPx4GpsBridge(Node):
         self.recovery_accuracy_tighten_s = max(
             0.0, float(self.get_parameter("recovery_accuracy_tighten_s").value)
         )
+        self.heading_reference = (Px4HeadingReference(
+            self.inertial_max_message_age_s, self.inertial_max_message_gap_s,
+            float(self.get_parameter("heading_match_tolerance_s").value),
+            self.continuity.max_yaw_rate_rad_s, self.inertial_reorder_tolerance_s,
+        ) if self.stabilized_heading_enabled else None)
+        self.last_heading_output_time = None
+        self.last_timesync_request = float("-inf")
+        self.pending_odometry = deque()
 
         self.phase = Phase.WAITING if self.rc_trigger_enabled else Phase.SPOOF
         self.start_time = None if self.rc_trigger_enabled else time.monotonic()
@@ -403,6 +430,8 @@ class VioPx4GpsBridge(Node):
         )
         self.create_timer(0.5, self._check_camera_fusion)
         self.create_timer(1.0 / self.rate_hz, self._tick)
+        if self.stabilized_heading_enabled:
+            self.create_timer(0.01, self._heading_io_tick)
         if self.status_file:
             self.create_timer(0.5, self._write_status_file)
 
@@ -426,6 +455,11 @@ class VioPx4GpsBridge(Node):
         self.get_logger().info(
             f"Heading alignment source={self.heading_source}; live GPS is gated until aligned"
         )
+        if self.stabilized_heading_enabled:
+            self.get_logger().warn(
+                "EXPERIMENTAL PX4-heading movement correction enabled; no VO yaw sent to PX4. "
+                f"Noise radius={stabilizer.noise_radius_m:g} m, "
+                f"heading smoothing={stabilizer.heading_tau_s:g} s. Ground validation required.")
 
     def _write_status_file(self):
         """Publish a small atomic snapshot for the companion launcher UI."""
@@ -461,6 +495,19 @@ class VioPx4GpsBridge(Node):
             ),
             "heading_aligned": self.heading_offset_rad is not None,
             "heading_source": self.heading_source,
+            "stabilized_heading_enabled": self.stabilized_heading_enabled,
+            "heading_reference_status": (self.heading_reference.reason
+                                         if self.heading_reference is not None else "startup_only"),
+            "heading_correction_deg": (math.degrees(self.continuity.stabilizer.correction)
+                                       if self.continuity.stabilizer is not None else None),
+            "heading_filter_residual_deg": (math.degrees(self.continuity.stabilizer.residual)
+                                            if self.continuity.stabilizer is not None else None),
+            "position_noise_held": (self.continuity.stabilizer.held
+                                    if self.continuity.stabilizer is not None else False),
+            "position_noise_radius_m": (self.continuity.stabilizer.noise_radius_m
+                                        if self.continuity.stabilizer is not None else 0.0),
+            "candidate_latitude": self.latest_fix["lat"],
+            "candidate_longitude": self.latest_fix["lon"],
             "startup_heading_status": (
                 self.startup_heading.reason if self.heading_source == "px4"
                 else "explicit manual heading"
@@ -852,16 +899,19 @@ class VioPx4GpsBridge(Node):
             # velocity. This prevents motion just before GPS was stopped from
             # being counted a second time.
             age = max(0.0, now - odom_arrival)
-            boundary = (
-                now, odom_time + age, north + vn * age, east + ve * age,
-                vn, ve, var_n, var_e, reset_counter,
-            )
-            self.inertial_start_odometry = boundary
-            self.inertial_last_odometry = boundary
-            self.latest_px4_velocity = (now, odom_time + age, vn, ve)
-            self.inertial_position_uncertainty_m = math.sqrt(max(var_n, var_e))
-            if math.sqrt(max(var_n, var_e)) > self.inertial_max_position_uncertainty_m:
-                self._reject_position_propagation("position_uncertainty_at_quarantine")
+            boundary = (self.heading_reference.motion_at(self.last_heading_output_time, now)
+                        if self.stabilized_heading_enabled else (
+                            now, odom_time+age, north+vn*age, east+ve*age,
+                            vn, ve, var_n, var_e, reset_counter))
+            if boundary is None:
+                self._reject_position_propagation("last_output_motion_boundary_unavailable")
+            else:
+                self.inertial_start_odometry = boundary
+                self.inertial_last_odometry = boundary
+                self.latest_px4_velocity = (boundary[0], boundary[1], boundary[4], boundary[5])
+                self.inertial_position_uncertainty_m = math.sqrt(max(boundary[6:8]))
+                if self.inertial_position_uncertainty_m > self.inertial_max_position_uncertainty_m:
+                    self._reject_position_propagation("position_uncertainty_at_quarantine")
         # Do not extrapolate the timestamp without extrapolating orientation:
         # doing so shortens the next dt and can manufacture a high yaw rate.
         self.inertial_last_yaw = self.latest_px4_yaw
@@ -1149,11 +1199,12 @@ class VioPx4GpsBridge(Node):
             self.get_logger().info(
                 "VIO_FRAME_RECOVERY_APPLIED reference=current_PX4_ATTITUDE "
                 f"raw_to_local_wxyz={self.continuity.rotation_q} "
-                "rotation=fixed_full_3d previous_trajectory=unchanged"
+                "rotation=full_3d_at_handoff previous_trajectory=unchanged"
             )
         self.inertial_active = False
 
-    def _recovery_velocity_agrees(self, local_velocity, raw_vio_yaw, frame_rotation=None) -> bool:
+    def _recovery_velocity_agrees(self, local_velocity, raw_vio_yaw, frame_rotation=None,
+                                 matched_velocity=None) -> bool:
         """Require recovered VIO motion to agree with PX4 before handoff."""
         if (not self.recovery_velocity_sample_valid or not self.inertial_heading_safe
                 or self.latest_px4_odometry is None or self.heading_offset_rad is None
@@ -1175,7 +1226,8 @@ class VioPx4GpsBridge(Node):
         vio_n, vio_e, _ = rotate_ned_heading(
             vx, vy, 0.0, self.heading_offset_rad
         )
-        px4_n, px4_e = self.latest_px4_odometry[4:6]
+        px4_n, px4_e = (self.latest_px4_odometry[4:6]
+                        if matched_velocity is None else matched_velocity)
         residual = math.hypot(vio_n - px4_n, vio_e - px4_e)
         stamp = self.latest_px4_odometry[1]
         if (residual <= self.recovery_velocity_agreement_m_s
@@ -1239,11 +1291,36 @@ class VioPx4GpsBridge(Node):
         target = self._inertial_recovery_target()
         rotation = None
         orientation_target = None
+        matched_velocity = None
+        if self.stabilized_heading_enabled:
+            match = self.heading_reference.last_match
+            if target is None or match is None or not self.heading_reference.fresh(time.monotonic()):
+                return None
+            stamp, q = match
+            if self.recovery_reset_stamp is not None and stamp < self.recovery_reset_stamp:
+                return None
+            motion = self.heading_reference.motion_at(
+                stamp+self.heading_reference.clock.offset, time.monotonic())
+            if motion is None:
+                return None
+            matched_velocity = motion[4:6]
+            orientation_target = frames.multiply(frames.from_rpy(0, 0, -self.heading_offset_rad), q)
+            self.inertial_yaw_delta = wrap_pi(
+                frames.yaw(orientation_target)-self.continuity.recovery_anchor_yaw)
+            displacement = (0., 0., 0.)
+            if self.inertial_position_safe:
+                start = self.inertial_start_odometry
+                if start is None or motion[8] != start[8] or stamp < start[1]:
+                    return None
+                displacement = rotate_ned_heading(
+                    motion[2]-start[2], motion[3]-start[3], 0., -self.heading_offset_rad)
+            target = displacement, self.inertial_yaw_delta
         comparison_yaw = raw_vio_yaw
         if raw_orientation is not None:
             if target is None:
                 return None
-            orientation_target = self._recovery_attitude_target()
+            if orientation_target is None:
+                orientation_target = self._recovery_attitude_target()
             if orientation_target is None:
                 return None
             if self.recovery_frame_rotation is None:
@@ -1254,7 +1331,8 @@ class VioPx4GpsBridge(Node):
             # EXACT rotation the final handoff would apply, not this baseline.
             comparison_yaw = frames.yaw(frames.multiply(self.recovery_frame_rotation, raw_orientation))
             rotation = frames.alignment(raw_orientation, orientation_target)
-        velocity_agrees = self._recovery_velocity_agrees(local_velocity, raw_vio_yaw, rotation)
+        velocity_agrees = self._recovery_velocity_agrees(
+            local_velocity, raw_vio_yaw, rotation, matched_velocity)
         yaw_agrees = self._recovery_yaw_agrees(comparison_yaw)
         if target is not None and velocity_agrees and yaw_agrees:
             self.recovery_target_orientation = orientation_target
@@ -1327,6 +1405,11 @@ class VioPx4GpsBridge(Node):
             return "PX4 startup heading missing, stale, or collecting fresh samples"
         if self.continuity_recovering:
             return "pose-jump gate recovering"
+        if self.stabilized_heading_enabled and (
+                self.heading_reference.last_match is None or not self.heading_reference.fresh(now)
+                or self.last_heading_output_time is None
+                or not 0 <= now-self.last_heading_output_time <= self.inertial_max_message_age_s):
+            return f"PX4 heading pairing not ready: {self.heading_reference.reason}"
         return self.camera_readiness.reason(now)
 
     def _record_pose_gate_result(self, result):
@@ -1348,6 +1431,34 @@ class VioPx4GpsBridge(Node):
         )
 
     def _odom_callback(self, msg: Odometry):
+        if not self.stabilized_heading_enabled:
+            return self._process_odom(msg)
+        if len(self.pending_odometry) >= 256:
+            self._heading_quarantine("heading_pair_queue_overflow")
+            self.pending_odometry.clear()
+        self.pending_odometry.append(msg)
+        self._drain_pending_odometry()
+
+    def _drain_pending_odometry(self):
+        """Wait at most the configured capture-age limit for an upper bracket.
+
+        Process every buffered raw sample in order through the original gate.
+        Do not replace a pending sample with a newer one: that could hide a jump.
+        No new GPS position is derived from an unmatched sample.
+        """
+        while self.pending_odometry:
+            msg = self.pending_odometry[0]
+            stamp = msg.header.stamp.sec + msg.header.stamp.nanosec*1e-9
+            matched = self.heading_reference.match(
+                stamp, self.get_clock().now().nanoseconds*1e-9, time.monotonic())
+            invalid = self.heading_reference.reason in (
+                "invalid_camera_timestamp", "camera_clock_changed", "camera_timestamp_stale_or_future")
+            if matched is None and not invalid:
+                return
+            self.pending_odometry.popleft()
+            self._process_odom(msg)
+
+    def _process_odom(self, msg: Odometry):
         pos, orientation = msg.pose.pose.position, msg.pose.pose.orientation
         stamp = msg.header.stamp
         self.camera_readiness.observe_odom(
@@ -1356,6 +1467,8 @@ class VioPx4GpsBridge(Node):
             msg.child_frame_id, self.expected_child_frame,
         )
         if msg.child_frame_id != self.expected_child_frame:
+            if self.stabilized_heading_enabled:
+                self._heading_quarantine("unexpected_vio_body_frame")
             if msg.child_frame_id != self.rejected_odom_frame:
                 self.rejected_odom_frame = msg.child_frame_id
                 self.get_logger().error(
@@ -1390,6 +1503,8 @@ class VioPx4GpsBridge(Node):
             angular.z,
         )
         if not all(math.isfinite(float(value)) for value in values):
+            if self.stabilized_heading_enabled:
+                self._heading_quarantine("invalid_vio_sample")
             self.get_logger().error("Ignoring VIO odometry containing NaN/Inf")
             return
         if self.odom_is_enu:
@@ -1420,12 +1535,24 @@ class VioPx4GpsBridge(Node):
             raw_orientation = (frames.ros_to_ned_frd(q_body, self.child_to_body_yaw_rad)
                                if self.odom_is_enu else q_body)
         except ValueError as exc:
+            if self.stabilized_heading_enabled:
+                self._heading_quarantine("invalid_vio_orientation")
             self.get_logger().error(f"Ignoring invalid VIO orientation: {exc}")
             return
         raw_body_yaw_ned = frames.yaw(raw_orientation)
         raw_yaw_rate_ned = -float(angular.z) if self.odom_is_enu else float(angular.z)
         stamp = msg.header.stamp
         sample_time = float(stamp.sec) + float(stamp.nanosec) * 1e-9
+        heading_reference = None
+        if self.stabilized_heading_enabled:
+            earth_yaw = self.heading_reference.match(
+                sample_time, self.get_clock().now().nanoseconds*1e-9, time.monotonic())
+            if earth_yaw is not None and self.heading_offset_rad is not None:
+                heading_reference = wrap_pi(earth_yaw-self.heading_offset_rad)
+            if self.heading_reference.reason in (
+                    "invalid_camera_timestamp", "camera_clock_changed", "camera_timestamp_stale_or_future"):
+                self._heading_quarantine(self.heading_reference.reason)
+                return
         if sample_time <= 0.0:
             sample_time = time.monotonic()
         frame_key = f"{msg.header.frame_id}|{msg.child_frame_id}"
@@ -1445,6 +1572,8 @@ class VioPx4GpsBridge(Node):
             orientation=raw_orientation,
             recovery_orientation=(self.recovery_target_orientation
                                   if inertial_target is not None else None),
+            heading_reference=heading_reference,
+            require_heading=self.stabilized_heading_enabled and self.phase == Phase.LIVE,
         )
         # Record the original gate result, including startup resets that the
         # following block reseeds. A synthetic seed is not a healthy recovery
@@ -1485,9 +1614,18 @@ class VioPx4GpsBridge(Node):
             if continuity.event == "quarantine_started" and self.phase == Phase.LIVE:
                 self._start_inertial_propagation()
             elif continuity.event == "recovery_completed":
+                if self.stabilized_heading_enabled and self.inertial_position_safe:
+                    # Log the displacement actually applied at capture time,
+                    # not the newer FCU position available at receipt time.
+                    self.inertial_displacement_ned = list(rotate_ned_heading(
+                        *recovery_displacement, self.heading_offset_rad))
+                    self.inertial_integrated_duration_s = (
+                        self.heading_reference.last_match[0]-self.inertial_start_odometry[1])
                 self._finish_inertial_propagation()
         if continuity.recovering:
             self.continuity_recovering = True
+            return
+        if continuity.waiting_for_heading:
             return
         if self.continuity_recovering:
             self.get_logger().info(
@@ -1506,9 +1644,8 @@ class VioPx4GpsBridge(Node):
             east -= self.anchor_ned[1]
             down -= self.anchor_ned[2]
 
-        # A fixed ENU->NED swap does not align cuVSLAM's arbitrary world yaw to
-        # north. Establish a one-time independent offset, then apply the same
-        # rotation to displacement and world velocity.
+        # Fixed geographic basis. Experimental continuity rotates only NEW
+        # movement upstream; never vary this offset and rotate the whole path.
         horizontal_speed = math.hypot(vn, ve)
         self._update_heading_alignment(continuity.yaw, horizontal_speed)
         if self.heading_offset_rad is not None:
@@ -1535,6 +1672,10 @@ class VioPx4GpsBridge(Node):
         }
         self.have_vio = True
         self.last_vio_time = time.monotonic()
+        if self.stabilized_heading_enabled and self.heading_reference.last_match is not None:
+            self.last_heading_output_time = (
+                self.heading_reference.last_match[0]+self.heading_reference.clock.offset)
+            self.last_vio_time = self.last_heading_output_time
         if self.vio_stale_warned:
             self.get_logger().info("VIO odometry resumed; GPS updates resumed")
             self.vio_stale_warned = False
@@ -1587,7 +1728,9 @@ class VioPx4GpsBridge(Node):
     def _select_accuracy(self) -> tuple[float, float]:
         if self.phase == Phase.SPOOF:
             return self.spoof_eph_m, self.spoof_epv_m
-        accuracy_floor = max(self.cruise_eph_m, self.inherited_position_uncertainty_m)
+        accuracy_floor = max(self.cruise_eph_m, self.inherited_position_uncertainty_m,
+                             self.continuity.stabilizer.noise_radius_m
+                             if self.stabilized_heading_enabled else 0.0)
         if self.frozen_position_uncertainty_m > 0.0:
             # Stable relative vision cannot recover an unknown global offset.
             # Require a new verified origin/restart before claiming tight GPS.
@@ -1643,6 +1786,36 @@ class VioPx4GpsBridge(Node):
             return "high"
         return "mid"
 
+    def _heading_io_tick(self):
+        """Read telemetry promptly; GPS output keeps its separately configured rate."""
+        now = time.monotonic()
+        if now-self.last_timesync_request >= .1:
+            token = self.heading_reference.clock.request(now)
+            self._mav.mav.timesync_send(0, token)
+            self.last_timesync_request = now
+        self._poll_mavlink()
+        self._drain_pending_odometry()
+
+    def _heading_quarantine(self, reason):
+        """Stop immediately and enter the SAME full recovery gate as raw jumps."""
+        if self.phase != Phase.LIVE:
+            return
+        self.pending_odometry.clear()
+        self._set_live_output_state(False, reason)
+        if self.continuity_recovering:
+            return
+        previous = self.continuity._accepted_sample()
+        if previous is None:
+            self.have_vio = False
+            return
+        p, yaw, velocity, rate, stamp, frame, orientation = previous
+        result = self.continuity.update(
+            p, yaw, velocity, rate, stamp, frame, orientation=orientation,
+            force_reanchor_reason=reason)
+        self._record_pose_gate_result(result)
+        self.continuity_recovering = True
+        self._start_inertial_propagation()
+
     def _poll_mavlink(self):
         """Drain MAVLink once and dispatch without discarding other message types."""
         if self.transport != "mavlink" or self._mav is None:
@@ -1655,6 +1828,19 @@ class VioPx4GpsBridge(Node):
             now = time.monotonic()
             if (self.px4_target_sysid is not None
                     and int(msg.get_srcSystem()) != self.px4_target_sysid):
+                continue
+            if message_type == "TIMESYNC" and self.stabilized_heading_enabled:
+                if int(msg.get_srcComponent()) != self.px4_target_compid:
+                    continue
+                if int(msg.tc1) == 0:
+                    self._mav.mav.timesync_send(int(now*1e9), int(msg.ts1))
+                else:
+                    clock = self.heading_reference.clock
+                    generation = clock.generation
+                    clock.observe(int(msg.tc1), int(msg.ts1), now)
+                    if generation != clock.generation:
+                        self.heading_reference.invalidate("px4_time_sync_changed")
+                        self._heading_quarantine("px4_time_sync_changed")
                 continue
             if (
                 message_type == "HEARTBEAT"
@@ -1696,6 +1882,8 @@ class VioPx4GpsBridge(Node):
                         self._reject_heading_recovery("invalid_px4_attitude_sample")
                 continue
             if message_type == "ODOMETRY":
+                if int(msg.get_srcComponent()) != self.px4_target_compid:
+                    continue
                 sample_time = float(msg.time_usec) * 1e-6
                 north, east = float(msg.x), float(msg.y)
                 try:
@@ -1704,6 +1892,9 @@ class VioPx4GpsBridge(Node):
                         (float(msg.vx), float(msg.vy), float(msg.vz)),
                     )
                 except ValueError as exc:
+                    if self.stabilized_heading_enabled:
+                        self.heading_reference.invalidate("invalid_px4_odometry")
+                        self._heading_quarantine("invalid_px4_odometry")
                     self.latest_px4_odometry = None
                     if self.inertial_active:
                         self._fail_inertial_propagation(f"invalid_px4_velocity_frame: {exc}")
@@ -1719,19 +1910,25 @@ class VioPx4GpsBridge(Node):
                     int(msg.frame_id) == 1
                     and int(msg.estimator_type) == 8
                     and int(getattr(msg, "quality", 0)) >= 0
+                    and var_n >= 0 and var_e >= 0
                 )
                 values = (sample_time, north, east, vn, ve, var_n, var_e)
                 if not valid_source or not all(math.isfinite(value) for value in values):
+                    if self.stabilized_heading_enabled:
+                        self.heading_reference.invalidate("invalid_px4_odometry_source")
+                        self._heading_quarantine("invalid_px4_odometry_source")
                     self.latest_px4_odometry = None
                     if self.inertial_active:
                         self._fail_inertial_propagation(
                             "invalid_px4_odometry_source_frame_or_covariance"
                         )
                 else:
-                    self._update_px4_odometry(
-                        (now, sample_time, north, east, vn, ve,
-                         var_n, var_e, reset_counter)
-                    )
+                    sample = (now, sample_time, north, east, vn, ve, var_n, var_e, reset_counter)
+                    if self.stabilized_heading_enabled:
+                        failure = self.heading_reference.observe(now, sample_time, msg.q, reset_counter, sample)
+                        if failure:
+                            self._heading_quarantine(failure)
+                    self._update_px4_odometry(sample)
                 continue
             if message_type != "RC_CHANNELS" or not self.rc_trigger_enabled:
                 continue
@@ -1751,6 +1948,8 @@ class VioPx4GpsBridge(Node):
             # from a previous successful run or a prior spoof attempt.
             self.camera_readiness.reset()
             self.continuity.reset()
+            self.pending_odometry.clear()
+            self.last_heading_output_time = None
             self.continuity_recovering = False
             self.pose_jump_episode_active = False
             self.have_vio = False
@@ -1790,6 +1989,14 @@ class VioPx4GpsBridge(Node):
 
     def _tick(self):
         self._poll_mavlink()
+        if self.stabilized_heading_enabled:
+            self._drain_pending_odometry()
+        if self.stabilized_heading_enabled and self.phase == Phase.LIVE:
+            if not self.heading_reference.fresh(time.monotonic()):
+                self._heading_quarantine("px4_heading_or_time_sync_stale")
+            elif (self.last_vio_time is not None
+                    and time.monotonic()-self.last_vio_time > self.inertial_max_message_age_s):
+                self._heading_quarantine("time_matched_camera_output_stale")
         if self.inertial_active:
             # Enforce stream-freshness guards even if cuVSLAM has
             # stopped producing callbacks during quarantine.

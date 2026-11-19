@@ -67,6 +67,58 @@ def test_saved_camera_serial_survives_config_round_trip(tmp_path):
         assert cli.load_config().camera_serial == '333422300181'
 
 
+def test_stabilized_heading_config_round_trip(tmp_path):
+    cfg = cli.apply_dict(cli.Config(), dict(
+        stabilized_heading_enabled=True, position_noise_radius_m=.015,
+        heading_smoothing_s=.7, heading_match_tolerance_s=.025))
+    cli.validate_stabilized_heading(cfg)
+    with patch.object(cli, 'user_config_path', return_value=tmp_path/'config.json'):
+        cli.save_config(cfg)
+        loaded = cli.load_config()
+    for key in ('stabilized_heading_enabled', 'position_noise_radius_m',
+                'heading_smoothing_s', 'heading_match_tolerance_s'):
+        assert getattr(loaded, key) == getattr(cfg, key)
+
+
+@pytest.mark.parametrize('invalid', [
+    dict(stabilized_heading_enabled='false'), dict(heading_source='manual'),
+    dict(child_to_body_yaw_deg=180), dict(position_noise_radius_m=float('nan')),
+    dict(position_noise_radius_m=-1), dict(position_noise_radius_m='0.01'),
+    dict(heading_smoothing_s=float('inf')), dict(heading_match_tolerance_s=.2),
+    dict(heading_match_tolerance_s=.05, inertial_max_message_age_s=.01),
+])
+def test_invalid_stabilized_config_cannot_touch_camera(invalid):
+    cfg = cli.apply_dict(cli.Config(), invalid)
+    with patch.object(cli, 'require_path_a_stopped'), \
+         patch.object(cli, 'cmd_vio') as camera, \
+         patch.object(cli, 'cmd_gps') as gps:
+        with pytest.raises(ValueError):
+            cli.cmd_run(cfg, 'a')
+    camera.assert_not_called()
+    gps.assert_not_called()
+
+
+def test_heading_menu_does_not_change_extrinsics():
+    cfg = cli.Config(camera_pitch_deg=32, camera_yaw_deg=180)
+    with patch.object(cli, 'prompt_line', side_effect=['on', '.01', '.5', '.03']), \
+         patch.object(cli, '_clear'), patch.object(cli, 'pause'), \
+         patch.object(cli, 'save_config') as save:
+        changed = cli.configure_heading(cfg)
+    assert changed.camera_pitch_deg == 32 and changed.camera_yaw_deg == 180
+    assert changed.child_to_body_yaw_deg == 0 and changed.heading_source == 'px4'
+    save.assert_called_once_with(changed)
+
+
+@pytest.mark.parametrize('answers', [['off', None], ['on', '.01', None]])
+def test_cancelling_heading_menu_preserves_original_config(answers):
+    cfg = cli.Config()
+    with patch.object(cli, 'prompt_line', side_effect=answers), \
+         patch.object(cli, '_clear'), patch.object(cli, 'pause'), \
+         patch.object(cli, 'save_config') as save:
+        assert cli.configure_heading(cfg) is cfg
+    save.assert_not_called()
+
+
 def test_unconfigured_camera_cannot_launch_or_reuse():
     with patch.object(cli, 'start_visible_isaac_session') as start:
         with pytest.raises(RuntimeError, match='rear D456 SDK serial'):
@@ -276,7 +328,7 @@ def test_heading_menu_no_longer_prompts_for_bridge_declination():
     with patch.object(cli, '_clear'), patch.object(cli, 'pause'), \
          patch.object(cli, 'prompt_line', side_effect=['px4', '0']) as prompt, \
          patch.object(cli, 'save_config') as save:
-        changed = cli.configure_heading(cfg)
+        changed = cli.configure_startup_heading(cfg)
     assert changed.heading_source == 'px4'
     assert prompt.call_count == 2
     assert all('declination' not in call.args[0].lower() for call in prompt.call_args_list)
