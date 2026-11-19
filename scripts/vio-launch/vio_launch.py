@@ -1503,7 +1503,7 @@ def cmd_run(
     if find_proc(cfg, "ev-bridge") or find_proc(cfg, "mavros"):
         raise RuntimeError("A legacy EV/MAVROS process is already running. Stop it before starting Path A.")
     print("Starting Path A (GPS spoof + VIO GPS)...\n", flush=True)
-    print("- Experimental full 3D recovery: recovered VO frames align to PX4 roll/pitch/yaw.", flush=True)
+    print("- Full 3D recovery: recovered VO frames align to PX4 roll/pitch/yaw.", flush=True)
     cmd_vio(cfg, defer_health=True)
     # Recheck in cmd_gps: another launcher may have started the bridge while
     # camera readiness was being checked. Never silently reuse that publisher.

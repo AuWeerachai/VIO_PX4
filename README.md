@@ -3,8 +3,8 @@
 Jetson Orin Nano cuVSLAM bridge for PX4 using Path A: home GPS spoof followed
 by live VIO-as-GPS over MAVLink `HIL_GPS`.
 
-This branch, `vio-full3d-recovery`, is a ground-test experiment. After a
-coordinate reset, recovery aligns the complete VO body orientation to fresh
+Full 3D recovery is enabled on `main`. After a coordinate reset,
+recovery aligns the complete VO body orientation to fresh
 PX4 roll/pitch/yaw, including the small real tilt of a nearly level aircraft.
 The resulting rigid rotation/translation stays fixed until another reset.
 Previous positions and the home reference are not rotated or replaced.
