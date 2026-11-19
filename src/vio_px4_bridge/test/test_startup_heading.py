@@ -9,6 +9,7 @@ import pytest
 
 from vio_px4_bridge.geo_utils import wrap_pi, rotate_ned_heading
 from vio_px4_bridge.startup_heading import Px4StartupHeading, heading_source
+from vio_px4_bridge import frame_alignment as frames
 
 
 def feed(gate, yaw=0.0, vio_yaw=math.pi/2, start=1.0, count=30):
@@ -109,7 +110,7 @@ def bridge():
     clock = SimpleNamespace(now=1.)
     clock.monotonic = lambda: clock.now
     phases = SimpleNamespace(LIVE='live', WAITING='waiting', SPOOF='spoof')
-    ns = dict(math=math, time=clock, wrap_pi=wrap_pi, Phase=phases)
+    ns = dict(math=math, time=clock, wrap_pi=wrap_pi, Phase=phases, frames=frames)
     exec(compile(ast.Module(body=[n for n in cls.body if getattr(n, 'name', '') in names],
                             type_ignores=[]), str(source), 'exec'), ns)
     obj = type('StartupHarness', (), {name: ns[name] for name in names})()

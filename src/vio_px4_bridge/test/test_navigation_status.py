@@ -50,6 +50,7 @@ def test_separate_recovery_status_and_honest_age(tmp_path, capsys, heading_safe)
     ('yaw_rate_limit', 'yaw-rate limit'),
     ('position_jump', 'position change exceeds speed limit'),
     ('yaw_jump', 'heading change exceeds yaw-rate limit'),
+    ('attitude_jump', '3D attitude change exceeds rotation-rate limit'),
     ('tracking_gap', 'tracking gap'),
     ('timestamp_regression', 'duplicate/backward timestamp'),
     ('frame_changed', 'coordinate frame changed'),

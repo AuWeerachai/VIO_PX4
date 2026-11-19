@@ -42,13 +42,13 @@ from vio_px4_bridge.geo_utils import mavlink_velocity_to_ned
 from vio_px4_bridge.geo_utils import rotate_ned_heading
 from vio_px4_bridge.geo_utils import rotate_vector_by_quaternion_xyzw
 from vio_px4_bridge.geo_utils import wrap_pi
-from vio_px4_bridge.geo_utils import yaw_from_quaternion_xyzw
 from vio_px4_bridge.local_continuity import LocalPoseContinuity
 from vio_px4_bridge.global_origin import GlobalOriginSetup
 from vio_px4_bridge.recovery_yaw import RecoveryYawAgreement
 from vio_px4_bridge.recovery_yaw import timestamp_order
 from vio_px4_bridge.spoof_readiness import SpoofReadiness
 from vio_px4_bridge.startup_heading import Px4StartupHeading, heading_source
+from vio_px4_bridge import frame_alignment as frames
 
 
 class Phase(Enum):
@@ -330,6 +330,9 @@ class VioPx4GpsBridge(Node):
         self.heading_offset_rad = None
         self.latest_px4_velocity = None
         self.latest_px4_yaw = None
+        self.latest_px4_attitude = None  # (arrival, boot timestamp, NED/FRD quaternion)
+        self.recovery_frame_rotation = None
+        self.recovery_target_orientation = None
         self.latest_px4_odometry = None
         self.recovery_reset_stamp = None
         self.inertial_active = False
@@ -474,6 +477,7 @@ class VioPx4GpsBridge(Node):
             "recovery_heading_failure": self.inertial_heading_failure,
             "recovery_reset_stamp": self.recovery_reset_stamp,
             "recovery_heading_reference": "current_fcu_heading",
+            "recovery_frame_mode": "full_3d_px4_attitude",
             "inertial_fallback_to_frozen_pose": self.inertial_fallback_to_frozen_pose,
             "inertial_recovery_failure": self.inertial_failure_reason,
             "frozen_position_uncertainty_m": self.frozen_position_uncertainty_m,
@@ -835,6 +839,8 @@ class VioPx4GpsBridge(Node):
         self.recovery_velocity_sample_valid = False
         self.recovery_yaw_agreement.reset()
         self.recovery_yaw_agreement_state = "waiting_for_baseline"
+        self.recovery_frame_rotation = None
+        self.recovery_target_orientation = None
         if self.latest_px4_odometry is None:
             self._fail_inertial_propagation("odometry_unavailable_at_quarantine")
         elif now - self.latest_px4_odometry[0] > self.inertial_max_message_age_s:
@@ -982,7 +988,7 @@ class VioPx4GpsBridge(Node):
             self.latest_px4_yaw = None
             if self.inertial_active:
                 self._reject_heading_recovery("invalid_px4_attitude_sample")
-            return
+            return False
         if self.inertial_active and self.inertial_last_yaw is not None:
             dt = sample[1] - self.inertial_last_yaw[1]
             ordering = timestamp_order(dt, self.inertial_reorder_tolerance_s)
@@ -993,14 +999,14 @@ class VioPx4GpsBridge(Node):
                     f"reason=small_timestamp_reorder dt_s={dt:.6f} "
                     f"tolerance_s={self.inertial_reorder_tolerance_s:.3f}"
                 )
-                return
+                return False
             if ordering == "regressed":
                 self.latest_px4_yaw = None
                 self.inertial_last_yaw = sample
                 self._reject_heading_recovery(
                     f"yaw_timestamp_regression dt_s={dt:.6f}"
                 )
-                return
+                return False
         if self.inertial_active and self.inertial_last_yaw is not None:
             dt = sample[1] - self.inertial_last_yaw[1]
             yaw_rate = abs(wrap_pi(sample[2] - self.inertial_last_yaw[2])) / dt
@@ -1018,6 +1024,27 @@ class VioPx4GpsBridge(Node):
         self.inertial_last_yaw = sample
         if self.inertial_active:
             self._refresh_recovery_heading()
+        return True
+
+    def _recovery_attitude_target(self):
+        """Fresh PX4 body attitude in the continuity world's NED-like frame.
+
+        PX4 is the independent physical roll/pitch/yaw reference. The fixed
+        startup heading offset is removed here because it is applied once,
+        later, to corrected local displacement. Never apply camera extrinsics
+        here and never feed this attitude back to PX4 as a measurement.
+        """
+        sample = self.latest_px4_attitude
+        now = time.monotonic()
+        if (sample is None or self.latest_px4_yaw is None
+                or sample[1] != self.latest_px4_yaw[1]
+                or not 0.0 <= now - sample[0] <= self.inertial_max_message_age_s):
+            self._reject_heading_recovery("full_attitude_missing_or_stale")
+            return None
+        if self.recovery_reset_stamp is not None and sample[1] < self.recovery_reset_stamp:
+            self._reject_heading_recovery("waiting_for_post_reset_attitude")
+            return None
+        return frames.multiply(frames.from_rpy(0.0, 0.0, -self.heading_offset_rad), sample[2])
 
     def _refresh_recovery_heading(self):
         """Align the recovery target to CURRENT FCU heading, not old yaw deltas.
@@ -1118,9 +1145,15 @@ class VioPx4GpsBridge(Node):
             f"yaw_deg={math.degrees(self.inertial_yaw_delta):.3f} "
             f"elapsed_s={elapsed:.3f} source={source} resume_eph_m={resume_eph:.3f}"
         )
+        if self.continuity.last_output_orientation is not None:
+            self.get_logger().info(
+                "VIO_FRAME_RECOVERY_APPLIED reference=current_PX4_ATTITUDE "
+                f"raw_to_local_wxyz={self.continuity.rotation_q} "
+                "rotation=fixed_full_3d previous_trajectory=unchanged"
+            )
         self.inertial_active = False
 
-    def _recovery_velocity_agrees(self, local_velocity, raw_vio_yaw) -> bool:
+    def _recovery_velocity_agrees(self, local_velocity, raw_vio_yaw, frame_rotation=None) -> bool:
         """Require recovered VIO motion to agree with PX4 before handoff."""
         if (not self.recovery_velocity_sample_valid or not self.inertial_heading_safe
                 or self.latest_px4_odometry is None or self.heading_offset_rad is None
@@ -1131,11 +1164,14 @@ class VioPx4GpsBridge(Node):
             return False
         # Use the rotation that the handoff will actually apply, not the
         # provisional epoch rotation (which omits motion during quarantine).
-        rotation = wrap_pi(self.continuity.recovery_anchor_yaw
-                           + self.inertial_yaw_delta - raw_vio_yaw)
-        vx, vy = self.continuity._rotate_xy(
-            local_velocity[0], local_velocity[1], rotation
-        )
+        if frame_rotation is not None:
+            vx, vy, _ = frames.rotate(frame_rotation, local_velocity)
+        else:
+            rotation = wrap_pi(self.continuity.recovery_anchor_yaw
+                               + self.inertial_yaw_delta - raw_vio_yaw)
+            vx, vy = self.continuity._rotate_xy(
+                local_velocity[0], local_velocity[1], rotation
+            )
         vio_n, vio_e, _ = rotate_ned_heading(
             vx, vy, 0.0, self.heading_offset_rad
         )
@@ -1197,12 +1233,33 @@ class VioPx4GpsBridge(Node):
             self.recovery_yaw_agreement_state = "collecting"
         return result.agreed
 
-    def _validated_recovery_target(self, local_velocity, raw_vio_yaw):
+    def _validated_recovery_target(self, local_velocity, raw_vio_yaw, raw_orientation=None):
         """Combine independent checks only at the final recovery decision."""
+        self.recovery_target_orientation = None
         target = self._inertial_recovery_target()
-        velocity_agrees = self._recovery_velocity_agrees(local_velocity, raw_vio_yaw)
-        yaw_agrees = self._recovery_yaw_agrees(raw_vio_yaw)
-        return target if velocity_agrees and yaw_agrees else None
+        rotation = None
+        orientation_target = None
+        comparison_yaw = raw_vio_yaw
+        if raw_orientation is not None:
+            if target is None:
+                return None
+            orientation_target = self._recovery_attitude_target()
+            if orientation_target is None:
+                return None
+            if self.recovery_frame_rotation is None:
+                self.recovery_frame_rotation = frames.alignment(raw_orientation, orientation_target)
+            # Hold one rotation throughout the agreement window. Re-fitting it
+            # on every sample would make yaw agree by construction and hide
+            # incorrect camera rotation. Velocity is checked separately in the
+            # EXACT rotation the final handoff would apply, not this baseline.
+            comparison_yaw = frames.yaw(frames.multiply(self.recovery_frame_rotation, raw_orientation))
+            rotation = frames.alignment(raw_orientation, orientation_target)
+        velocity_agrees = self._recovery_velocity_agrees(local_velocity, raw_vio_yaw, rotation)
+        yaw_agrees = self._recovery_yaw_agrees(comparison_yaw)
+        if target is not None and velocity_agrees and yaw_agrees:
+            self.recovery_target_orientation = orientation_target
+            return target
+        return None
 
     def _reset_recovery_agreement(self):
         self.recovery_yaw_agreement.reset()
@@ -1212,6 +1269,8 @@ class VioPx4GpsBridge(Node):
         )
         self.recovery_velocity_agreement_count = 0
         self.recovery_velocity_last_timestamp = None
+        self.recovery_frame_rotation = None
+        self.recovery_target_orientation = None
 
     def _camera_imu_callback(self, msg: Imu):
         stamp = msg.header.stamp
@@ -1357,15 +1416,13 @@ class VioPx4GpsBridge(Node):
             vn, ve, vd = float(lin.x), float(lin.y), float(lin.z)
 
         try:
-            vio_child_yaw_enu = yaw_from_quaternion_xyzw(
-                orientation.x, orientation.y, orientation.z, orientation.w
-            )
+            q_body = frames.normalize((orientation.w, orientation.x, orientation.y, orientation.z))
+            raw_orientation = (frames.ros_to_ned_frd(q_body, self.child_to_body_yaw_rad)
+                               if self.odom_is_enu else q_body)
         except ValueError as exc:
             self.get_logger().error(f"Ignoring invalid VIO orientation: {exc}")
             return
-        raw_body_yaw_ned = wrap_pi(
-            math.pi * 0.5 - (vio_child_yaw_enu + self.child_to_body_yaw_rad)
-        )
+        raw_body_yaw_ned = frames.yaw(raw_orientation)
         raw_yaw_rate_ned = -float(angular.z) if self.odom_is_enu else float(angular.z)
         stamp = msg.header.stamp
         sample_time = float(stamp.sec) + float(stamp.nanosec) * 1e-9
@@ -1376,7 +1433,8 @@ class VioPx4GpsBridge(Node):
         if self.inertial_active:
             # Evaluate freshness/reset/uncertainty guards even while the
             # agreement windows are still collecting samples.
-            inertial_target = self._validated_recovery_target((vn, ve, vd), raw_body_yaw_ned)
+            inertial_target = self._validated_recovery_target(
+                (vn, ve, vd), raw_body_yaw_ned, raw_orientation)
         recovery_displacement = None if inertial_target is None else inertial_target[0]
         recovery_yaw_delta = 0.0 if inertial_target is None else inertial_target[1]
         continuity = self.continuity.update(
@@ -1384,6 +1442,9 @@ class VioPx4GpsBridge(Node):
             raw_yaw_rate_ned, sample_time, frame_key,
             recovery_displacement=recovery_displacement,
             recovery_yaw_delta=recovery_yaw_delta,
+            orientation=raw_orientation,
+            recovery_orientation=(self.recovery_target_orientation
+                                  if inertial_target is not None else None),
         )
         # Record the original gate result, including startup resets that the
         # following block reseeds. A synthetic seed is not a healthy recovery
@@ -1401,6 +1462,7 @@ class VioPx4GpsBridge(Node):
             continuity = self.continuity.update(
                 (north, east, down), raw_body_yaw_ned, (vn, ve, vd),
                 raw_yaw_rate_ned, sample_time, frame_key,
+                orientation=raw_orientation,
             )
         north, east, down = continuity.position
         vn, ve, vd = continuity.velocity
@@ -1623,8 +1685,10 @@ class VioPx4GpsBridge(Node):
                 if all(math.isfinite(value) for value in (roll, pitch, yaw, boot_time)):
                     if self.phase != Phase.LIVE:
                         self.startup_heading.observe(now, boot_time, yaw)
-                    self._integrate_px4_yaw((now, boot_time, yaw))
+                    if self._integrate_px4_yaw((now, boot_time, yaw)):
+                        self.latest_px4_attitude = (now, boot_time, frames.from_rpy(roll, pitch, yaw))
                 else:
+                    self.latest_px4_attitude = None
                     if self.phase != Phase.LIVE:
                         self.startup_heading.observe(now, boot_time, float("nan"))
                     if self.inertial_active:

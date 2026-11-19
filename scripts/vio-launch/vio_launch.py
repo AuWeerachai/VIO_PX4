@@ -1401,6 +1401,7 @@ def show_navigation_status(cfg: Config) -> None:
                 "yaw_rate_limit": "yaw-rate limit",
                 "position_jump": "position change exceeds speed limit",
                 "yaw_jump": "heading change exceeds yaw-rate limit",
+                "attitude_jump": "3D attitude change exceeds rotation-rate limit",
                 "tracking_gap": "tracking gap",
                 "timestamp_regression": "duplicate/backward timestamp",
                 "frame_changed": "coordinate frame changed",
@@ -1505,6 +1506,7 @@ def cmd_run(
     if find_proc(cfg, "ev-bridge") or find_proc(cfg, "mavros"):
         raise RuntimeError("A legacy EV/MAVROS process is already running. Stop it before starting Path A.")
     print("Starting Path A (GPS spoof + VIO GPS)...\n", flush=True)
+    print("- Experimental full 3D recovery: recovered VO frames align to PX4 roll/pitch/yaw.", flush=True)
     cmd_vio(cfg, defer_health=True)
     # Recheck in cmd_gps: another launcher may have started the bridge while
     # camera readiness was being checked. Never silently reuse that publisher.
@@ -1786,7 +1788,7 @@ def configure_pose_gate(cfg: Config) -> Config:
             ("speed", "Maximum speed m/s", cfg.gate_max_speed_m_s, float, 0.0),
             ("acceleration", "Maximum acceleration m/s^2",
              cfg.gate_max_acceleration_m_s2, float, 0.0),
-            ("yaw_rate", "Maximum yaw rate deg/s",
+            ("yaw_rate", "Maximum rotation rate deg/s (yaw and 3D pose steps)",
              cfg.gate_max_yaw_rate_deg_s, float, 0.0),
         )),
         ("Timing", (
@@ -1862,16 +1864,16 @@ def configure_pose_gate(cfg: Config) -> Config:
     save_config(cfg)
     print("\nSaved pose-jump gate limits.")
     print(
-        "Note: speed and yaw-rate limits are automatically converted into "
-        "allowed position and heading changes using the measured time between "
+        "Note: speed and rotation-rate limits are automatically converted into "
+        "allowed position and 3D orientation changes using the measured time between "
         "arriving odometry messages."
     )
     print(
         "During quarantine, PX4 odometry is used only while HIL_GPS is silent. "
         "There is no fixed duration cutoff. "
         "If position propagation fails a guard, position remains frozen. "
-        "Recovery uses current FCU heading after fresh camera/FCU agreement; "
-        "it does not require uninterrupted heading during the disturbance."
+        "Recovery aligns the new VO frame in roll, pitch, and yaw to fresh PX4 attitude. "
+        "The correction is then fixed until another reset; previous positions are unchanged."
     )
     print("The new limits take effect the next time Path A starts.")
     pause()
@@ -1974,7 +1976,7 @@ def interactive_main(cfg: Config) -> int:
                     "pose-gate",
                     f"speed={cfg.gate_max_speed_m_s:g} m/s; "
                     f"accel={cfg.gate_max_acceleration_m_s2:g} m/s²; "
-                    f"yaw rate={cfg.gate_max_yaw_rate_deg_s:g}°/s",
+                    f"rotation rate={cfg.gate_max_yaw_rate_deg_s:g}°/s",
                 ),
                 MenuItem(
                     "RViz auto-launch (toggle ON/OFF)",

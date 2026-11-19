@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 from vio_px4_bridge.geo_utils import wrap_pi
+from vio_px4_bridge import frame_alignment as frames
 
 @dataclass(frozen=True)
 class ContinuityResult:
@@ -15,6 +16,7 @@ class ContinuityResult:
     epoch: int
     event: str | None = None
     detail: str | None = None
+    orientation: tuple[float, float, float, float] | None = None
 
 class LocalPoseContinuity:
     """Map reset-prone VIO into a continuous frame using a quarantine gate."""
@@ -32,13 +34,16 @@ class LocalPoseContinuity:
 
     def reset(self):
         self.rotation = 0.0
+        self.rotation_q = frames.IDENTITY
         self.translation = (0.0, 0.0, 0.0)
+        self.last_raw_orientation = self.last_output_orientation = None
         self.last_raw_position = self.last_raw_yaw = None
         self.last_raw_velocity = self.last_yaw_rate = None
         self.last_timestamp = self.last_frame_key = None
         self.last_output_position = self.last_output_yaw = None
         self.stable_samples = self.epoch = 0
         self.recovery_anchor_position = self.recovery_anchor_yaw = None
+        self.recovery_anchor_orientation = None
         self._clear_suspect()
 
     def _clear_suspect(self):
@@ -56,16 +61,15 @@ class LocalPoseContinuity:
         return math.sqrt(sum(x*x for x in values))
 
     def _transform_position(self, p):
-        x, y = self._rotate_xy(p[0], p[1], self.rotation)
-        return x+self.translation[0], y+self.translation[1], p[2]+self.translation[2]
+        rotated = frames.rotate(self.rotation_q, p)
+        return tuple(rotated[i] + self.translation[i] for i in range(3))
 
     def _transform_velocity(self, v):
-        x, y = self._rotate_xy(v[0], v[1], self.rotation)
-        return x, y, v[2]
+        return frames.rotate(self.rotation_q, v)
 
     def _motion_reason(self, old, new, enforce_gap=True):
-        p0, yaw0, v0, rate0, t0, frame0 = old
-        p1, yaw1, v1, rate1, t1, frame1 = new
+        p0, yaw0, v0, rate0, t0, frame0, q0 = old
+        p1, yaw1, v1, rate1, t1, frame1, q1 = new
         dt = t1-t0
         if dt <= 0: return "timestamp_regression"
         if frame1 != frame0: return "frame_changed"
@@ -80,13 +84,20 @@ class LocalPoseContinuity:
         delta = tuple(p1[i]-p0[i] for i in range(3))
         if self._norm(delta) / dt > self.max_speed_mps:
             return "position_jump"
-        if abs(wrap_pi(yaw1-yaw0)) / dt > self.max_yaw_rate_rad_s:
+        # With a full pose, use the actual rotation, not an Euler-yaw step.
+        # Euler yaw can jump at a vertical/inverted raw frame even when the
+        # physical rotation is small. The configured rotation-rate bound also
+        # catches a roll/pitch-only coordinate reset.
+        if q0 is not None and q1 is not None:
+            if frames.angle_between(q0, q1) / dt > self.max_yaw_rate_rad_s:
+                return "attitude_jump"
+        elif abs(wrap_pi(yaw1-yaw0)) / dt > self.max_yaw_rate_rad_s:
             return "yaw_jump"
         return None
 
     def _gate_detail(self, old, new, reason):
-        p0, yaw0, v0, rate0, t0, frame0 = old
-        p1, yaw1, v1, rate1, t1, frame1 = new
+        p0, yaw0, v0, rate0, t0, frame0, q0 = old
+        p1, yaw1, v1, rate1, t1, frame1, q1 = new
         dt = t1-t0
         if reason == "timestamp_regression":
             return f"dt_s={dt:.6f} limit=>0"
@@ -112,12 +123,16 @@ class LocalPoseContinuity:
             return (f"pose_implied_yaw_rate_deg_s={math.degrees(implied_rate):.3f} "
                     f"limit_deg_s={math.degrees(self.max_yaw_rate_rad_s):.3f} "
                     f"dt_s={dt:.3f}")
+        if reason == "attitude_jump":
+            return (f"pose_implied_rotation_deg_s={math.degrees(frames.angle_between(q0, q1)/dt):.3f} "
+                    f"limit_deg_s={math.degrees(self.max_yaw_rate_rad_s):.3f} dt_s={dt:.3f}")
         return "explicit_source_event=true"
 
     def _accepted_sample(self):
         if self.last_timestamp is None: return None
         return (self.last_raw_position, self.last_raw_yaw, self.last_raw_velocity,
-                self.last_yaw_rate, self.last_timestamp, self.last_frame_key)
+                self.last_yaw_rate, self.last_timestamp, self.last_frame_key,
+                self.last_raw_orientation)
 
     def _held(self, reason, event=None, detail=None):
         position = self.recovery_anchor_position or self.last_output_position
@@ -125,63 +140,81 @@ class LocalPoseContinuity:
                else self.last_output_yaw)
         return ContinuityResult(position, yaw,
                                 (0.0, 0.0, 0.0), True, False, reason, self.epoch,
-                                event, detail)
+                                event, detail, self.recovery_anchor_orientation)
 
     def _start_recovery(self):
         if self.recovery_anchor_position is None:
             self.recovery_anchor_position = self.last_output_position
             self.recovery_anchor_yaw = self.last_output_yaw
+            self.recovery_anchor_orientation = self.last_output_orientation
 
     def _set_raw_state(self, sample):
-        p, yaw, v, rate, timestamp, frame = sample
+        p, yaw, v, rate, timestamp, frame, orientation = sample
         self.last_raw_position, self.last_raw_yaw, self.last_raw_velocity = p, yaw, v
         self.last_yaw_rate, self.last_timestamp, self.last_frame_key = rate, timestamp, frame
+        self.last_raw_orientation = orientation
 
-    def _finish_recovery(self, sample, displacement, yaw_delta):
+    def _finish_recovery(self, sample, displacement, yaw_delta, recovery_orientation=None):
         """Align the recovered raw epoch to the independently propagated target."""
-        p, yaw, v, rate, timestamp, frame = sample
+        p, yaw, v, rate, timestamp, frame, orientation = sample
         target = tuple(self.recovery_anchor_position[i] + displacement[i]
                        for i in range(3))
         target_yaw = wrap_pi(self.recovery_anchor_yaw + yaw_delta)
         self.rotation = wrap_pi(target_yaw - yaw)
-        rx, ry = self._rotate_xy(p[0], p[1], self.rotation)
-        self.translation = (target[0] - rx, target[1] - ry, target[2] - p[2])
+        if orientation is not None:
+            recovery_orientation = frames.normalize(recovery_orientation)
+            self.rotation_q = frames.alignment(orientation, recovery_orientation)
+            target_yaw = frames.yaw(recovery_orientation)
+        else:
+            self.rotation_q = frames.from_rpy(0.0, 0.0, self.rotation)
+        rotated = frames.rotate(self.rotation_q, p)
+        self.translation = tuple(target[i] - rotated[i] for i in range(3))
         self._set_raw_state(sample)
         self.last_output_position, self.last_output_yaw = target, target_yaw
+        self.last_output_orientation = recovery_orientation
         self.recovery_anchor_position = self.recovery_anchor_yaw = None
+        self.recovery_anchor_orientation = None
         out_v = self._transform_velocity(v)
         return ContinuityResult(target, target_yaw, out_v, False, True, None,
                                 self.epoch, "recovery_completed",
-                                "anchor=independent_px4_inertial_delta")
+                                "anchor=validated_recovery_target "
+                                f"rotation={'full_3d' if orientation is not None else 'yaw_only'}",
+                                recovery_orientation)
 
     def _accept(self, sample, reanchored=False, reason=None, event=None,
-                detail=None, recovery_displacement=None, recovery_yaw_delta=0.0):
-        p, yaw, v, rate, timestamp, frame = sample
-        out_p, out_yaw, out_v = self._transform_position(p), wrap_pi(yaw+self.rotation), self._transform_velocity(v)
+                detail=None, recovery_displacement=None, recovery_yaw_delta=0.0,
+                recovery_orientation=None):
+        p, yaw, v, rate, timestamp, frame, orientation = sample
+        out_q = None if orientation is None else frames.multiply(self.rotation_q, orientation)
+        out_yaw = wrap_pi(yaw+self.rotation) if out_q is None else frames.yaw(out_q)
+        out_p, out_v = self._transform_position(p), self._transform_velocity(v)
         self._set_raw_state(sample)
         if self.recovery_anchor_position is not None:
             if not reanchored:
                 self.stable_samples += 1
             if (self.stable_samples >= self.recovery_samples
-                    and recovery_displacement is not None):
+                    and recovery_displacement is not None
+                    and (orientation is None or recovery_orientation is not None)):
                 return self._finish_recovery(
-                    sample, recovery_displacement, recovery_yaw_delta
+                    sample, recovery_displacement, recovery_yaw_delta, recovery_orientation
                 )
             return ContinuityResult(
                 self.recovery_anchor_position, self.recovery_anchor_yaw,
                 (0.0, 0.0, 0.0), True, reanchored, reason, self.epoch,
-                event, detail,
+                event, detail, self.recovery_anchor_orientation,
             )
         self.last_output_position, self.last_output_yaw = out_p, out_yaw
+        self.last_output_orientation = out_q
         if self.epoch and not reanchored: self.stable_samples += 1
         recovering = bool(self.epoch and self.stable_samples < self.recovery_samples)
         return ContinuityResult(out_p, out_yaw, out_v, recovering, reanchored,
-                                reason, self.epoch, event, detail)
+                                reason, self.epoch, event, detail, out_q)
 
     def update(self, position, yaw, velocity, yaw_rate, timestamp, frame_key,
                force_reanchor_reason=None, recovery_displacement=None,
-               recovery_yaw_delta=0.0):
-        sample = (position, yaw, velocity, yaw_rate, timestamp, frame_key)
+               recovery_yaw_delta=0.0, orientation=None, recovery_orientation=None):
+        orientation = None if orientation is None else frames.normalize(orientation)
+        sample = (position, yaw, velocity, yaw_rate, timestamp, frame_key, orientation)
         accepted = self._accepted_sample()
         if accepted is None: return self._accept(sample)
 
@@ -198,6 +231,7 @@ class LocalPoseContinuity:
                 return self._accept(
                     sample, recovery_displacement=recovery_displacement,
                     recovery_yaw_delta=recovery_yaw_delta,
+                    recovery_orientation=recovery_orientation,
                 )
             self._start_recovery()
             self.suspect_reason, self.suspect_samples = reason, [sample]
@@ -231,10 +265,13 @@ class LocalPoseContinuity:
         # displacement is supplied and applied by _finish_recovery().
         anchor_p, anchor_yaw = self.suspect_samples[0][0:2]
         self.rotation = wrap_pi(self.recovery_anchor_yaw-anchor_yaw)
-        rx, ry = self._rotate_xy(anchor_p[0], anchor_p[1], self.rotation)
-        self.translation = (self.recovery_anchor_position[0]-rx,
-                            self.recovery_anchor_position[1]-ry,
-                            self.recovery_anchor_position[2]-anchor_p[2])
+        anchor_q = self.suspect_samples[0][6]
+        if anchor_q is not None and self.recovery_anchor_orientation is not None:
+            self.rotation_q = frames.alignment(anchor_q, self.recovery_anchor_orientation)
+        else:
+            self.rotation_q = frames.from_rpy(0.0, 0.0, self.rotation)
+        rotated = frames.rotate(self.rotation_q, anchor_p)
+        self.translation = tuple(self.recovery_anchor_position[i]-rotated[i] for i in range(3))
         reason, detail = self.suspect_reason, self.suspect_detail
         self._clear_suspect()
         self.epoch += 1
@@ -242,4 +279,5 @@ class LocalPoseContinuity:
         return self._accept(
             sample, True, reason, "reset_confirmed", detail,
             recovery_displacement, recovery_yaw_delta,
+            recovery_orientation,
         )
