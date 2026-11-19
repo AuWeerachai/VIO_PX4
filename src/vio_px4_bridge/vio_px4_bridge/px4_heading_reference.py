@@ -168,11 +168,20 @@ class Px4HeadingReference:
             self.reason = "px4_heading_stale"
             return None
         stamp = now-age-self.clock.offset
+        if stamp < self.history[0][1]:
+            # Newer telemetry cannot supply a missing historical lower bound.
+            self.reason = "camera_before_heading_history"
+            return None
         for a, b in zip(self.history, list(self.history)[1:]):
             dt = b[1]-a[1]
             if a[1] <= stamp <= b[1] and 0 < dt <= self.max_gap and a[3] == b[3]:
                 if min(stamp-a[1], b[1]-stamp) > self.max_skew:
-                    break
+                    # Both endpoints have arrived. Waiting for MORE telemetry
+                    # cannot improve this bracket and would block fresh frames
+                    # until this one becomes stale. The raw pose must still be
+                    # checked, but cannot update GPS without a valid match.
+                    self.reason = "heading_pair_outside_tolerance"
+                    return None
                 q = interpolate(a[2], b[2], (stamp-a[1])/dt)
                 self.last_match = (stamp, q)
                 self.reason = "matched"

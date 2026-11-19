@@ -189,3 +189,50 @@ and reference generation of the accepted output instead. A normal pending
 frame does not invalidate it; stale data, clock loss and estimator/history
 resets still prevent handoff. Regression tests reproduce the original failure
 and check all three rejection cases. No timing limit was relaxed.
+
+### Stationary-test timing corrections
+
+The subsequent stationary Jetson run failed: fresh, unchanged raw VO was
+quarantined by the new heading-pairing path. This is a software timing failure,
+not evidence of physical motion. The original tests varied message arrival
+latency but used exactly 50 ms PX4 capture intervals; they missed uneven
+capture spacing.
+
+- A known 70 ms PX4 bracket has points more than 30 ms from either endpoint.
+  Those points cannot satisfy the configured pairing tolerance. Previously
+  the queue waited indefinitely for a better bracket, blocking later frames
+  until the old frame exceeded its age limit. Now an unusable bracket (or a
+  frame older than retained history) is processed through the raw pose gate
+  without updating output. The following samples can still be matched. A
+  genuinely missing future bracket waits within the existing freshness bound.
+- Recovery now replays every cached PX4 motion sample after the last accepted
+  camera-capture boundary through the existing displacement, speed,
+  acceleration, uncertainty, reset and timestamp guards. Previously it compared
+  the next live packet directly with that older boundary, inventing a gap and
+  unnecessarily freezing recovery. No intermediate packet is skipped to get
+  to the newest one. Real missing data still rejects propagation.
+- In experimental-mode status, the counter is labelled **Quarantine episodes
+  (pose/timing/reference)**. Timing and FCU-reset events must not be presented
+  as confirmed visual pose jumps. JSON keys remain backward compatible.
+
+The added regressions first reproduced the old failures. They cover uneven
+20 Hz PX4 capture spacing with 90 Hz stationary/moving VO, a real jump in an
+unpairable frame, fresh output age, cached-motion replay, faults in intermediate
+cached samples and a genuine PX4 gap. Timing/physical thresholds, publication
+rates, firmware parameters and the stable branch are unchanged. These local
+tests do not replace the required stationary and movement retest on Jetson.
+
+Local validation after the corrections: **429 tests passed, none skipped**,
+including 14 timing regression cases. An isolated colcon package build and a
+ROS-node smoke test importing that installed package also passed. The startup
+handoff regression additionally verifies that a raw, unmatched startup sample
+cannot replace the previously matched output. No active Jetson process was
+changed during this validation.
+
+Clock/rate clarification: `HIGHRES_IMU` contains sensor measurements, not the
+estimated attitude used here. Startup uses `ATTITUDE`; continuous pairing uses
+the `ODOMETRY` quaternion and its capture timestamp/reset counter. Both streams
+are **requested** at 20 Hz; the delivered rate can vary. PX4 boot time, Jetson
+monotonic time and ROS timestamps are different time bases. `TIMESYNC` estimates
+the PX4-to-Jetson offset; the bridge also maps ROS time to Jetson monotonic time.
+It does not set either device's clock or assume their timestamps are equal.

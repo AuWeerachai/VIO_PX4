@@ -1418,7 +1418,9 @@ def show_navigation_status(cfg: Config) -> None:
                   f"noise band: {float(status.get('position_noise_radius_m', 0))*100:.1f} cm "
                   f"({'holding' if status.get('position_noise_held') else 'moving'})")
     if "pose_jump_count" in status:
-        print(f"- Pose-jump episodes: {int(status['pose_jump_count'])} since Path A start")
+        episode_label = ("Quarantine episodes (pose/timing/reference)"
+                         if status.get("stabilized_heading_enabled") else "Pose-jump episodes")
+        print(f"- {episode_label}: {int(status['pose_jump_count'])} since Path A start")
         reason = status.get("last_pose_jump_reason")
         if reason:
             labels = {
@@ -1431,6 +1433,10 @@ def show_navigation_status(cfg: Config) -> None:
                 "tracking_gap": "tracking gap",
                 "timestamp_regression": "duplicate/backward timestamp",
                 "frame_changed": "coordinate frame changed",
+                "camera_timestamp_stale_or_future": "camera timestamp stale/future (timing)",
+                "time_matched_camera_output_stale": "no fresh time-matched output (timing)",
+                "px4_heading_or_time_sync_stale": "PX4 heading/time synchronization stale",
+                "px4_estimator_reset": "PX4 estimator reset",
             }
             stage = " during startup" if status.get("last_pose_jump_stage") == "startup" else ""
             print(f"- Latest episode trigger: {labels.get(reason, reason)}{stage}")

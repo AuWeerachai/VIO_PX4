@@ -57,10 +57,13 @@ def test_separate_recovery_status_and_honest_age(tmp_path, capsys, heading_safe)
     ('tracking_gap', 'tracking gap'),
     ('timestamp_regression', 'duplicate/backward timestamp'),
     ('frame_changed', 'coordinate frame changed'),
+    ('camera_timestamp_stale_or_future', 'camera timestamp stale/future (timing)'),
+    ('time_matched_camera_output_stale', 'no fresh time-matched output (timing)'),
     ('new_reason', 'new_reason'),
     (None, 'none'),
 ])
-def test_status_keeps_latest_episode_trigger_after_recovery(tmp_path, capsys, reason, label):
+@pytest.mark.parametrize('stabilized', [False, True])
+def test_status_keeps_latest_episode_trigger_after_recovery(tmp_path, capsys, reason, label, stabilized):
     source = Path(__file__).parents[3] / 'scripts/vio-launch/vio_launch.py'
     node = next(n for n in ast.parse(source.read_text()).body
                 if isinstance(n, ast.FunctionDef) and n.name == 'show_navigation_status')
@@ -69,6 +72,7 @@ def test_status_keeps_latest_episode_trigger_after_recovery(tmp_path, capsys, re
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), 'exec'), namespace)
     status = dict(updated_unix_s=100., navigation='live_vio', px4_connected=True,
                   vio_fresh=True, pose_gate_quarantine=False, hil_gps_output_active=True,
+                  stabilized_heading_enabled=stabilized,
                   pose_jump_count=2 if reason else 0, last_pose_jump_reason=reason,
                   last_pose_jump_detail='measured=61 limit=60' if reason else None,
                   last_pose_jump_stage='startup')
@@ -76,7 +80,8 @@ def test_status_keeps_latest_episode_trigger_after_recovery(tmp_path, capsys, re
     namespace['show_navigation_status'](SimpleNamespace(state_dir=tmp_path))
     output = capsys.readouterr().out
     assert 'Pose-jump gate status: healthy' in output
-    assert f"Pose-jump episodes: {status['pose_jump_count']} since Path A start" in output
+    episode_label = 'Quarantine episodes (pose/timing/reference)' if stabilized else 'Pose-jump episodes'
+    assert f"{episode_label}: {status['pose_jump_count']} since Path A start" in output
     assert f'Latest episode trigger: {label}' in output
     if reason:
         assert 'during startup' in output

@@ -896,9 +896,9 @@ class VioPx4GpsBridge(Node):
         else:
             (odom_arrival, odom_time, north, east, vn, ve,
              var_n, var_e, reset_counter) = self.latest_px4_odometry
-            # Move the cached sample to the quarantine boundary using its
-            # velocity. This prevents motion just before GPS was stopped from
-            # being counted a second time.
+            # In the legacy path extrapolate to the quarantine boundary. The
+            # time-matched path instead starts at the last accepted camera
+            # capture, so motion after that capture is counted exactly once.
             age = max(0.0, now - odom_arrival)
             boundary = (self.heading_reference.motion_at(self.last_heading_output_time, now)
                         if self.stabilized_heading_enabled else (
@@ -913,6 +913,19 @@ class VioPx4GpsBridge(Node):
                 self.inertial_position_uncertainty_m = math.sqrt(max(boundary[6:8]))
                 if self.inertial_position_uncertainty_m > self.inertial_max_position_uncertainty_m:
                     self._reject_position_propagation("position_uncertainty_at_quarantine")
+                if self.stabilized_heading_enabled:
+                    # Camera output can be older than one telemetry interval.
+                    # Replay every cached packet after its boundary through
+                    # the SAME guards as live recovery. Comparing only the next
+                    # live packet to the old boundary invents a message gap;
+                    # jumping straight to the newest packet could hide a fault.
+                    for record in self.heading_reference.history:
+                        if record[1] <= boundary[1]:
+                            continue
+                        if record[4] is None:
+                            self._fail_inertial_propagation("cached_motion_unavailable")
+                            break
+                        self._update_px4_odometry(record[4])
         # Do not extrapolate the timestamp without extrapolating orientation:
         # doing so shortens the next dt and can manufacture a high yaw rate.
         self.inertial_last_yaw = self.latest_px4_yaw
@@ -1446,6 +1459,8 @@ class VioPx4GpsBridge(Node):
 
         Process every buffered raw sample in order through the original gate.
         Do not replace a pending sample with a newer one: that could hide a jump.
+        A known unusable bracket is NOT a wait for future telemetry: process
+        that sample without heading/output, then try the following sample.
         No new GPS position is derived from an unmatched sample.
         """
         while self.pending_odometry:
@@ -1455,7 +1470,9 @@ class VioPx4GpsBridge(Node):
                 stamp, self.get_clock().now().nanoseconds*1e-9, time.monotonic())
             invalid = self.heading_reference.reason in (
                 "invalid_camera_timestamp", "camera_clock_changed", "camera_timestamp_stale_or_future")
-            if matched is None and not invalid:
+            unpairable = self.heading_reference.reason in (
+                "camera_before_heading_history", "heading_pair_outside_tolerance")
+            if matched is None and not invalid and not unpairable:
                 return
             self.pending_odometry.popleft()
             self._process_odom(msg)
@@ -1628,6 +1645,11 @@ class VioPx4GpsBridge(Node):
             self.continuity_recovering = True
             return
         if continuity.waiting_for_heading:
+            return
+        if self.stabilized_heading_enabled and self.heading_reference.last_match is None:
+            # Startup does not yet require heading in the continuity gate, but
+            # an unmatched raw sample still cannot replace the matched output
+            # that the spoof-to-live readiness check refers to.
             return
         if self.continuity_recovering:
             self.get_logger().info(
