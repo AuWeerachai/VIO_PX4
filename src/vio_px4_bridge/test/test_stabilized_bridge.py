@@ -28,6 +28,7 @@ def stabilized(bridge):
     b.have_vio=False
     b.last_vio_time=None
     b.last_heading_output_time=None
+    b.last_heading_output_generation=None
     b.heading_reference=Px4HeadingReference()
     b.continuity=LocalPoseContinuity(confirmation_samples=3,recovery_samples=4,
                                    stabilizer=StabilizedDisplacement())

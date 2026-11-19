@@ -143,7 +143,7 @@ quarantine fields, or a MAVLink capture, for that distinction.
 
 ## Local validation and required hardware check
 
-Validation on 19 November 2026: **396 tests passed, none skipped**, with ROS
+Initial validation on 19 November 2026: **396 tests passed, none skipped**, with ROS
 Humble sourced. An isolated `colcon build --packages-select vio_px4_bridge`
 also passed; the existing workspace installation was not replaced.
 
@@ -179,3 +179,13 @@ Protocol references: [MAVLink TIMESYNC](https://mavlink.io/en/services/timesync.
 and [ODOMETRY fields](https://mavlink.io/en/messages/common.html#ODOMETRY).
 The expected PX4 stream conventions were checked against the local firmware's
 `src/modules/mavlink/streams/ODOMETRY.hpp`.
+
+### Ground-test startup correction
+
+The first Jetson start exposed a spoof-deadline race: trying to match the next
+camera frame clears the transient `last_match`, even though the previously
+accepted time-matched output is still fresh. The deadline now checks the age
+and reference generation of the accepted output instead. A normal pending
+frame does not invalidate it; stale data, clock loss and estimator/history
+resets still prevent handoff. Regression tests reproduce the original failure
+and check all three rejection cases. No timing limit was relaxed.

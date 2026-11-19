@@ -328,6 +328,7 @@ class VioPx4GpsBridge(Node):
             self.continuity.max_yaw_rate_rad_s, self.inertial_reorder_tolerance_s,
         ) if self.stabilized_heading_enabled else None)
         self.last_heading_output_time = None
+        self.last_heading_output_generation = None
         self.last_timesync_request = float("-inf")
         self.pending_odometry = deque()
 
@@ -1406,7 +1407,8 @@ class VioPx4GpsBridge(Node):
         if self.continuity_recovering:
             return "pose-jump gate recovering"
         if self.stabilized_heading_enabled and (
-                self.heading_reference.last_match is None or not self.heading_reference.fresh(now)
+                not self.heading_reference.fresh(now)
+                or self.last_heading_output_generation != self.heading_reference.generation
                 or self.last_heading_output_time is None
                 or not 0 <= now-self.last_heading_output_time <= self.inertial_max_message_age_s):
             return f"PX4 heading pairing not ready: {self.heading_reference.reason}"
@@ -1675,6 +1677,7 @@ class VioPx4GpsBridge(Node):
         if self.stabilized_heading_enabled and self.heading_reference.last_match is not None:
             self.last_heading_output_time = (
                 self.heading_reference.last_match[0]+self.heading_reference.clock.offset)
+            self.last_heading_output_generation = self.heading_reference.generation
             self.last_vio_time = self.last_heading_output_time
         if self.vio_stale_warned:
             self.get_logger().info("VIO odometry resumed; GPS updates resumed")
@@ -1950,6 +1953,7 @@ class VioPx4GpsBridge(Node):
             self.continuity.reset()
             self.pending_odometry.clear()
             self.last_heading_output_time = None
+            self.last_heading_output_generation = None
             self.continuity_recovering = False
             self.pose_jump_episode_active = False
             self.have_vio = False

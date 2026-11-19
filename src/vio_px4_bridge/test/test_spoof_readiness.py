@@ -148,6 +148,44 @@ def test_deadline_hands_off_only_when_all_checks_pass(bridge):
     assert bridge.spoof_failure_reason is None
 
 
+@pytest.mark.parametrize('fault', [None, 'reset', 'stale', 'clock'])
+def test_pending_next_heading_does_not_invalidate_fresh_accepted_handoff(bridge, fault):
+    from vio_px4_bridge.px4_heading_reference import Px4HeadingReference
+    from vio_px4_bridge.frame_alignment import IDENTITY
+    from test_px4_heading_reference import synced
+    ref = Px4HeadingReference()
+    synced(ref, 15.)
+    ref.observe(14.95, 9.95, IDENTITY, 0)
+    ref.observe(15., 10., IDENTITY, 0)
+    assert ref.match(1014.96, 1015., 15.) == 0.
+    bridge.stabilized_heading_enabled = True
+    bridge.heading_reference = ref
+    bridge.inertial_max_message_age_s = .25
+    bridge.last_heading_output_time = bridge.last_vio_time = 14.96
+    bridge.last_heading_output_generation = 0
+    # The 90-Hz camera has already delivered the next frame, ahead of the
+    # 20-Hz FCU. At the spoof deadline, the accepted 40-ms-old pair is healthy.
+    assert ref.match(1015.01, 1015.02, 15.02) is None
+    assert ref.last_match is None
+    if fault == 'reset':
+        ref.invalidate('px4_estimator_reset')
+        ref.observe(15., 10., IDENTITY, 1)
+        assert ref.fresh(15.)
+    elif fault == 'stale':
+        bridge.last_heading_output_time = 14.
+    elif fault == 'clock':
+        ref.clock.clear()
+    if fault is not None:
+        assert bridge._handoff_block_reason() is not None
+        bridge._maybe_end_spoof_by_timer()
+        assert bridge.phase == bridge.Phase.WAITING
+        return
+    assert bridge._handoff_block_reason() is None
+    bridge._maybe_end_spoof_by_timer()
+    assert bridge.phase == bridge.Phase.LIVE
+    assert bridge.spoof_failure_reason is None
+
+
 @pytest.mark.parametrize('problem', ['IMU timestamps unstable', 'camera fusion setting not confirmed recently'])
 def test_failed_deadline_sends_no_more_gps(bridge, problem):
     bridge.camera_readiness.reason.return_value = problem

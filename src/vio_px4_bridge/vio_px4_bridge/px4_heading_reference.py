@@ -83,8 +83,10 @@ class Px4HeadingReference:
         self.reason = "waiting_for_px4_heading"
         self.last_ros_offset = None
         self.last_match = None
+        self.generation = 0
 
     def invalidate(self, reason):
+        self.generation += 1
         self.history.clear()
         self.last_match = None
         self.reason = reason
