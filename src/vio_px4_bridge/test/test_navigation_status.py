@@ -21,6 +21,7 @@ def test_separate_recovery_status_and_honest_age(tmp_path, capsys, heading_safe)
                   px4_connected=True, pose_gate_quarantine=True, vio_age_s=47.8848,
                   inertial_recovery_active=True, recovery_position_safe=False,
                   inherited_position_uncertainty_m=1.2,
+                  frozen_position_uncertainty_m=5.0,
                   recovery_heading_safe=heading_safe,
                   inertial_recovery_failure='position_uncertainty',
                   recovery_heading_failure=None if heading_safe else 'yaw_message_gap',
@@ -33,6 +34,8 @@ def test_separate_recovery_status_and_honest_age(tmp_path, capsys, heading_safe)
     assert 'Position recovery: frozen' in output
     assert 'position_uncertainty' in output
     assert 'Position uncertainty inherited from PX4: at least 1.20 m' in output
+    assert 'verify/reset origin' not in output
+    assert 'Global position uncertainty:' not in output
     assert 'Last accepted VIO sample: 47.88 s ago' in output
     assert 'Latency:' not in output
     if heading_safe:

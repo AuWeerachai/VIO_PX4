@@ -1417,9 +1417,6 @@ def show_navigation_status(cfg: Config) -> None:
         print(f"- Spoof health check: {status.get('handoff_check_reason') or 'healthy'}")
     if status.get("spoof_failure_reason"):
         print(f"- Spoof failed: {status['spoof_failure_reason']}")
-    if float(status.get("frozen_position_uncertainty_m", 0.0)) > 0:
-        print("- Global position uncertainty: movement was discarded during recovery; "
-              "verify/reset origin before relying on tight GPS accuracy")
     inherited = float(status.get("inherited_position_uncertainty_m", 0.0))
     if inherited > 0:
         print(f"- Position uncertainty inherited from PX4: at least {inherited:.2f} m")
