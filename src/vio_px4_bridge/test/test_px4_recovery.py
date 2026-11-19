@@ -12,9 +12,11 @@ import pytest
 from vio_px4_bridge.geo_utils import (
     mavlink_velocity_to_ned, rotate_ned_heading, wrap_pi, enu_offset_to_ned,
     yaw_from_quaternion_xyzw, ned_offset_to_lla,
+    rotate_vector_by_quaternion_xyzw,
 )
 from vio_px4_bridge.recovery_yaw import RecoveryYawAgreement, timestamp_order
 from vio_px4_bridge.local_continuity import LocalPoseContinuity
+from vio_px4_bridge import frame_alignment as frames
 
 
 def test_velocity_frame_is_independent_of_position_frame():
@@ -46,7 +48,7 @@ def bridge():
              '_update_px4_odometry', '_fail_inertial_propagation',
              '_reject_position_propagation', '_reject_heading_recovery',
              '_validated_recovery_target', '_reset_recovery_agreement',
-             '_refresh_recovery_heading',
+             '_refresh_recovery_heading', '_recovery_attitude_target',
              '_poll_mavlink',
              '_recovery_velocity_agrees', '_tick', '_odom_callback', '_record_pose_gate_result',
              '_recovery_yaw_agrees', '_finish_inertial_propagation', '_select_accuracy'}
@@ -54,10 +56,11 @@ def bridge():
                         type_ignores=[])
     clock = SimpleNamespace(now=10.0)
     clock.monotonic = lambda: clock.now
-    ns = dict(time=clock, math=math, wrap_pi=wrap_pi,
+    ns = dict(time=clock, math=math, wrap_pi=wrap_pi, frames=frames,
               rotate_ned_heading=rotate_ned_heading, timestamp_order=timestamp_order,
               Odometry=SimpleNamespace, enu_offset_to_ned=enu_offset_to_ned,
               yaw_from_quaternion_xyzw=yaw_from_quaternion_xyzw,
+              rotate_vector_by_quaternion_xyzw=rotate_vector_by_quaternion_xyzw,
               ned_offset_to_lla=ned_offset_to_lla,
               mavlink_velocity_to_ned=mavlink_velocity_to_ned,
               Phase=SimpleNamespace(SPOOF='spoof', LIVE='live', ALIGNING='aligning', WAITING='waiting'))
@@ -83,11 +86,14 @@ def bridge():
     obj.inherited_position_uncertainty_m = 0.0
     obj.inertial_yaw_delta = 0.4
     obj.inertial_last_yaw = obj.latest_px4_yaw = (10.0, 10.0, 0.4)
+    obj.latest_px4_attitude = (10.0, 10.0, frames.from_rpy(0, 0, .4))
+    obj.recovery_frame_rotation = obj.recovery_target_orientation = None
     odom = (10.0, 10.0, 0, 0, 0, 0, 0.1, 0.1, 0)
     obj.latest_px4_odometry = obj.inertial_start_odometry = obj.inertial_last_odometry = odom
     obj.continuity = SimpleNamespace(max_speed_mps=10.0, max_acceleration_mps2=5.0,
                                     max_yaw_rate_rad_s=math.tau, recovery_anchor_yaw=0,
-                                    _rotate_xy=LocalPoseContinuity._rotate_xy)
+                                    _rotate_xy=LocalPoseContinuity._rotate_xy,
+                                    last_output_orientation=None)
     obj.heading_offset_rad = 0.0
     obj.recovery_yaw_agreement = RecoveryYawAgreement(required_samples=2)
     obj.recovery_yaw_agreement_deg = 20.0
@@ -223,7 +229,8 @@ def test_yaw_jump_restarts_windows_but_accepts_current_heading(bridge):
 def feed_px4(bridge, t, yaw=.4, variance=.1, vn=0., ve=0., reset=0, north=0., east=0.):
     bridge.clock.now = t
     bridge._update_px4_odometry((t, t, north, east, vn, ve, variance, variance, reset))
-    bridge._integrate_px4_yaw((t, t, yaw))
+    if bridge._integrate_px4_yaw((t, t, yaw)):
+        bridge.latest_px4_attitude = (t, t, frames.from_rpy(0, 0, yaw))
 
 
 @pytest.mark.parametrize('variance,reset', [(3.109 ** 2, 0), (.1, 1)])
@@ -367,7 +374,7 @@ def vio_message(t, north, yaw=0., vn=0.):
 
 @pytest.mark.parametrize('reason', [
     'speed_limit', 'acceleration_limit', 'yaw_rate_limit', 'position_jump',
-    'yaw_jump', 'tracking_gap', 'timestamp_regression', 'frame_changed',
+    'attitude_jump', 'tracking_gap', 'timestamp_regression', 'frame_changed',
 ])
 def test_episode_counter_records_actual_gate_trigger_once(bridge, reason):
     bridge.continuity = LocalPoseContinuity()
@@ -378,7 +385,7 @@ def test_episode_counter_records_actual_gate_trigger_once(bridge, reason):
     original_fix = dict(bridge.latest_fix)
     t = 11.1 if reason == 'tracking_gap' else 10. if reason == 'timestamp_regression' else 10.05
     msg = vio_message(t, 1. if reason == 'position_jump' else 0.,
-                      yaw=.5 if reason == 'yaw_jump' else 0.,
+                      yaw=.5 if reason == 'attitude_jump' else 0.,
                       vn=11. if reason == 'speed_limit' else 1. if reason == 'acceleration_limit' else 0.)
     if reason == 'yaw_rate_limit':
         msg.twist.twist.angular.z = -7.
@@ -580,18 +587,19 @@ def test_real_motion_uses_propagated_target_when_position_remains_safe(bridge):
 
 
 def telemetry(bridge, t, counter, yaw=0., gyro_z=0., attitude_first=True,
-              north=0., east=0., vn=0., ve=0., variance=.1, quality=0):
+              north=0., east=0., vn=0., ve=0., variance=.1, quality=0,
+              roll=0., pitch=0.):
     """Feed actual MAVLink dispatch with synchronized ODOMETRY q/body gyro."""
     bridge.clock.now = t
     odom = SimpleNamespace(
         get_type=lambda: 'ODOMETRY', get_srcSystem=lambda: 1,
         time_usec=round(t*1e6), frame_id=1, child_frame_id=1, estimator_type=8,
-        x=north, y=east, vx=vn, vy=ve, vz=0., q=(math.cos(yaw/2), 0., 0., math.sin(yaw/2)),
+        x=north, y=east, vx=vn, vy=ve, vz=0., q=frames.from_rpy(roll, pitch, yaw),
         rollspeed=0., pitchspeed=0., yawspeed=gyro_z,
         pose_covariance=[variance]*21, reset_counter=counter, quality=quality)
     attitude = SimpleNamespace(
         get_type=lambda: 'ATTITUDE', get_srcSystem=lambda: 1, get_srcComponent=lambda: 1,
-        time_boot_ms=round(t*1000), roll=0., pitch=0., yaw=yaw)
+        time_boot_ms=round(t*1000), roll=roll, pitch=pitch, yaw=yaw)
     queue = [attitude, odom, None] if attitude_first else [odom, attitude, None]
     bridge._mav = SimpleNamespace(recv_match=Mock(side_effect=queue))
     bridge.poll_real()
