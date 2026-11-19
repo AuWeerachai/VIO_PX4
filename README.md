@@ -29,3 +29,4 @@ lost motion, or remove accumulated global uncertainty.
 - ROS source is under `src/`.
 - Operator launcher code is under `scripts/vio-launch/`.
 - Runtime architecture documentation is under `docs/`.
+- Standalone camera calibration: [calibration/README.md](calibration/README.md), with separate local/onboard-computer deployment.

@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -eo pipefail
+# Only sets this observer's ROS environment; never starts/stops the flight stack.
+if [[ -f /opt/ros/humble/setup.bash ]]; then
+    source /opt/ros/humble/setup.bash
+fi
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
+exec /usr/bin/python3 -s "$(dirname -- "${BASH_SOURCE[0]}")/extrinsic_calibration.py" "$@"

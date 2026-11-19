@@ -1,0 +1,223 @@
+From 3b897698c5e3b5eb018e8d7e89cc3e842805b605 Mon Sep 17 00:00:00 2001
+From: AuWeerachai <auweerachais@gmail.com>
+Date: Thu, 19 Nov 2026 14:49:59 -0500
+Subject: [PATCH] Add passive localhost PX4 telemetry for standalone
+ calibration
+
+---
+ .../test/test_diagnostic_telemetry.py         | 83 +++++++++++++++++++
+ .../vio_px4_bridge/diagnostic_telemetry.py    | 60 ++++++++++++++
+ .../vio_px4_bridge/vio_px4_gps_bridge.py      | 19 +++++
+ 3 files changed, 162 insertions(+)
+ create mode 100644 src/vio_px4_bridge/test/test_diagnostic_telemetry.py
+ create mode 100644 src/vio_px4_bridge/vio_px4_bridge/diagnostic_telemetry.py
+
+diff --git a/src/vio_px4_bridge/test/test_diagnostic_telemetry.py b/src/vio_px4_bridge/test/test_diagnostic_telemetry.py
+new file mode 100644
+index 0000000..2f576c6
+--- /dev/null
++++ b/src/vio_px4_bridge/test/test_diagnostic_telemetry.py
+@@ -0,0 +1,83 @@
++import json
++from types import SimpleNamespace
++from unittest.mock import Mock, patch
++
++from vio_px4_bridge.diagnostic_telemetry import DiagnosticTelemetry
++from test_px4_recovery import bridge
++
++
++def attitude(**overrides):
++    values = dict(roll=.1, pitch=-.2, yaw=1., rollspeed=.01, pitchspeed=.02, yawspeed=.03,
++                  time_boot_ms=1000, get_type=lambda: 'ATTITUDE', get_srcSystem=lambda: 1,
++                  get_srcComponent=lambda: 1)
++    values.update(overrides)
++    return SimpleNamespace(**values)
++
++
++def test_one_way_localhost_copy():
++    with patch('vio_px4_bridge.diagnostic_telemetry.socket.socket') as make:
++        d = DiagnosticTelemetry()
++        d.publish(attitude(), 'live', False)
++        wire, target = make.return_value.sendto.call_args.args
++        packet = json.loads(wire)
++        assert target == ('127.0.0.1', 14691)
++        assert packet['data']['roll'] == .1
++        assert packet['data']['boot_s'] == 1
++        assert packet['quarantined'] is False
++        make.return_value.bind.assert_not_called()
++        make.return_value.recv.assert_not_called()
++        make.return_value.setblocking.assert_called_once_with(False)
++
++
++def test_missing_receiver_socket_failure_and_bad_data_are_nonfatal():
++    with patch('vio_px4_bridge.diagnostic_telemetry.socket.socket', side_effect=OSError):
++        DiagnosticTelemetry().publish(attitude(), 'live', False)
++    with patch('vio_px4_bridge.diagnostic_telemetry.socket.socket') as make:
++        d = DiagnosticTelemetry()
++        d.publish(attitude(roll=float('nan')), 'live', False)
++        make.return_value.sendto.assert_not_called()
++        make.return_value.sendto.side_effect = BlockingIOError
++        d.publish(attitude(), 'live', False)
++        assert d.dropped == 1
++        d.close()
++        d.publish(attitude(), 'live', False)
++
++
++def test_only_attitude_and_local_ned_height_are_exported():
++    with patch('vio_px4_bridge.diagnostic_telemetry.socket.socket') as make:
++        d = DiagnosticTelemetry()
++        d.publish(attitude(get_type=lambda: 'PARAM_SET'), 'live', False)
++        make.return_value.sendto.assert_not_called()
++        odom = SimpleNamespace(get_type=lambda: 'ODOMETRY', get_srcSystem=lambda: 1,
++                               get_srcComponent=lambda: 1, time_usec=2000000,
++                               frame_id=1, z=-1.2, reset_counter=3)
++        d.publish(odom, 'live', True)
++        packet = json.loads(make.return_value.sendto.call_args.args[0])
++        assert packet['data']['z'] == -1.2
++        assert packet['quarantined']
++        odom.frame_id = 4
++        make.return_value.sendto.reset_mock()
++        d.publish(odom, 'live', True)
++        make.return_value.sendto.assert_not_called()
++
++
++def test_real_mavlink_dispatch_unaffected_by_broken_diagnostic_consumer(bridge):
++    b = bridge
++    # The production Phase is an enum; the fixture uses string constants.
++    class PhaseValue(str):
++        @property
++        def value(self):
++            return str(self)
++    b.phase = PhaseValue('live')
++    b._diagnostic_telemetry = Mock()
++    b._diagnostic_telemetry.publish.side_effect = RuntimeError('diagnostic failure')
++    b._integrate_px4_yaw = Mock(return_value=True)
++    valid = attitude(time_boot_ms=10000)
++    b._mav = Mock()
++    b._mav.recv_match.side_effect = [
++        attitude(get_srcSystem=lambda: 2), attitude(get_srcComponent=lambda: 100), valid, None]
++    b.poll_real()
++    b._diagnostic_telemetry.publish.assert_called_once_with(valid, 'live', True)
++    b._integrate_px4_yaw.assert_called_once_with((10., 10., 1.))
++    assert b.latest_px4_attitude[:2] == (10., 10.)
++    assert b.continuity_recovering is True  # No gate/fusion state altered.
+diff --git a/src/vio_px4_bridge/vio_px4_bridge/diagnostic_telemetry.py b/src/vio_px4_bridge/vio_px4_bridge/diagnostic_telemetry.py
+new file mode 100644
+index 0000000..4f347df
+--- /dev/null
++++ b/src/vio_px4_bridge/vio_px4_bridge/diagnostic_telemetry.py
+@@ -0,0 +1,60 @@
++"""One-way diagnostic copy of already received PX4 data, localhost only.
++
++No receive/bind/serial/MAVLink command API. Missing listeners, socket failures,
++and malformed diagnostic packets must never affect navigation processing.
++"""
++import json
++import math
++import socket
++import time
++
++PORT = 14691
++
++
++class DiagnosticTelemetry:
++    def __init__(self, port=PORT):
++        self.socket = None
++        self.destination = ("127.0.0.1", int(port))
++        self.dropped = 0
++        try:
++            self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++            self.socket.setblocking(False)
++            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8192)
++        except OSError:
++            self.close()
++
++    def publish(self, msg, phase, quarantined):
++        if self.socket is None:
++            return
++        try:
++            kind = msg.get_type()
++            if kind == "ATTITUDE":
++                data = {name: float(getattr(msg, name)) for name in
++                        ("roll", "pitch", "yaw", "rollspeed", "pitchspeed", "yawspeed")}
++                data["boot_s"] = float(msg.time_boot_ms)*1e-3
++            elif kind == "ODOMETRY":
++                if int(msg.frame_id) != 1:  # PX4 LOCAL_NED; z is down-positive.
++                    return
++                data = dict(boot_s=float(msg.time_usec)*1e-6, z=float(msg.z),
++                            reset_counter=int(msg.reset_counter), frame_id=int(msg.frame_id))
++            else:
++                return
++            if not all(math.isfinite(v) for v in data.values()):
++                return
++            packet = dict(schema=1, source="vio_px4_bridge_diagnostic", type=kind,
++                          received_unix_s=time.time(), received_monotonic_s=time.monotonic(),
++                          system_id=int(msg.get_srcSystem()), component_id=int(msg.get_srcComponent()),
++                          phase=str(phase), quarantined=bool(quarantined), data=data)
++            self.socket.sendto(json.dumps(packet, allow_nan=False, separators=(",", ":")).encode(),
++                               self.destination)
++        except Exception:
++            # Diagnostic errors never propagate into the GPS/heading/recovery path.
++            self.dropped += 1
++
++    def close(self):
++        if self.socket is not None:
++            try:
++                self.socket.close()
++            except OSError:
++                pass
++            self.socket = None
+diff --git a/src/vio_px4_bridge/vio_px4_bridge/vio_px4_gps_bridge.py b/src/vio_px4_bridge/vio_px4_bridge/vio_px4_gps_bridge.py
+index 7b4da29..72a6000 100644
+--- a/src/vio_px4_bridge/vio_px4_bridge/vio_px4_gps_bridge.py
++++ b/src/vio_px4_bridge/vio_px4_bridge/vio_px4_gps_bridge.py
+@@ -49,6 +49,7 @@ from vio_px4_bridge.recovery_yaw import timestamp_order
+ from vio_px4_bridge.spoof_readiness import SpoofReadiness
+ from vio_px4_bridge.startup_heading import Px4StartupHeading, heading_source
+ from vio_px4_bridge import frame_alignment as frames
++from vio_px4_bridge.diagnostic_telemetry import DiagnosticTelemetry
+ 
+ 
+ class Phase(Enum):
+@@ -384,6 +385,7 @@ class VioPx4GpsBridge(Node):
+         self._mav = None
+         self._gps_pub = None
+         self._hil_gps_extensions_supported = None
++        self._diagnostic_telemetry = DiagnosticTelemetry()
+         self._init_transport()
+ 
+         qos = QoSProfile(
+@@ -1656,6 +1658,16 @@ class VioPx4GpsBridge(Node):
+             if (self.px4_target_sysid is not None
+                     and int(msg.get_srcSystem()) != self.px4_target_sysid):
+                 continue
++            # Passive localhost copy only. The diagnostic consumer cannot send
++            # commands back through this socket or take the Cube's serial port.
++            mirror = getattr(self, "_diagnostic_telemetry", None)
++            if (mirror is not None and message_type in ("ATTITUDE", "ODOMETRY")
++                    and self.px4_target_sysid is not None
++                    and int(msg.get_srcComponent()) == self.px4_target_compid):
++                try:
++                    mirror.publish(msg, self.phase.value, self.continuity_recovering)
++                except Exception:
++                    pass  # Even a diagnostic implementation fault is non-fatal.
+             if (
+                 message_type == "HEARTBEAT"
+                 and self.px4_target_sysid is not None
+@@ -1977,6 +1989,13 @@ class VioPx4GpsBridge(Node):
+         self._gps_pub.publish(msg)
+ 
+ 
++    def destroy_node(self):
++        mirror = getattr(self, "_diagnostic_telemetry", None)
++        if mirror is not None:
++            mirror.close()
++        return super().destroy_node()
++
++
+ def main(args=None):
+     rclpy.init(args=args)
+     node = VioPx4GpsBridge()
+-- 
+2.34.1
+

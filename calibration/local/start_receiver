@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ $# != 1 || $1 == -* ]]; then echo 'Usage: ./start_receiver teamc@JETSON_IP'; exit 2; fi
+tool_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+receiver_tmp=$(mktemp -d /tmp/calibration-receiver.XXXXXX)
+control="$receiver_tmp/ssh"
+cleanup() {
+    ssh -o ControlPath="$control" -O exit "$1" >/dev/null 2>&1 || true
+    rmdir -- "$receiver_tmp" 2>/dev/null || true
+}
+trap 'cleanup "$1"' EXIT
+ssh -M -S "$control" -o ControlPersist=60 -o ConnectTimeout=10 -fN "$1"
+echo 'Ready: leave this window open. On Jetson, STOP then Y transfers and plots here.'
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 /usr/bin/python3 -s "$tool_dir/desktop_receiver.py" "$1" --control-path "$control"
