@@ -127,6 +127,8 @@ def capture_flight(args):
         return tf_arrays(buffer.lookup_transform(target, source, stamp))
 
     print(f'Output: {folder}', flush=True)
+    if args.seconds is None:
+        print('READY. Type START once, then press Enter. STATUS shows counters; STOP ends the session.', flush=True)
     try:
         while True:
             rclpy.spin_once(node, timeout_sec=.02)
@@ -140,7 +142,14 @@ def capture_flight(args):
                     meta.update(start_unix_s=start_ns*1e-9, start_utc=datetime.now(timezone.utc).isoformat())
                     write_json(folder/'capture.json', meta)
                     clouds.clear()
-                    print('RECORDING. Type STOP then Enter to finish.', flush=True)
+                    print('RECORDING STARTED. Type STATUS for counters; STOP then Enter to finish.', flush=True)
+                elif command == 'START':
+                    print('Already recording. Type STATUS for counters or STOP to finish.', flush=True)
+                elif command == 'STATUS':
+                    tele = 'receiving' if telemetry.last_received and now-telemetry.last_received < 1 else 'MISSING'
+                    elapsed = now-begin if recording else 0
+                    print(f'{"RECORDING" if recording else "NOT RECORDING — enter START"} | '
+                          f'{elapsed:.1f} s | {frame_count} clouds | {count_pose} VO poses | PX4 {tele}', flush=True)
                 elif command in ('STOP', 'DONE'):
                     meta['capture_complete'] = recording
                     return_code = 0 if recording else 2
@@ -150,7 +159,8 @@ def capture_flight(args):
                     return_code = 2
                     break
                 elif command:
-                    print('Commands: START / STOP (DONE also stops).', flush=True)
+                    print(f'Unrecognized command {command!r}. Type START once and press Enter, '
+                          'or STATUS / STOP.', flush=True)
             else:
                 return_code = None
             if return_code is not None:
@@ -215,7 +225,9 @@ def capture_flight(args):
                     frame_count += 1
                     last_stamp, last_sample = ns, now
                     break
-            if now-last_print >= 3:
+            # Do not write periodic status through the operator's partially typed
+            # command. Timed captures have no command input; interactive ones use STATUS.
+            if args.seconds is not None and now-last_print >= 3:
                 tele = 'receiving' if telemetry.last_received and now-telemetry.last_received < 1 else 'MISSING'
                 elapsed = now-begin if recording else 0
                 print(f'{"RECORDING" if recording else "READY — type START"} | {elapsed:.1f} s | '
@@ -249,7 +261,11 @@ def capture_flight(args):
         meta.update(stop_utc=datetime.now(timezone.utc).isoformat(), elapsed_s=duration,
                     diagnostics=diagnostics, captured_frames=frame_count)
         write_json(folder/'capture.json', meta)
-    print(f'SAVED: {folder}')
+    if begin is None:
+        print(f'NOT RECORDED: START was never accepted. Empty session metadata: {folder}', flush=True)
+        print('Run the recorder again, type START once, and press Enter. Wait for RECORDING STARTED.')
+        return return_code
+    print(f'SAVED: {folder} ({frame_count} clouds, {count_pose} VO poses)', flush=True)
     if meta['capture_complete'] and not getattr(args, 'no_transfer_prompt', False) and sys.stdin.isatty():
         from transfer_results import offer_transfer
         offer_transfer(folder)

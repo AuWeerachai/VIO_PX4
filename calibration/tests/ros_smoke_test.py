@@ -89,7 +89,7 @@ def main():
         report = json.loads((output/"report.json").read_text())
         np.testing.assert_allclose(report["suggested_rpy_deg"], [1.2, 32, 180], atol=.12)
         assert report["grid_frame"] == "test_map"
-        assert (output/"measured.png").is_file() and (output/"predicted_after.png").is_file()
+        assert (output/"current_floor_view.png").is_file() and (output/"predicted_floor_view.png").is_file()
         print(f"ROS integration PASS; SYNTHETIC DATA ONLY: {output}")
     finally:
         if process.poll() is None:

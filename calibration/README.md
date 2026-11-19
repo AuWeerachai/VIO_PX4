@@ -75,7 +75,9 @@ not stop VO. Files remain on Jetson if transfer fails.
 ```
 
 Enter **height from Cube Orange to the physical ground plane at START (metres)**,
-then the RViz Fixed Frame. Type START to record; STOP (or DONE) finishes.
+then the RViz Fixed Frame. Type START once and press Enter; wait for **RECORDING STARTED**.
+Type STATUS and Enter for sample counts. Interactive status does not print repeatedly
+over your input. STOP (or DONE), followed by Enter, finishes.
 A second operator should run the terminal during flight.
 
 After STOP:

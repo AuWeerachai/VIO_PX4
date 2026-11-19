@@ -82,7 +82,7 @@ def main():
             mirror.publish(attitude, 'live', False)
             mirror.publish(odom, 'live', False)
             if elapsed > 2. and not started:
-                proc.stdin.write('START\n')
+                proc.stdin.write('startstart\nstart\nstatus\n')
                 proc.stdin.flush()
                 started = True
             if elapsed > 13. and not stopped:
@@ -97,6 +97,10 @@ def main():
         stdout, _ = proc.communicate(timeout=5)
         print(stdout)
         assert proc.returncode == 0, f'capture failed: {root}'
+        assert "Unrecognized command 'STARTSTART'" in stdout
+        assert 'RECORDING STARTED.' in stdout
+        assert stdout.count('READY. Type START once') == 1
+        assert 'READY — type START |' not in stdout
         assert not (output/'report.json').exists(), 'must never analyze during recording'
         meta = json.loads((output/'capture.json').read_text())
         assert meta['capture_complete'] and meta['elapsed_s'] > 8
@@ -106,7 +110,7 @@ def main():
         subprocess.run([sys.executable, '-s', script, 'analyze', str(output), '--output', str(result)], check=True, timeout=30)
         report = json.loads((result/'report.json').read_text())
         np.testing.assert_allclose(report['suggested_rpy_deg'], [1.2, 32, 180], atol=.15)
-        for name in ('measured.png', 'predicted_after.png', 'pose_orientation.png'):
+        for name in ('current_floor_view.png', 'predicted_floor_view.png', 'orientation_history.png'):
             assert (result/name).is_file(), name
         print(f'FLIGHT RECORDING TEST PASS — SYNTHETIC DATA ONLY: {root}')
     finally:
