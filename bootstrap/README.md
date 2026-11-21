@@ -98,8 +98,8 @@ ros2 run vio_px4_bridge vio_px4_gps_bridge --ros-args \
   -p home_alt_m:=300.0 \
   -p spoof_duration_s:=15.0 \
   -p spoof_until_vio:=false \
-  -p boot_accuracy_m:=0.05 \
-  -p cruise_eph_m:=0.05 \
+  -p boot_accuracy_m:=0.02 \
+  -p cruise_eph_m:=0.02 \
   -p satellites:=40 \
   -p horizontal_only_output:=true \
   -p heading_source:=px4 \
@@ -202,9 +202,13 @@ checks for an existing serial-port owner and fails rather than competing for it.
 horizontal-only mode, altitude is held at the configured origin and velocity is
 zero; `EKF2_GPS_CTRL=1` leaves height and velocity estimation to PX4. Only
 latitude and longitude carry live VIO motion. Healthy horizontal uncertainty is
-configured as 0.05 m (5 cm on the HIL_GPS wire);
+configured as 0.02 m (2 cm on the HIL_GPS wire);
 larger recovery uncertainty is retained. This is an
-operator-selected uncertainty, not a measured accuracy guarantee. The synthetic receiver reports
+operator-selected uncertainty, not a measured accuracy guarantee. PX4 uses the larger
+of received horizontal uncertainty and `EKF2_GPS_P_NOISE` for normal position fusion:
+with healthy output at 0.02 m, a PX4 floor of 0.05 m or 0.10 m controls the
+effective measurement noise. Larger recovery uncertainty still takes precedence.
+The synthetic receiver reports
 40 satellites, representing a strong but realistic multi-constellation fix. This is
 a binary healthy-source indicator; EPH and PX4 innovations still determine
 measurement weighting and consistency.

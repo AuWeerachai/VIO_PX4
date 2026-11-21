@@ -248,8 +248,8 @@ def test_stable_main_reports_five_cm_without_dynamic_or_heading_experiments(tmp_
         with pytest.raises(RuntimeError, match='capture only'):
             cli.cmd_gps(cfg)
     command = start.call_args.args[2]
-    assert 'boot_accuracy_m:=0.05' in command
-    assert 'cruise_eph_m:=0.05' in command
+    assert 'boot_accuracy_m:=0.02' in command
+    assert 'cruise_eph_m:=0.02' in command
     assert 'rate_hz:=10.0' in command
     assert 'camera_imu_required:=false' in command
     assert 'send_vo_heading' not in command
@@ -263,8 +263,8 @@ def test_stable_direct_bridge_defaults_are_five_cm_without_experiments():
                     if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                     and n.func.attr == 'declare_parameter' and len(n.args) == 2
                     and all(isinstance(a, ast.Constant) for a in n.args)}
-    assert declarations['boot_accuracy_m'] == .05
-    assert declarations['cruise_eph_m'] == .05
+    assert declarations['boot_accuracy_m'] == .02
+    assert declarations['cruise_eph_m'] == .02
     assert declarations['spoof_eph_m'] == .5
     assert declarations['rate_hz'] == 10.
     assert 'send_vo_heading' not in declarations
