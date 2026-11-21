@@ -231,7 +231,7 @@ def test_heading_defaults_migrate_saved_compass_without_changing_extrinsics():
     assert cli.apply_dict(cfg, {'heading_source': 'manual'}).heading_source == 'manual'
 
 
-def test_stable_main_reports_one_cm_without_dynamic_or_heading_experiments(tmp_path):
+def test_stable_main_reports_two_cm_without_dynamic_or_heading_experiments(tmp_path):
     cfg = cli.apply_dict(cli.Config(vio_px4_dir=tmp_path,
                          mavlink_url='udpout:127.0.0.1:14540',
                          state_dir=tmp_path/'state'),
@@ -248,23 +248,23 @@ def test_stable_main_reports_one_cm_without_dynamic_or_heading_experiments(tmp_p
         with pytest.raises(RuntimeError, match='capture only'):
             cli.cmd_gps(cfg)
     command = start.call_args.args[2]
-    assert 'boot_accuracy_m:=0.01' in command
-    assert 'cruise_eph_m:=0.01' in command
+    assert 'boot_accuracy_m:=0.02' in command
+    assert 'cruise_eph_m:=0.02' in command
     assert 'rate_hz:=10.0' in command
     assert 'camera_imu_required:=false' in command
     assert 'send_vo_heading' not in command
     assert 'dynamic_repositioning_enabled' not in command
 
 
-def test_stable_direct_bridge_defaults_are_one_cm_without_experiments():
+def test_stable_direct_bridge_defaults_are_two_cm_without_experiments():
     import ast
     tree = ast.parse((ROOT/'src/vio_px4_bridge/vio_px4_bridge/vio_px4_gps_bridge.py').read_text())
     declarations = {n.args[0].value: n.args[1].value for n in ast.walk(tree)
                     if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                     and n.func.attr == 'declare_parameter' and len(n.args) == 2
                     and all(isinstance(a, ast.Constant) for a in n.args)}
-    assert declarations['boot_accuracy_m'] == .01
-    assert declarations['cruise_eph_m'] == .01
+    assert declarations['boot_accuracy_m'] == .02
+    assert declarations['cruise_eph_m'] == .02
     assert declarations['spoof_eph_m'] == .5
     assert declarations['rate_hz'] == 10.
     assert 'send_vo_heading' not in declarations

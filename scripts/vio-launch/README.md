@@ -150,7 +150,7 @@ is an estimator estimate, not a guarantee of true error.
 
 Freezing cannot account for movement during the outage. Recovery therefore
 retains a conservative global uncertainty floor (maximum configured speed
-times outage duration), rather than automatically claiming 0.01 m accuracy.
+times outage duration), rather than automatically claiming 0.02 m accuracy.
 PX4 may reject the resulting degraded GPS. A verified origin and new bridge
 session are needed to clear that uncertainty.
 

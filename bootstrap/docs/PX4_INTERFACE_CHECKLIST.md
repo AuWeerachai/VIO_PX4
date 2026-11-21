@@ -60,8 +60,8 @@ firmware because message handling and estimator requirements can change.
 - [ ] Send at 10 Hz without long gaps. PX4 timestamps receipt locally.
 - [ ] `fix_type=3`, synthetic satellites=40, speed accuracy
   below `EKF2_REQ_SACC`, and EPH/EPV below their configured gates.
-- [ ] Healthy horizontal EPH is configured as `0.01 m`; HIL_GPS whole-centimetre
-  encoding sends `0.01 m` on the wire. This is configured
+- [ ] Healthy horizontal EPH is configured as `0.02 m`; HIL_GPS whole-centimetre
+  encoding sends `0.02 m` on the wire. This is configured
   confidence, not independently measured accuracy. PX4's
   `EKF2_GPS_P_NOISE` is a separate lower bound: keeping it at `0.1 m` means
   PX4 still applies at least that position noise. Do not claim RTK fix types
@@ -204,7 +204,7 @@ firmware because message handling and estimator requirements can change.
   "Last accepted VIO sample" is accepted-data age, not transport/camera latency.
 - [ ] Successful PX4-position recovery retains the peak reported horizontal
   uncertainty during the outage (and any previously inherited floor). Do not
-  automatically tighten inherited global uncertainty to 0.01 m merely because
+  automatically tighten inherited global uncertainty to 0.02 m merely because
   relative camera tracking stabilizes or PX4 later reports a smaller variance.
 - [ ] Verify 30- and 90-second stationary and moving tests recover to the
   trusted anchor plus actual PX4 position displacement, without the old time
