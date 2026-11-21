@@ -22,15 +22,15 @@ def test_bridge_and_launcher_use_requested_normal_confidence():
     }
     launcher = ast.parse((ROOT / 'scripts/vio-launch/vio_launch.py').read_text())
     for key in ('boot_accuracy_m', 'cruise_eph_m'):
-        assert defaults[key] == 0.02
+        assert defaults[key] == 0.01
         values = [ast.literal_eval(value) for node in ast.walk(launcher)
                   if isinstance(node, ast.Dict)
                   for name, value in zip(node.keys, node.values)
                   if isinstance(name, ast.Constant) and name.value == key]
-        assert values == [0.02]
+        assert values == [0.01]
 
 
-def test_wire_preserves_standard_coordinate_scaling_and_two_cm_eph():
+def test_wire_preserves_standard_coordinate_scaling_and_one_cm_eph():
     tree = ast.parse(SOURCE.read_text())
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)
                and n.name == 'VioPx4GpsBridge')
@@ -42,12 +42,12 @@ def test_wire_preserves_standard_coordinate_scaling_and_two_cm_eph():
     exec(compile(ast.Module(body=[clamp, method], type_ignores=[]), str(SOURCE), 'exec'), ns)
     bridge = SimpleNamespace(fix_type=3, satellites=40, gps_id=1,
                              _hil_gps_extensions_supported=None, _mav=Mock())
-    fix = dict(lat=40.41358964, lon=-79.94629414, alt=200., eph=.02,
+    fix = dict(lat=40.41358964, lon=-79.94629414, alt=200., eph=.01,
                epv=1., vn=0., ve=0., vd=0.)
     ns['_publish_hil_gps'](bridge, fix)
     args = bridge._mav.mav.hil_gps_send.call_args.args
     assert args[2:4] == (404135896, -799462941)
-    assert args[5] == 2  # PX4 decodes this as 0.02 m.
+    assert args[5] == 1  # PX4 decodes this as 0.01 m, not zero.
     fix['eph'] = 0.37  # Recovery uncertainty must still be transmitted.
     ns['_publish_hil_gps'](bridge, fix)
     assert bridge._mav.mav.hil_gps_send.call_args.args[5] == 37
